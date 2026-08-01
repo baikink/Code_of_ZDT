@@ -197,7 +197,7 @@ void SysTick_Handler(void)
   /* USER CODE BEGIN SysTick_IRQn 1 */
   static uint32_t tick_cnt = 0;
   tick_cnt++;
-  if(tick_cnt >= 10) {
+  if(tick_cnt >= 20) {
     tick_cnt = 0;
     g_tick_10ms++;
     g_flag_10ms = true;
@@ -247,23 +247,7 @@ void USART1_IRQHandler(void)
     if(rxCount >= 7 && rxCmd[0] == 0x01)  // 帧头0x01，地址匹配
     {
       usart1_good_cnt++;  // 诊断：位置解析成功
-
-      // 提取位置数据（32位，大端）
-      uint32_t pos = (uint32_t)(
-                        ((uint32_t)rxCmd[3] << 24) |
-                        ((uint32_t)rxCmd[4] << 16) |
-                        ((uint32_t)rxCmd[5] << 8)  |
-                        ((uint32_t)rxCmd[6] << 0)
-                      );
-
-      // 转换为角度（65536 = 一圈 = 360°）
-      extern float motor_current_angle;
-      motor_current_angle = (float)pos * 360.0f / 65536.0f;
-
-      // 处理方向符号
-      if(rxCmd[2]) {
-        motor_current_angle = -motor_current_angle;
-      }
+      // 开环控制不使用编码器位置；此处只保留驱动器响应的诊断计数。
     }
 
     HAL_UART_Receive_DMA(&huart1, (uint8_t*)rxCmd, CMD_LEN); // 重新开启 DMA 接收
@@ -325,7 +309,7 @@ void USART2_IRQHandler(void)
           {
             extern float ball_velocity;
             ball_error = new_error;
-            ball_velocity = new_velocity;  // 使用MaixCAM计算的速度
+            ball_velocity = -new_velocity;  // MaixCAM 发送 error 的导数，取负后与 ball_error 坐标同向
             rxMaixcamFlag = true;  // 设置接收完成标志
           }
           else

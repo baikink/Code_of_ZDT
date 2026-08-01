@@ -53,9 +53,6 @@
 
 /* USER CODE BEGIN PV */
 
-// 电机实时位置（由 USART1 中断从步进电机响应解析写入）
-float motor_current_angle = 0.0f;  // 当前角度（度）
-
 // 钢球位置误差/速度（由 USART2 中断从 MaixCAM 数据解析）
 float ball_velocity = 0.0f;        // 钢球速度（cm/s）
 
@@ -126,15 +123,14 @@ int main(void)
 
   // ========== 步进电机初始化 ==========
   HAL_Delay(500);  // 等待串口和电机驱动器就绪
-
+/*
   // 使能电机（只通电锁轴，不会转动）
   Emm_V5_En_Control(MOTOR_ADDR, 1, 0);
   HAL_Delay(100);
-
+*/
   // 等待驱动器上电自动回零完成（0点已在张大头上位机设置好）
-  // ⭐ 上电后不转 16.8°，0点就是目标位置
   HAL_Delay(3000);
-
+  HAL_Delay(10);
 
   /* USER CODE END 2 */
 
@@ -143,7 +139,7 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  pid_init(&pidY, POSITION_PID, 1.0f, 0.0f, 0.0f, 0.0f);//2.50f, 0.0f, 0.70f, 0.0f
+  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.0f, 0.9f);//2.50f, 0.0f, 0.70f, 0.0f
   pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
 
   while (1)
@@ -151,9 +147,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-
-
  if(g_flag_10ms)
     {
         g_flag_10ms = false;    // 清标志
@@ -168,22 +161,19 @@ int main(void)
     }
 
 
-    // ========== 每100ms：读取电机位置 + 发送 VOFA+ 数据（10Hz） ==========
-    if(HAL_GetTick() - last_vofa_time >= 100)
+    // ========== 每10ms：发送 VOFA+ 数据（100Hz） ==========
+    if(HAL_GetTick() - last_vofa_time >= 10)
     {
       last_vofa_time = HAL_GetTick();
 
-      // 读取电机实时位置（响应在USART1中断中解析为 motor_current_angle）
-      Emm_V5_Read_Sys_Params(MOTOR_ADDR, S_CPOS);
-
       // ===== VOFA+ 发送：5通道 =====
-      // 除 redYSpeed 是 int，其余 ×100 ÷100 即真实值
+      // 所有通道均 ×100 发送，VOFA+ 中 ÷100 后为真实值。
       int32_t vofa_data[5];
-      vofa_data[0] = (int32_t)(motor_current_angle * 100.0f);  // ch0: 电机角度(°)
-      vofa_data[1] = (int32_t)(Y * 100.0f);                    // ch1: 小球位置 Y(cm)
-      vofa_data[2] = (int32_t)redYSpeed;                        // ch2: 小球速度(视觉)
-      vofa_data[3] = (int32_t)(pidY.out * 100.0f);             // ch3: 位置环输出
-      vofa_data[4] = (int32_t)(pidY_Speed.out * 100.0f);       // ch4: 速度环输出
+      vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0: 开环目标角度(°)
+      vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1: 小球位置(cm)
+      vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 计算的小球速度(cm/s)
+      vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环输出(°)
+      vofa_data[4] = (int32_t)(pidY_Speed.out * 100.0f);             // ch4: 速度环输出
       Vofa_usage_SendString(vofa_data, 5);
     }
 

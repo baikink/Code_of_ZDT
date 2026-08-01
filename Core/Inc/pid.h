@@ -30,8 +30,8 @@ typedef struct
 
 }pid_t;
 
-/* 输出限幅宏（�?抗积分饱和）
- * 超出 [lo, hi] 时同步把超出量从 iout 里减回来，防止积分越界累�?导致抖动
+/* 输出限幅宏（�?抗积分饱和）
+ * 超出 [lo, hi] 时同步把超出量从 iout 里减回来，防止积分越界累�?导致抖动
  * 用法：PIDOUT_CLAMP(&pidXxx, -50.0f, 50.0f);
  */
 #define PIDOUT_CLAMP(pid, lo, hi)                               \
@@ -85,8 +85,8 @@ void pidout_Servo_limit(pid_t *pid);
 
 ////////////////////26//////////////
 /* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
-#define ANGLE_LIMIT_MAX   14.0f    /* 正向最大�?�度 (°) */
-#define ANGLE_LIMIT_MIN  -16.0f    /* 反向最大�?�度 (°) */
+#define ANGLE_LIMIT_MAX   15.0f    /* 正向最大角度 (°) */
+#define ANGLE_LIMIT_MIN  -15.0f    /* 反向最大角度 (°) */
 
 extern float Y;
 extern float Y_last;
@@ -95,6 +95,8 @@ extern pid_t pidY;
 extern pid_t pidY_Speed;
 
 void pid_control__26Y(void);
+void motor_set_angle(float target_deg);
+float motor_get_command_angle(void);
 
 void pidout_limit_Y(pid_t *pid);
 

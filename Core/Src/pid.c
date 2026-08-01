@@ -2,9 +2,11 @@
 #include "Emm_V5.h"              /* ball_error、Emm_V5_Pos_Control */
 
 extern float ball_velocity;  /* 视觉小球速度，定义在 main.c */
-extern float motor_current_angle;  /* 电机实时角度(°)，基于上电零点 */
 
 #define PULSES_PER_DEG  8.89f  /* 3200脉冲/圈，1°=8.89脉冲 */
+
+/* 上一次下发的绝对目标脉冲，仅用于 VOFA 显示和避免重复发同一目标。 */
+static int32_t motor_command_pulses = 0;
 
 /* 由 pid.h 的角度限幅换算成脉冲阈值（仅 pid.c 内部使用） */
 #define PULSE_LIMIT_MAX  (ANGLE_LIMIT_MAX * PULSES_PER_DEG)            /* 正向限幅脉冲 */
@@ -635,72 +637,57 @@ void pidout_Servo_limit(pid_t *pid)
 
 
 
-///////////////////////////////////////26///////////////////////
-/*void pid_control__26Y(void)
-{
-	Y = ball_error;              // 视觉小球位置
-	redYSpeed = ball_velocity;   // 视觉小球速度（不自己算差分）
-		// 1.设置目标位置
-	pidY.target =   0;
-		// 2.获取当前位置
-	pidY.now = Y;
-		// 3.PID控制器计算输出
-	pid_cal(&pidY);
-	pidY.iout = 0.0f;                  // 取消位置环积分项
-	pidY.out = pidY.pout + pidY.dout;  // 只保留 PD 输出
-		// 4.限制输出范围
-	pidout_limit_Y(&pidY);
-
-	// ═══ 绝对角度限幅：基于上电零点的 ±10° (±89脉冲) ═══
-	float cur_angle = motor_current_angle;              // 电机当前绝对角度(°)
-	float cur_pulses = cur_angle * PULSES_PER_DEG;      // 换算脉冲
-	float target_pulses = cur_pulses + pidY.out;         // 如果执行本次增量后的绝对位置
-	if(target_pulses > PULSE_LIMIT_MAX) {
-		pidY.iout -= (target_pulses - PULSE_LIMIT_MAX); // 把超出的部分从 iout 回退，防二次饱和
-		pidY.out   =  PULSE_LIMIT_MAX - cur_pulses;     // 截断：不能超正向
-	}
-	if(target_pulses < PULSE_LIMIT_MIN) {
-		pidY.iout -= (target_pulses - PULSE_LIMIT_MIN); // 同上，反向
-		pidY.out   =  PULSE_LIMIT_MIN - cur_pulses;     // 截断：不能超反向
-	}
-	if(pidY.out >  PULSE_LIMIT_MAX) pidY.out =  PULSE_LIMIT_MAX;  // 防溢出保险
-	if(pidY.out <  PULSE_LIMIT_MIN) pidY.out =  PULSE_LIMIT_MIN;
-	// 边界死区保护（限位前 2°）：仍向限位方向推压时清零，消除微抖
-	if(cur_pulses >= PULSE_DEAD_MAX && pidY.out > 0) { pidY.out = 0.0f; pidY.iout = 0.0f; }
-	if(cur_pulses <= PULSE_DEAD_MIN && pidY.out < 0) { pidY.out = 0.0f; pidY.iout = 0.0f; }
-
-	// 电机执行：直接使用位置环输出
-	uint32_t clk = (uint32_t)(pidY.out > 0 ? pidY.out : -pidY.out);
-	if(pidY.out>0)Emm_V5_Pos_Control(MOTOR_ADDR, 0, 10, 0, clk, 0, 0);
-	else if(pidY.out<0)Emm_V5_Pos_Control(MOTOR_ADDR, 1, 10, 0, clk, 0, 0);
-	else Emm_V5_Pos_Control(MOTOR_ADDR, 0, 10, 0, 0, 0, 0);
-
-	Y_last = Y;
-}
-
-
+/*
 void pidout_limit_Y(pid_t *pid)
 {
 	PIDOUT_CLAMP(pid, -50.0f, 50.0f);
-}*/
+}
+*/
+float motor_get_command_angle(void)
+{
+	return (float)motor_command_pulses / PULSES_PER_DEG;
+}
+
+void motor_set_angle(float target_deg)
+{
+	/* PID 输出是相对上电回零点的绝对目标倾角。 */
+	if(target_deg >  6.0f) target_deg =  6.0f;
+	if(target_deg < -10.0f) target_deg = -10.0f;
+
+	/* 驱动器绝对位置模式：+θ 为零点上方，-θ 为零点下方。 */
+	int32_t target_pulses = (int32_t)(target_deg * PULSES_PER_DEG);
+	if(target_pulses == motor_command_pulses) {
+		return;
+	}
+
+	if(target_pulses >= 0) {
+		Emm_V5_Pos_Control(MOTOR_ADDR, 0, 10, 0, (uint32_t)target_pulses, 1, 0);
+	} else {
+		Emm_V5_Pos_Control(MOTOR_ADDR, 1, 10, 0, (uint32_t)(-target_pulses), 1, 0);
+	}
+
+	motor_command_pulses = target_pulses;
+}
 
 void pid_control__26Y(void)
 {
 	Y = ball_error;              // 视觉小球位置
-	redYSpeed = ball_velocity;   // 视觉小球速度（不自己算差分）
-		// 1.设置目标位置
-	pidY.target =   0;
-		// 2.获取当前位置
+	redYSpeed = Y - Y_last;      // 视觉小球速度
+	// 1.设置目标位置
+	pidY.target = 0;
+	// 2.获取当前位置
 	pidY.now = Y;
-		// 3.PID控制器计算输出
+	// 3.PID控制器计算输出
 	pid_cal(&pidY);
 
-	// 电机执行：直接使用位置环输出
-	uint32_t clk = (uint32_t)(pidY.out > 0 ? pidY.out : -pidY.out);
-	if(pidY.out>0)Emm_V5_Pos_Control(MOTOR_ADDR, 0, 10, 0, clk, 0, 0);
-	else if(pidY.out<0)Emm_V5_Pos_Control(MOTOR_ADDR, 1, 10, 0, clk, 0, 0);
-	else Emm_V5_Pos_Control(MOTOR_ADDR, 0, 10, 0, 0, 0, 0);
+	// 4.补偿机构不对称：下降方向 ×1.2，上升方向 ×1.0
+	float cmd_angle = (pidY.out < 0.0f) ? (pidY.out * 1.25f) : pidY.out;
+	motor_set_angle(cmd_angle);
 
 	Y_last = Y;
+}
 
+void pidout_limit_Y(pid_t *pid)
+{
+	PIDOUT_CLAMP(pid, -50.0f, 50.0f);
 }
