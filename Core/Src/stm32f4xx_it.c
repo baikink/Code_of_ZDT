@@ -64,7 +64,8 @@ extern DMA_HandleTypeDef hdma_usart2_rx;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
-
+extern volatile uint32_t g_tick_10ms;
+extern volatile bool g_flag_10ms;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -194,7 +195,13 @@ void SysTick_Handler(void)
   /* USER CODE END SysTick_IRQn 0 */
   HAL_IncTick();
   /* USER CODE BEGIN SysTick_IRQn 1 */
-
+  static uint32_t tick_cnt = 0;
+  tick_cnt++;
+  if(tick_cnt >= 10) {
+    tick_cnt = 0;
+    g_tick_10ms++;
+    g_flag_10ms = true;
+  }
   /* USER CODE END SysTick_IRQn 1 */
 }
 

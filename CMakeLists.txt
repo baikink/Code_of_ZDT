@@ -32,7 +32,9 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 enable_language(C ASM)
 
 # Create an executable object type
-add_executable(${CMAKE_PROJECT_NAME})
+add_executable(${CMAKE_PROJECT_NAME}
+        Core/Inc/pid.h
+        Core/Src/pid.c)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -47,8 +49,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/Emm_V5.c
     Core/Src/UART_vofa_usage.c
-    Core/Src/pid_alg.c
-    Core/Src/ball_balance.c
+    Core/Src/ball_balance_pid.c
+    Core/Src/pid.c
 )
 
 # Add include paths

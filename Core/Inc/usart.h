@@ -54,7 +54,6 @@ extern __IO uint8_t rxCount;
 
 extern __IO uint8_t rxMaixcam[RX_MAIXCAM_SIZE];
 extern __IO float ball_error;     // 小球位置（相对中心，负=左，正=右；由视觉误差取负得到）
-extern float ball_velocity;      // 小球速度(cm/s)，在 main.c 定义
 extern __IO bool rxMaixcamFlag;
 
 extern __IO uint32_t maixcam_rx_cnt;    // 诊断：收到的帧次数
