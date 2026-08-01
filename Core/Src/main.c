@@ -139,8 +139,8 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  /* 位置单环：f 参数仅在增量式 PID 中使用，位置式设为 0。 */
-  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.10f, 0.0f);
+  /* 视觉速度阻尼已承担 D 项；位置环使用中等 P，保证回中速度且避免撞限。 */
+  pid_init(&pidY, POSITION_PID, 0.850f, 0.0f, 0.0f, 0.50f);
   pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
 
   while (1)

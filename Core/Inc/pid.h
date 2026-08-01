@@ -85,20 +85,21 @@ void pidout_Servo_limit(pid_t *pid);
 
 ////////////////////26//////////////
 /* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
-#define ANGLE_LIMIT_MAX    6.0f    /* 正向最大角度 (°) */
+#define ANGLE_LIMIT_MAX    8.0f    /* 正向最大角度 (°) */
 #define ANGLE_LIMIT_MIN  -10.0f    /* 反向最大角度 (°) */
 
 /* 视觉速度阻尼：先低通滤波，再将速度换算为反向制动倾角。 */
 #define BALL_VELOCITY_FILTER_ALPHA  0.25f
-#define VELOCITY_DAMPING_K           0.12f   /* °/(cm/s) */
+#define VELOCITY_DAMPING_K           0.20f   /* °/(cm/s) */
 #define VELOCITY_DAMPING_LIMIT       3.0f    /* 最大制动倾角 (°) */
+#define VELOCITY_DAMPING_DEADZONE    0.5f    /* |Y| ≤ 0.5 cm 时不施加速度制动 */
 
 /* 小球偏离中心但持续不动时，用最小倾角克服静摩擦。 */
-#define STUCK_POSITION_THRESHOLD     0.5f    /* 仅在 |Y| > 0.5 cm 时检测卡滞 */
+#define STUCK_POSITION_THRESHOLD     1.0f    /* 仅在 |Y| > 1.0 cm 时检测卡滞并启用起动倾角 */
 #define STUCK_POSITION_DELTA         0.03f   /* 单控制周期内的位置变化阈值 (cm) */
 #define STUCK_TICKS_REQUIRED         10u     /* 连续 10 × 20ms = 200ms 不动 */
-#define BREAKAWAY_POS_ANGLE          4.5f    /* Y < 0 时的正向起动倾角 (°) */
-#define BREAKAWAY_NEG_ANGLE         -3.2f    /* Y > 0 时的负向起动倾角，后续再 ×1.2 */
+#define BREAKAWAY_POS_ANGLE          2.0f    /* Y < 0 时的正向起动倾角 (°) */
+#define BREAKAWAY_NEG_ANGLE         -3.0f    /* Y > 0 时的负向起动倾角，后续再 ×1.2 */
 #define BREAKAWAY_RELEASE_DISTANCE   0.25f   /* 向中心累计移动该距离后退出起动补偿 (cm) */
 
 extern float Y;

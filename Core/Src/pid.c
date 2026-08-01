@@ -662,9 +662,9 @@ void motor_set_angle(float target_deg)
 	}
 
 	if(target_pulses >= 0) {
-		Emm_V5_Pos_Control(MOTOR_ADDR, 0, 10, 0, (uint32_t)target_pulses, 1, 0);
+		Emm_V5_Pos_Control(MOTOR_ADDR, 0, 800, 0, (uint32_t)target_pulses, 1, 0);
 	} else {
-		Emm_V5_Pos_Control(MOTOR_ADDR, 1, 10, 0, (uint32_t)(-target_pulses), 1, 0);
+		Emm_V5_Pos_Control(MOTOR_ADDR, 1, 800, 0, (uint32_t)(-target_pulses), 1, 0);
 	}
 
 	motor_command_pulses = target_pulses;
@@ -689,9 +689,10 @@ void pid_control__26Y(void)
 	static bool breakaway_active = false;
 	filtered_velocity += BALL_VELOCITY_FILTER_ALPHA * (ball_velocity - filtered_velocity);
 
-	/* 卡滞后保持起动倾角，直到小球确实向中心累计移动 0.25cm。 */
+	/* 仅在离目标超过静摩擦阈值时使用起动倾角；进入近目标区域立即退出。 */
 	if(breakaway_active) {
-		if((breakaway_start_y < 0.0f && Y >= breakaway_start_y + BREAKAWAY_RELEASE_DISTANCE) ||
+		if((Y <= STUCK_POSITION_THRESHOLD && Y >= -STUCK_POSITION_THRESHOLD) ||
+		   (breakaway_start_y < 0.0f && Y >= breakaway_start_y + BREAKAWAY_RELEASE_DISTANCE) ||
 		   (breakaway_start_y > 0.0f && Y <= breakaway_start_y - BREAKAWAY_RELEASE_DISTANCE)) {
 			breakaway_active = false;
 		}
@@ -710,12 +711,17 @@ void pid_control__26Y(void)
 		stuck_ticks = 0u;
 	}
 
-	/* 球向正方向运动时给负倾角刹车，反之亦然。 */
-	pidY_velocity_damping = -VELOCITY_DAMPING_K * filtered_velocity;
-	if(pidY_velocity_damping > VELOCITY_DAMPING_LIMIT) {
-		pidY_velocity_damping = VELOCITY_DAMPING_LIMIT;
-	} else if(pidY_velocity_damping < -VELOCITY_DAMPING_LIMIT) {
-		pidY_velocity_damping = -VELOCITY_DAMPING_LIMIT;
+	/* 进入目标附近后不再制动，避免低速或误判静止时拖慢回中。 */
+	if(Y <= VELOCITY_DAMPING_DEADZONE && Y >= -VELOCITY_DAMPING_DEADZONE) {
+		pidY_velocity_damping = 0.0f;
+	} else {
+		/* 球向正方向运动时给负倾角刹车，反之亦然。 */
+		pidY_velocity_damping = -VELOCITY_DAMPING_K * filtered_velocity;
+		if(pidY_velocity_damping > VELOCITY_DAMPING_LIMIT) {
+			pidY_velocity_damping = VELOCITY_DAMPING_LIMIT;
+		} else if(pidY_velocity_damping < -VELOCITY_DAMPING_LIMIT) {
+			pidY_velocity_damping = -VELOCITY_DAMPING_LIMIT;
+		}
 	}
 
 	// 4.位置环倾角叠加速度制动；卡滞时保持最小起动倾角。
