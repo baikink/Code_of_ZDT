@@ -1,0 +1,239 @@
+
+---
+events:
+  -
+    kind: "message-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineSystem.cmake:205 (message)"
+      - "CMakeLists.txt:28 (project)"
+    message: |
+      The system is: Windows - 10.0.22631 - AMD64
+  -
+    kind: "message-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:28 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" failed.
+      Compiler: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang.exe 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      1
+      lld: error: unable to find library -lmingw32
+      lld: error: unable to find library -lunwind
+      lld: error: unable to find library -lmoldname
+      lld: error: unable to find library -lmingwex
+      lld: error: unable to find library -lmsvcrt
+      lld: error: unable to find library -ladvapi32
+      lld: error: unable to find library -lshell32
+      lld: error: unable to find library -luser32
+      lld: error: unable to find library -lkernel32
+      lld: error: unable to find library -lmingw32
+      lld: error: unable to find library -lunwind
+      lld: error: unable to find library -lmoldname
+      lld: error: unable to find library -lmingwex
+      lld: error: unable to find library -lmsvcrt
+      lld: error: unable to find library -lkernel32
+      clang: error: linker command failed with exit code 1 (use -v to see invocation)
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCCompiler.cmake:123 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:28 (project)"
+    message: |
+      Compiling the C compiler identification source file "CMakeCCompilerId.c" succeeded.
+      Compiler: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang.exe 
+      Build flags: 
+      Id flags: -c 
+      
+      The output was:
+      0
+      
+      
+      Compilation of the C compiler identification source "CMakeCCompilerId.c" produced "CMakeCCompilerId.o"
+      
+      The C compiler identification is Clang, found in:
+        D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/3.30.2/CompilerIdC/CMakeCCompilerId.o
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCXXCompiler.cmake:126 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:28 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" failed.
+      Compiler: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang++.exe 
+      Build flags: 
+      Id flags:  
+      
+      The output was:
+      1
+      lld: error: unable to find library -lc++
+      lld: error: unable to find library -lmingw32
+      lld: error: unable to find library -lunwind
+      lld: error: unable to find library -lmoldname
+      lld: error: unable to find library -lmingwex
+      lld: error: unable to find library -lmsvcrt
+      lld: error: unable to find library -ladvapi32
+      lld: error: unable to find library -lshell32
+      lld: error: unable to find library -luser32
+      lld: error: unable to find library -lkernel32
+      lld: error: unable to find library -lmingw32
+      lld: error: unable to find library -lunwind
+      lld: error: unable to find library -lmoldname
+      lld: error: unable to find library -lmingwex
+      lld: error: unable to find library -lmsvcrt
+      lld: error: unable to find library -lkernel32
+      clang++: error: linker command failed with exit code 1 (use -v to see invocation)
+      
+      
+  -
+    kind: "message-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:17 (message)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerId.cmake:64 (__determine_compiler_id_test)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCXXCompiler.cmake:126 (CMAKE_DETERMINE_COMPILER_ID)"
+      - "CMakeLists.txt:28 (project)"
+    message: |
+      Compiling the CXX compiler identification source file "CMakeCXXCompilerId.cpp" succeeded.
+      Compiler: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang++.exe 
+      Build flags: 
+      Id flags: -c 
+      
+      The output was:
+      0
+      
+      
+      Compilation of the CXX compiler identification source "CMakeCXXCompilerId.cpp" produced "CMakeCXXCompilerId.o"
+      
+      The CXX compiler identification is Clang, found in:
+        D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/3.30.2/CompilerIdCXX/CMakeCXXCompilerId.o
+      
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeDetermineCompilerABI.cmake:74 (try_compile)"
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeTestCCompiler.cmake:26 (CMAKE_DETERMINE_COMPILER_ABI)"
+      - "CMakeLists.txt:28 (project)"
+    checks:
+      - "Detecting C compiler ABI info"
+    directories:
+      source: "D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-wjjpal"
+      binary: "D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-wjjpal"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang-scan-deps.exe"
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "CMAKE_C_ABI_COMPILED"
+      cached: true
+      stdout: |
+        Change Dir: 'D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-wjjpal'
+        
+        Run Build Command(s): D:/ESP32/espressif/tools/ninja/1.12.1/ninja.exe -v cmTC_f8098
+        [1/2] D:\\ESP32\\espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clang.exe   -std=gnu11   -v -MD -MT CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj -MF CMakeFiles\\cmTC_f8098.dir\\CMakeCCompilerABI.c.obj.d -o CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj -c D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeCCompilerABI.c
+        clang version 16.0.1 (https://github.com/espressif/llvm-project.git fe4f10a809705c2ddbed62145616bb9c85c499c0)
+        Target: x86_64-w64-windows-gnu
+        Thread model: posix
+        InstalledDir: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin
+         (in-process)
+         "D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang.exe" -cc1 -triple x86_64-w64-windows-gnu -emit-obj -mrelax-all -disable-free -clear-ast-before-backend -disable-llvm-verifier -discard-value-names -main-file-name CMakeCCompilerABI.c -mrelocation-model pic -pic-level 2 -mframe-pointer=none -fmath-errno -ffp-contract=on -fno-rounding-math -mconstructor-aliases -mms-bitfields -funwind-tables=2 -target-cpu x86-64 -tune-cpu generic -mllvm -treat-scalable-fixed-error-as-warning -debugger-tuning=gdb -v -fcoverage-compilation-dir=D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-wjjpal -resource-dir D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/lib/clang/16 -dependency-file "CMakeFiles\\\\cmTC_f8098.dir\\\\CMakeCCompilerABI.c.obj.d" -MT CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj -sys-header-deps -internal-isystem D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/lib/clang/16/include -internal-isystem D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/x86_64-w64-mingw32/include -internal-isystem D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/x86_64-w64-mingw32/usr/include -internal-isystem D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/include -std=gnu11 -fdebug-compilation-dir=D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-wjjpal -ferror-limit 19 -fno-use-cxa-atexit -fgnuc-version=4.2.1 -exception-model=seh -faddrsig -o CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj -x c D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeCCompilerABI.c
+        clang -cc1 version 16.0.1 based upon LLVM 16.0.1 default target x86_64-w64-mingw32
+        ignoring nonexistent directory "D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/x86_64-w64-mingw32/include"\x0d
+        ignoring nonexistent directory "D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/x86_64-w64-mingw32/usr/include"\x0d
+        #include "..." search starts here:\x0d
+        #include <...> search starts here:\x0d
+         D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/lib/clang/16/include\x0d
+         D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/include\x0d
+        End of search list.\x0d
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && D:\\ESP32\\espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clang.exe  -v -Wl,-v CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj -o cmTC_f8098.exe -Wl,--out-implib,libcmTC_f8098.dll.a -Wl,--major-image-version,0,--minor-image-version,0   && cd ."
+        FAILED: cmTC_f8098.exe 
+        C:\\Windows\\system32\\cmd.exe /C "cd . && D:\\ESP32\\espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clang.exe  -v -Wl,-v CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj -o cmTC_f8098.exe -Wl,--out-implib,libcmTC_f8098.dll.a -Wl,--major-image-version,0,--minor-image-version,0   && cd ."
+        clang version 16.0.1 (https://github.com/espressif/llvm-project.git fe4f10a809705c2ddbed62145616bb9c85c499c0)
+        Target: x86_64-w64-windows-gnu
+        Thread model: posix
+        InstalledDir: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin
+         "D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/ld.lld" -m i386pep -Bdynamic -o cmTC_f8098.exe crt2.o crtbegin.o -LD:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/x86_64-w64-mingw32/lib -LD:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/x86_64-w64-mingw32/mingw/lib -LD:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/lib -v CMakeFiles/cmTC_f8098.dir/CMakeCCompilerABI.c.obj --out-implib libcmTC_f8098.dll.a --major-image-version 0 --minor-image-version 0 -lmingw32 D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/lib/clang/16/lib/windows/libclang_rt.builtins-x86_64.a -lunwind -lmoldname -lmingwex -lmsvcrt -ladvapi32 -lshell32 -luser32 -lkernel32 -lmingw32 D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/lib/clang/16/lib/windows/libclang_rt.builtins-x86_64.a -lunwind -lmoldname -lmingwex -lmsvcrt -lkernel32 crtend.o
+        LLD 16.0.1 (compatible with GNU linkers)
+        lld: error: unable to find library -lmingw32
+        lld: error: unable to find library -lunwind
+        lld: error: unable to find library -lmoldname
+        lld: error: unable to find library -lmingwex
+        lld: error: unable to find library -lmsvcrt
+        lld: error: unable to find library -ladvapi32
+        lld: error: unable to find library -lshell32
+        lld: error: unable to find library -luser32
+        lld: error: unable to find library -lkernel32
+        lld: error: unable to find library -lmingw32
+        lld: error: unable to find library -lunwind
+        lld: error: unable to find library -lmoldname\x0d
+        lld: error: unable to find library -lmingwex\x0d
+        lld: error: unable to find library -lmsvcrt\x0d
+        lld: error: unable to find library -lkernel32\x0d
+        clang: error: linker command failed with exit code 1 (use -v to see invocation)\x0d
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+  -
+    kind: "try_compile-v1"
+    backtrace:
+      - "D:/ESP32/espressif/tools/cmake/3.30.2/share/cmake-3.30/Modules/CMakeTestCCompiler.cmake:56 (try_compile)"
+      - "CMakeLists.txt:28 (project)"
+    checks:
+      - "Check for working C compiler: D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang.exe"
+    directories:
+      source: "D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-5gperg"
+      binary: "D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-5gperg"
+    cmakeVariables:
+      CMAKE_CXX_COMPILER_CLANG_SCAN_DEPS: "D:/ESP32/espressif/tools/esp-clang/16.0.1-fe4f10a809/esp-clang/bin/clang-scan-deps.exe"
+      CMAKE_C_FLAGS: ""
+      CMAKE_C_FLAGS_DEBUG: "-g"
+      CMAKE_EXE_LINKER_FLAGS: ""
+    buildResult:
+      variable: "CMAKE_C_COMPILER_WORKS"
+      cached: true
+      stdout: |
+        Change Dir: 'D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-5gperg'
+        
+        Run Build Command(s): D:/ESP32/espressif/tools/ninja/1.12.1/ninja.exe -v cmTC_ef24e
+        [1/2] D:\\ESP32\\espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clang.exe   -std=gnu11 -MD -MT CMakeFiles/cmTC_ef24e.dir/testCCompiler.c.obj -MF CMakeFiles\\cmTC_ef24e.dir\\testCCompiler.c.obj.d -o CMakeFiles/cmTC_ef24e.dir/testCCompiler.c.obj -c D:/File/2026diansaiH/Code_of_ZDT/build/CMakeFiles/CMakeScratch/TryCompile-5gperg/testCCompiler.c
+        [2/2] C:\\Windows\\system32\\cmd.exe /C "cd . && D:\\ESP32\\espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clang.exe   CMakeFiles/cmTC_ef24e.dir/testCCompiler.c.obj -o cmTC_ef24e.exe -Wl,--out-implib,libcmTC_ef24e.dll.a -Wl,--major-image-version,0,--minor-image-version,0  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 && cd ."
+        FAILED: cmTC_ef24e.exe 
+        C:\\Windows\\system32\\cmd.exe /C "cd . && D:\\ESP32\\espressif\\tools\\esp-clang\\16.0.1-fe4f10a809\\esp-clang\\bin\\clang.exe   CMakeFiles/cmTC_ef24e.dir/testCCompiler.c.obj -o cmTC_ef24e.exe -Wl,--out-implib,libcmTC_ef24e.dll.a -Wl,--major-image-version,0,--minor-image-version,0  -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 && cd ."
+        lld: error: unable to find library -lkernel32
+        lld: error: unable to find library -luser32
+        lld: error: unable to find library -lgdi32
+        lld: error: unable to find library -lwinspool
+        lld: error: unable to find library -lshell32
+        lld: error: unable to find library -lole32
+        lld: error: unable to find library -loleaut32
+        lld: error: unable to find library -luuid
+        lld: error: unable to find library -lcomdlg32
+        lld: error: unable to find library -ladvapi32
+        lld: error: unable to find library -lmingw32
+        lld: error: unable to find library -lunwind
+        lld: error: unable to find library -lmoldname
+        lld: error: unable to find library -lmingwex\x0d
+        lld: error: unable to find library -lmsvcrt\x0d
+        lld: error: unable to find library -ladvapi32\x0d
+        lld: error: unable to find library -lshell32\x0d
+        lld: error: unable to find library -luser32\x0d
+        lld: error: unable to find library -lkernel32\x0d
+        lld: error: unable to find library -lmingw32\x0d
+        lld: error: too many errors emitted, stopping now\x0d
+        clang: error: linker command failed with exit code 1 (use -v to see invocation)\x0d
+        ninja: build stopped: subcommand failed.
+        
+      exitCode: 1
+...

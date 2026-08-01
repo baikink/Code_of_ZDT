@@ -324,7 +324,7 @@ void USART2_IRQHandler(void)
             } else {
               ball_error = new_error;
             }
-            ball_velocity = new_velocity;
+            ball_velocity = -new_velocity;  // 与正常数据分支保持同一坐标方向
             rxMaixcamFlag = true;
           }
         }

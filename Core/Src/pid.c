@@ -47,6 +47,7 @@ float Y_last;
 
 pid_t pidY;
 pid_t pidY_Speed;
+float pidY_velocity_damping;
 
 void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
 {
@@ -672,7 +673,8 @@ void motor_set_angle(float target_deg)
 void pid_control__26Y(void)
 {
 	Y = ball_error;              // 视觉小球位置
-	redYSpeed = Y - Y_last;      // 视觉小球速度
+	float position_delta = Y - Y_last;
+	redYSpeed = position_delta;  // 保留旧诊断变量
 	// 1.设置目标位置
 	pidY.target = 0;
 	// 2.获取当前位置
@@ -680,8 +682,56 @@ void pid_control__26Y(void)
 	// 3.PID控制器计算输出
 	pid_cal(&pidY);
 
-	// 4.补偿机构不对称：下降方向 ×1.2，上升方向 ×1.0
-	float cmd_angle = (pidY.out < 0.0f) ? (pidY.out * 1.2f) : pidY.out;
+	/* 视觉速度存在帧间抖动和偶发零值，先低通滤波再参与制动。 */
+	static float filtered_velocity = 0.0f;
+	static float breakaway_start_y = 0.0f;
+	static uint8_t stuck_ticks = 0u;
+	static bool breakaway_active = false;
+	filtered_velocity += BALL_VELOCITY_FILTER_ALPHA * (ball_velocity - filtered_velocity);
+
+	/* 卡滞后保持起动倾角，直到小球确实向中心累计移动 0.25cm。 */
+	if(breakaway_active) {
+		if((breakaway_start_y < 0.0f && Y >= breakaway_start_y + BREAKAWAY_RELEASE_DISTANCE) ||
+		   (breakaway_start_y > 0.0f && Y <= breakaway_start_y - BREAKAWAY_RELEASE_DISTANCE)) {
+			breakaway_active = false;
+		}
+		stuck_ticks = 0u;
+	} else if((Y > STUCK_POSITION_THRESHOLD || Y < -STUCK_POSITION_THRESHOLD) &&
+	          position_delta > -STUCK_POSITION_DELTA &&
+	          position_delta < STUCK_POSITION_DELTA) {
+		if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+			stuck_ticks++;
+		}
+		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+			breakaway_start_y = Y;
+			breakaway_active = true;
+		}
+	} else {
+		stuck_ticks = 0u;
+	}
+
+	/* 球向正方向运动时给负倾角刹车，反之亦然。 */
+	pidY_velocity_damping = -VELOCITY_DAMPING_K * filtered_velocity;
+	if(pidY_velocity_damping > VELOCITY_DAMPING_LIMIT) {
+		pidY_velocity_damping = VELOCITY_DAMPING_LIMIT;
+	} else if(pidY_velocity_damping < -VELOCITY_DAMPING_LIMIT) {
+		pidY_velocity_damping = -VELOCITY_DAMPING_LIMIT;
+	}
+
+	// 4.位置环倾角叠加速度制动；卡滞时保持最小起动倾角。
+	float cmd_angle = pidY.out + pidY_velocity_damping;
+	if(breakaway_active) {
+		if(breakaway_start_y < 0.0f && cmd_angle < BREAKAWAY_POS_ANGLE) {
+			cmd_angle = BREAKAWAY_POS_ANGLE;
+		} else if(breakaway_start_y > 0.0f && cmd_angle > BREAKAWAY_NEG_ANGLE) {
+			cmd_angle = BREAKAWAY_NEG_ANGLE;
+		}
+	}
+
+	// 负方向（下降）机构补偿 ×1.2。
+	if(cmd_angle < 0.0f) {
+		cmd_angle *= 1.2f;
+	}
 	motor_set_angle(cmd_angle);
 
 	Y_last = Y;

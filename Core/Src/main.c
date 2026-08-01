@@ -140,7 +140,7 @@ int main(void)
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
   /* 位置单环：f 参数仅在增量式 PID 中使用，位置式设为 0。 */
-  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.0f, 0.0f);
+  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.10f, 0.0f);
   pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
 
   while (1)
@@ -174,7 +174,7 @@ int main(void)
       vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1: 小球位置(cm)
       vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 计算的小球速度(cm/s)
       vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环输出(°)
-      vofa_data[4] = (int32_t)(pidY_Speed.out * 100.0f);             // ch4: 速度环输出
+      vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4: 视觉速度制动倾角(°)
       Vofa_usage_SendString(vofa_data, 5);
     }
 
