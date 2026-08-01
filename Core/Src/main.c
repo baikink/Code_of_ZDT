@@ -58,7 +58,7 @@ float ball_velocity = 0.0f;        // 钢球速度（cm/s）
 
 // ── PID 实例（声明在 pid.h）──
 
-// ── 10ms 定时标志（SysTick 派生，100Hz）──
+// ── 20ms 控制定时标志（SysTick 派生，50Hz）──
 volatile uint32_t g_tick_10ms = 0;
 volatile bool g_flag_10ms = false;
 
@@ -139,7 +139,8 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.0f, 0.5f);//2.50f, 0.0f, 0.70f, 0.0f
+  /* 位置单环：f 参数仅在增量式 PID 中使用，位置式设为 0。 */
+  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.0f, 0.0f);
   pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
 
   while (1)

@@ -651,8 +651,8 @@ float motor_get_command_angle(void)
 void motor_set_angle(float target_deg)
 {
 	/* PID 输出是相对上电回零点的绝对目标倾角。 */
-	if(target_deg >  6.0f) target_deg =  6.0f;
-	if(target_deg < -10.0f) target_deg = -10.0f;
+	if(target_deg > ANGLE_LIMIT_MAX) target_deg = ANGLE_LIMIT_MAX;
+	if(target_deg < ANGLE_LIMIT_MIN) target_deg = ANGLE_LIMIT_MIN;
 
 	/* 驱动器绝对位置模式：+θ 为零点上方，-θ 为零点下方。 */
 	int32_t target_pulses = (int32_t)(target_deg * PULSES_PER_DEG);
@@ -681,7 +681,7 @@ void pid_control__26Y(void)
 	pid_cal(&pidY);
 
 	// 4.补偿机构不对称：下降方向 ×1.2，上升方向 ×1.0
-	float cmd_angle = (pidY.out < 0.0f) ? (pidY.out * 1.25f) : pidY.out;
+	float cmd_angle = (pidY.out < 0.0f) ? (pidY.out * 1.2f) : pidY.out;
 	motor_set_angle(cmd_angle);
 
 	Y_last = Y;

@@ -85,8 +85,8 @@ void pidout_Servo_limit(pid_t *pid);
 
 ////////////////////26//////////////
 /* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
-#define ANGLE_LIMIT_MAX   15.0f    /* 正向最大角度 (°) */
-#define ANGLE_LIMIT_MIN  -15.0f    /* 反向最大角度 (°) */
+#define ANGLE_LIMIT_MAX    6.0f    /* 正向最大角度 (°) */
+#define ANGLE_LIMIT_MIN  -10.0f    /* 反向最大角度 (°) */
 
 extern float Y;
 extern float Y_last;
