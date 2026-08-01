@@ -139,7 +139,7 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.0f, 0.9f);//2.50f, 0.0f, 0.70f, 0.0f
+  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.0f, 0.5f);//2.50f, 0.0f, 0.70f, 0.0f
   pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
 
   while (1)
