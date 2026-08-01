@@ -45,6 +45,19 @@ int redYSpeed;
 float Y;
 float Y_last;
 
+/* 目标坐标与视觉 Y 使用同一坐标系，默认回到画面中心。 */
+volatile float ball_target_y = 0.0f;
+
+void ball_target_set(float target_y)
+{
+	ball_target_y = target_y;
+}
+
+float ball_target_get(void)
+{
+	return ball_target_y;
+}
+
 pid_t pidY;
 pid_t pidY_Speed;
 float pidY_velocity_damping;
@@ -662,9 +675,9 @@ void motor_set_angle(float target_deg)
 	}
 
 	if(target_pulses >= 0) {
-		Emm_V5_Pos_Control(MOTOR_ADDR, 0, 800, 0, (uint32_t)target_pulses, 1, 0);
+		Emm_V5_Pos_Control(MOTOR_ADDR, 0, 1200, 0, (uint32_t)target_pulses, 1, 0);
 	} else {
-		Emm_V5_Pos_Control(MOTOR_ADDR, 1, 800, 0, (uint32_t)(-target_pulses), 1, 0);
+		Emm_V5_Pos_Control(MOTOR_ADDR, 1, 1200, 0, (uint32_t)(-target_pulses), 1, 0);
 	}
 
 	motor_command_pulses = target_pulses;
@@ -672,64 +685,79 @@ void motor_set_angle(float target_deg)
 
 void pid_control__26Y(void)
 {
-	Y = ball_error;              // 视觉小球位置
-	float position_delta = Y - Y_last;
-	redYSpeed = position_delta;  // 保留旧诊断变量
-	// 1.设置目标位置
-	pidY.target = 0;
-	// 2.获取当前位置
-	pidY.now = Y;
-	// 3.PID控制器计算输出
+	static float filtered_velocity = 0.0f;
+	static float relative_y_last = 0.0f;
+	static float target_y_last = 0.0f;
+	static float breakaway_start_error = 0.0f;
+	static uint8_t stuck_ticks = 0u;
+	static bool breakaway_active = false;
+	static bool control_initialized = false;
+
+	Y = ball_error;  // 视觉小球绝对位置
+
+	/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+	float target_y = ball_target_get();
+	float relative_y = Y - target_y;
+	bool target_changed = !control_initialized || target_y != target_y_last;
+
+	/* 切换目标时丢弃旧的卡滞状态，避免沿旧目标方向施加起动倾角。 */
+	if(target_changed) {
+		stuck_ticks = 0u;
+		breakaway_active = false;
+		relative_y_last = relative_y;
+		target_y_last = target_y;
+		control_initialized = true;
+	}
+
+	float position_delta = relative_y - relative_y_last;
+	redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+
+	/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+	pidY.target = 0.0f;
+	pidY.now = relative_y;
 	pid_cal(&pidY);
 
 	/* 视觉速度存在帧间抖动和偶发零值，先低通滤波再参与制动。 */
-	static float filtered_velocity = 0.0f;
-	static float breakaway_start_y = 0.0f;
-	static uint8_t stuck_ticks = 0u;
-	static bool breakaway_active = false;
 	filtered_velocity += BALL_VELOCITY_FILTER_ALPHA * (ball_velocity - filtered_velocity);
 
-	/* 仅在离目标超过静摩擦阈值时使用起动倾角；进入近目标区域立即退出。 */
+	/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。 */
 	if(breakaway_active) {
-		if((Y <= STUCK_POSITION_THRESHOLD && Y >= -STUCK_POSITION_THRESHOLD) ||
-		   (breakaway_start_y < 0.0f && Y >= breakaway_start_y + BREAKAWAY_RELEASE_DISTANCE) ||
-		   (breakaway_start_y > 0.0f && Y <= breakaway_start_y - BREAKAWAY_RELEASE_DISTANCE)) {
+		if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+		   (breakaway_start_error < 0.0f &&
+		    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+		   (breakaway_start_error > 0.0f &&
+		    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
 			breakaway_active = false;
 		}
 		stuck_ticks = 0u;
-	} else if((Y > STUCK_POSITION_THRESHOLD || Y < -STUCK_POSITION_THRESHOLD) &&
+	} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
 	          position_delta > -STUCK_POSITION_DELTA &&
 	          position_delta < STUCK_POSITION_DELTA) {
 		if(stuck_ticks < STUCK_TICKS_REQUIRED) {
 			stuck_ticks++;
 		}
 		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
-			breakaway_start_y = Y;
+			breakaway_start_error = relative_y;
 			breakaway_active = true;
 		}
 	} else {
 		stuck_ticks = 0u;
 	}
 
-	/* 进入目标附近后不再制动，避免低速或误判静止时拖慢回中。 */
-	if(Y <= VELOCITY_DAMPING_DEADZONE && Y >= -VELOCITY_DAMPING_DEADZONE) {
-		pidY_velocity_damping = 0.0f;
-	} else {
-		/* 球向正方向运动时给负倾角刹车，反之亦然。 */
-		pidY_velocity_damping = -VELOCITY_DAMPING_K * filtered_velocity;
-		if(pidY_velocity_damping > VELOCITY_DAMPING_LIMIT) {
-			pidY_velocity_damping = VELOCITY_DAMPING_LIMIT;
-		} else if(pidY_velocity_damping < -VELOCITY_DAMPING_LIMIT) {
-			pidY_velocity_damping = -VELOCITY_DAMPING_LIMIT;
-		}
+	/* 球向正方向运动时给负倾角刹车，反之亦然。 */
+	pidY_velocity_damping = -VELOCITY_DAMPING_K * filtered_velocity;
+	if(pidY_velocity_damping > VELOCITY_DAMPING_LIMIT) {
+		pidY_velocity_damping = VELOCITY_DAMPING_LIMIT;
+	} else if(pidY_velocity_damping < -VELOCITY_DAMPING_LIMIT) {
+		pidY_velocity_damping = -VELOCITY_DAMPING_LIMIT;
 	}
 
-	// 4.位置环倾角叠加速度制动；卡滞时保持最小起动倾角。
+	// 位置环倾角叠加速度制动；卡滞时保持最小起动倾角。
 	float cmd_angle = pidY.out + pidY_velocity_damping;
 	if(breakaway_active) {
-		if(breakaway_start_y < 0.0f && cmd_angle < BREAKAWAY_POS_ANGLE) {
+		if(breakaway_start_error < 0.0f && cmd_angle < BREAKAWAY_POS_ANGLE) {
 			cmd_angle = BREAKAWAY_POS_ANGLE;
-		} else if(breakaway_start_y > 0.0f && cmd_angle > BREAKAWAY_NEG_ANGLE) {
+		} else if(breakaway_start_error > 0.0f && cmd_angle > BREAKAWAY_NEG_ANGLE) {
 			cmd_angle = BREAKAWAY_NEG_ANGLE;
 		}
 	}
@@ -740,6 +768,7 @@ void pid_control__26Y(void)
 	}
 	motor_set_angle(cmd_angle);
 
+	relative_y_last = relative_y;
 	Y_last = Y;
 }
 

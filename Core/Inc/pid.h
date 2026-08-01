@@ -90,20 +90,24 @@ void pidout_Servo_limit(pid_t *pid);
 
 /* 视觉速度阻尼：先低通滤波，再将速度换算为反向制动倾角。 */
 #define BALL_VELOCITY_FILTER_ALPHA  0.25f
-#define VELOCITY_DAMPING_K           0.20f   /* °/(cm/s) */
-#define VELOCITY_DAMPING_LIMIT       3.0f    /* 最大制动倾角 (°) */
-#define VELOCITY_DAMPING_DEADZONE    0.5f    /* |Y| ≤ 0.5 cm 时不施加速度制动 */
+#define VELOCITY_DAMPING_K           0.18f   /* °/(cm/s) */
+#define VELOCITY_DAMPING_LIMIT       5.0f    /* 最大制动倾角 (°) */
 
-/* 小球偏离中心但持续不动时，用最小倾角克服静摩擦。 */
-#define STUCK_POSITION_THRESHOLD     1.0f    /* 仅在 |Y| > 1.0 cm 时检测卡滞并启用起动倾角 */
-#define STUCK_POSITION_DELTA         0.03f   /* 单控制周期内的位置变化阈值 (cm) */
+/* 小球偏离目标且持续不动时，用最小倾角克服静摩擦。 */
+#define STUCK_POSITION_THRESHOLD     1.0f    /* 仅在距目标 |error| > 1.0 cm 时检测卡滞并启用起动倾角 */
+#define STUCK_POSITION_DELTA         0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
 #define STUCK_TICKS_REQUIRED         10u     /* 连续 10 × 20ms = 200ms 不动 */
-#define BREAKAWAY_POS_ANGLE          2.0f    /* Y < 0 时的正向起动倾角 (°) */
-#define BREAKAWAY_NEG_ANGLE         -3.0f    /* Y > 0 时的负向起动倾角，后续再 ×1.2 */
-#define BREAKAWAY_RELEASE_DISTANCE   0.25f   /* 向中心累计移动该距离后退出起动补偿 (cm) */
+#define BREAKAWAY_POS_ANGLE          2.0f    /* 目标误差 < 0 时的正向起动倾角 (°) */
+#define BREAKAWAY_NEG_ANGLE         -3.0f    /* 目标误差 > 0 时的负向起动倾角，后续再 ×1.2 */
+#define BREAKAWAY_RELEASE_DISTANCE   0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
 
 extern float Y;
 extern float Y_last;
+
+/* 小球目标位置，单位 cm，坐标系与 Y 保持一致；可在运行中随时更新。 */
+extern volatile float ball_target_y;
+void ball_target_set(float target_y);
+float ball_target_get(void);
 
 extern pid_t pidY;
 extern pid_t pidY_Speed;
