@@ -38,6 +38,8 @@ extern UART_HandleTypeDef huart2;
 
 extern UART_HandleTypeDef huart3;
 
+extern UART_HandleTypeDef huart4;   /* UART4: 蓝牙调参 PC10=TX / PC11=RX */
+
 /* USER CODE BEGIN Private defines */
 
 // ========== USART1 接收步进电机数据 ==========
@@ -67,6 +69,7 @@ extern __IO uint32_t usart1_good_cnt;  // 诊断：位置解析成功帧次数
 void MX_USART1_UART_Init(void);
 void MX_USART2_UART_Init(void);
 void MX_USART3_UART_Init(void);
+void MX_UART4_Init(void);          /* 蓝牙调参，9600，PC10/PC11 */
 
 /* USER CODE BEGIN Prototypes */
 

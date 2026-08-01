@@ -27,6 +27,7 @@
 #include "Emm_V5.h"
 #include "UART_vofa_usage.h"
 #include "pid.h"
+#include "bt_tune.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -111,6 +112,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
+  MX_UART4_Init();              /* 蓝牙调参 */
   /* USER CODE BEGIN 2 */
 
   // ========== 启动 UART1 DMA 接收（步进电机） ==========
@@ -123,6 +125,9 @@ int main(void)
 
   // ========== VOFA+ 通道准备（USART3） ==========
   Vofa_usage_prepare();
+
+  // ========== 蓝牙调参接收启动（UART4） ==========
+  BT_Tune_Init();
 
   // ========== 步进电机初始化 ==========
   HAL_Delay(500);  // 等待串口和电机驱动器就绪
@@ -143,8 +148,8 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  pid_init(&pidY, POSITION_PID, 3.1f, 0.0f, 0.0f, 0.0f);
-  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
+  pid_init(&pidY, POSITION_PID, 2.50f, 0.0f, 0.70f, 0.0f);
+  pid_init(&pidY_Speed, POSITION_PID,1.0f, 0.0f, 0.0f, 0.0f);
 
   while (1)
   {
@@ -159,6 +164,9 @@ int main(void)
         g_flag_10ms = false;    // 清标志
         pid_control__26Y();
     }
+
+    // ========== 蓝牙调参：解析收到的数据包 ==========
+    BT_Tune_Process();
 
     // ========== 视觉数据：每帧更新 ==========
     if(rxMaixcamFlag)

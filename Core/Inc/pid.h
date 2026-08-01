@@ -11,7 +11,7 @@ extern int redYSpeed;
 
 enum
 {
-  POSITION_PID = 0,  // ��???
+  POSITION_PID = 0,  // ��???
   DELTA_PID,         // ?????
 };
 
@@ -30,6 +30,21 @@ typedef struct
 
 }pid_t;
 
+/* 输出限幅宏（�?抗积分饱和）
+ * 超出 [lo, hi] 时同步把超出量从 iout 里减回来，防止积分越界累�?导致抖动
+ * 用法：PIDOUT_CLAMP(&pidXxx, -50.0f, 50.0f);
+ */
+#define PIDOUT_CLAMP(pid, lo, hi)                               \
+    do {                                                        \
+        if((pid)->out > (float)(hi)) {                          \
+            (pid)->iout -= ((pid)->out - (float)(hi));          \
+            (pid)->out   = (float)(hi);                         \
+        }                                                       \
+        if((pid)->out < (float)(lo)) {                          \
+            (pid)->iout -= ((pid)->out - (float)(lo));          \
+            (pid)->out   = (float)(lo);                         \
+        }                                                       \
+    } while(0)
 
 /*extern pid_t motorA;
 extern pid_t motorB;
@@ -69,6 +84,10 @@ void pid_control_Y(void);*/
 void pidout_Servo_limit(pid_t *pid);
 
 ////////////////////26//////////////
+/* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
+#define ANGLE_LIMIT_MAX   14.0f    /* 正向最大�?�度 (°) */
+#define ANGLE_LIMIT_MIN  -16.0f    /* 反向最大�?�度 (°) */
+
 extern float Y;
 extern float Y_last;
 
