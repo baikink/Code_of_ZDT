@@ -49,9 +49,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # Add user sources here
     Core/Src/Emm_V5.c
     Core/Src/UART_vofa_usage.c
-    Core/Src/ball_balance_pid.c
     Core/Src/pid.c
-    Core/Src/bt_tune.c
 )
 
 # Add include paths

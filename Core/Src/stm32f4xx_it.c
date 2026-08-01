@@ -23,7 +23,6 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "Emm_V5.h"
-#include "bt_tune.h"
 #include <string.h>  // 用于 memcpy
 #include <math.h>    // 用于 fabsf
 /* USER CODE END Includes */
@@ -67,7 +66,6 @@ extern UART_HandleTypeDef huart2;
 /* USER CODE BEGIN EV */
 extern volatile uint32_t g_tick_10ms;
 extern volatile bool g_flag_10ms;
-extern UART_HandleTypeDef huart4;
 /* USER CODE END EV */
 
 /******************************************************************************/
@@ -391,25 +389,5 @@ void DMA2_Stream7_IRQHandler(void)
 }
 
 /* USER CODE BEGIN 1 */
-
-/**
-  * @brief UART4 global interrupt（蓝牙调参接收）
-  */
-void UART4_IRQHandler(void)
-{
-  HAL_UART_IRQHandler(&huart4);
-}
-
-/**
-  * @brief HAL UART 接收完成回调（单字节中断接收）
-  *        UART4 每收到 1 字节触发一次
-  */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
-{
-  if(huart->Instance == UART4)
-  {
-    BT_Tune_ByteReceived();   /* 拼包，收到 ']' 时置 bt_pkt_ready */
-  }
-}
 
 /* USER CODE END 1 */
