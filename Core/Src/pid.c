@@ -1,7 +1,7 @@
 #include "pid.h"
 #include "Emm_V5.h"              /* ball_error、Emm_V5_Pos_Control */
 
-extern float ball_velocity;  /* 视觉小球速度，定义在 main.c */
+extern volatile float ball_velocity;  /* 视觉小球速度，定义在 main.c，中断写主循环读 */
 
 #define PULSES_PER_DEG  8.89f  /* 3200脉冲/圈，1°=8.89脉冲 */
 
@@ -16,6 +16,7 @@ static int32_t motor_command_pulses = 0;
 
 #define MAX_DUTY  7200    /* 旧代码需要，PWM最大占空比 */
 #define MOTOR_ADDR 1      /* 旧代码需要，电机地址 */
+#define MOTOR_POSITION_SPEED_RPM  100u   /* 串口绝对位置命令速度 */
 
 /*pid_t motorA;
 pid_t motorB;
@@ -61,6 +62,7 @@ float ball_target_get(void)
 pid_t pidY;
 pid_t pidY_Speed;
 float pidY_velocity_damping;
+float pidY_filtered_velocity = 0.0f;  /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
 
 void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
 {
@@ -642,6 +644,46 @@ void pidout_limit(pid_t *pid)
 	PIDOUT_CLAMP(pid, 0, MAX_DUTY);
 }
 
+/* 带条件积分与输出限幅的位置式 PID（串级环专用）
+ *
+ * 与 PIDOUT_CLAMP 的反算抗饱和相比，本函数从不把比例项的溢出量写进 iout：
+ *   1. 先试算积分增量，只有「输出未饱和」或「误差方向会让积分退出饱和」时才采纳；
+ *   2. iout 独立限幅到 ±i_limit（i_limit=0 即彻底禁用积分，等价纯 P/PD）；
+ *   3. 最后只截断 out，iout 保持干净。
+ *
+ * 这样比例项可以随意撞限幅，积分状态不会被污染，不存在 Ki=0 时留下永久偏置的问题。
+ */
+static void pid_cal_clamped(pid_t *pid, float lo, float hi, float i_limit)
+{
+	pid->error[0] = pid->target - pid->now;
+
+	pid->pout = pid->p * pid->error[0];
+	pid->dout = pid->d * (pid->error[0] - pid->error[1]);
+
+	/* 条件积分：先看不含新增量的输出是否已经饱和到同一侧。 */
+	if(i_limit > 0.0f) {
+		float out_wo_new_i = pid->pout + pid->iout + pid->dout;
+		bool sat_hi = (out_wo_new_i >= hi) && (pid->error[0] > 0.0f);
+		bool sat_lo = (out_wo_new_i <= lo) && (pid->error[0] < 0.0f);
+		if(!sat_hi && !sat_lo) {
+			pid->iout += pid->i * pid->error[0];
+			if(pid->iout >  i_limit) pid->iout =  i_limit;
+			if(pid->iout < -i_limit) pid->iout = -i_limit;
+		}
+	} else {
+		pid->iout = 0.0f;  /* 显式禁用积分，杜绝历史残留偏置 */
+	}
+
+	pid->out = pid->pout + pid->iout + pid->dout;
+
+	pid->error[2] = pid->error[1];
+	pid->error[1] = pid->error[0];
+
+	/* 只截断输出，不回写 iout。 */
+	if(pid->out > hi) pid->out = hi;
+	if(pid->out < lo) pid->out = lo;
+}
+
 void pidout_Servo_limit(pid_t *pid)
 {
 	PIDOUT_CLAMP(pid, -40.0f, 40.0f);
@@ -675,9 +717,9 @@ void motor_set_angle(float target_deg)
 	}
 
 	if(target_pulses >= 0) {
-		Emm_V5_Pos_Control(MOTOR_ADDR, 0, 1200, 0, (uint32_t)target_pulses, 1, 0);
+		Emm_V5_Pos_Control(MOTOR_ADDR, 0, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)target_pulses, 1, 0);
 	} else {
-		Emm_V5_Pos_Control(MOTOR_ADDR, 1, 1200, 0, (uint32_t)(-target_pulses), 1, 0);
+		Emm_V5_Pos_Control(MOTOR_ADDR, 1, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)(-target_pulses), 1, 0);
 	}
 
 	motor_command_pulses = target_pulses;
@@ -685,13 +727,15 @@ void motor_set_angle(float target_deg)
 
 void pid_control__26Y(void)
 {
-	static float filtered_velocity = 0.0f;
 	static float relative_y_last = 0.0f;
 	static float target_y_last = 0.0f;
 	static float breakaway_start_error = 0.0f;
+	static float breakaway_angle = 0.0f;
 	static uint8_t stuck_ticks = 0u;
+	static uint8_t breakaway_ramp_ticks = 0u;
 	static bool breakaway_active = false;
 	static bool control_initialized = false;
+	static bool target_hold_active = false;
 
 	Y = ball_error;  // 视觉小球绝对位置
 
@@ -703,7 +747,10 @@ void pid_control__26Y(void)
 	/* 切换目标时丢弃旧的卡滞状态，避免沿旧目标方向施加起动倾角。 */
 	if(target_changed) {
 		stuck_ticks = 0u;
+		breakaway_ramp_ticks = 0u;
 		breakaway_active = false;
+		breakaway_angle = 0.0f;
+		target_hold_active = false;
 		relative_y_last = relative_y;
 		target_y_last = target_y;
 		control_initialized = true;
@@ -712,15 +759,83 @@ void pid_control__26Y(void)
 	float position_delta = relative_y - relative_y_last;
 	redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
 
+	/* 内环速度反馈改为本地位置差分速度。
+	 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+	 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+	 */
+	float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+	float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+	float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+
+	/* 接近目标后的到位保持。
+	 *
+	 * 这里不是简单的“位置一小就停”，而是同时满足：
+	 *   1) |位置误差| <= 0.4cm：比 ±1cm 的验收线明显更紧，真正贴近目标；
+	 *   2) |速度| <= 0.4cm/s：球确实已经慢下来，而不是高速穿越目标点。
+	 *
+	 * 一旦进入保持态，就直接撤掉控制输出，让平台回到 0°；
+	 * 只有当误差重新长到 0.6cm 以上时才恢复闭环。这个回差能避免视觉噪声、
+	 * 步进脉冲量化和轻微回弹把系统卡在“进死区/出死区”的反复切换里。
+	 */
+	if(target_hold_active) {
+		if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+			target_hold_active = false;
+		}
+	} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+	          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+		target_hold_active = true;
+	}
+
+	if(target_hold_active) {
+		/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
+		 * 做法是：仅禁止 breakaway，且稍后把外环目标速度压到 0，
+		 * 让内环继续按“0 速度”闭环保持球静止。
+		 * 这样既保留了微调能力，又避免平台在目标附近追来追去。
+		 */
+		stuck_ticks = 0u;
+		breakaway_ramp_ticks = 0u;
+		breakaway_active = false;
+		breakaway_angle = 0.0f;
+	}
+
 	/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
 	pidY.target = 0.0f;
 	pidY.now = relative_y;
-	pid_cal(&pidY);
+	/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+	 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+	 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+	 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+	 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+	pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+	                POS_LOOP_I_LIMIT);
+	if(target_hold_active) {
+		/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+		 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+		 */
+		pidY.out = 0.0f;
+	}
 
-	/* 视觉速度存在帧间抖动和偶发零值，先低通滤波再参与制动。 */
-	filtered_velocity += BALL_VELOCITY_FILTER_ALPHA * (ball_velocity - filtered_velocity);
+	/* 先限制本地估计速度，再低通滤波，避免位置量化造成的单帧尖峰把速度环推入饱和。
+	 * VOFA ch2 继续保留 MaixCAM 原始速度，仅用于诊断比较，不再直接参与控制。
+	 */
+	float control_velocity = estimated_velocity;
+	if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+		control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+	} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+		control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+	}
+	pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+	                         (control_velocity - pidY_filtered_velocity);
 
-	/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。 */
+	/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+	 *
+	 * breakaway 现改为“分级加力”：
+	 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+	 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+	 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+	 *
+	 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+	 */
 	if(breakaway_active) {
 		if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
 		   (breakaway_start_error < 0.0f &&
@@ -728,6 +843,28 @@ void pid_control__26Y(void)
 		   (breakaway_start_error > 0.0f &&
 		    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
 			breakaway_active = false;
+			breakaway_angle = 0.0f;
+			breakaway_ramp_ticks = 0u;
+		} else if(position_delta > -STUCK_POSITION_DELTA &&
+		          position_delta < STUCK_POSITION_DELTA) {
+			if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+				breakaway_ramp_ticks++;
+			} else {
+				breakaway_ramp_ticks = 0u;
+				if(breakaway_start_error < 0.0f) {
+					breakaway_angle += BREAKAWAY_ANGLE_STEP;
+					if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+						breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+					}
+				} else {
+					breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+					if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+						breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+					}
+				}
+			}
+		} else {
+			breakaway_ramp_ticks = 0u;
 		}
 		stuck_ticks = 0u;
 	} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
@@ -739,32 +876,65 @@ void pid_control__26Y(void)
 		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
 			breakaway_start_error = relative_y;
 			breakaway_active = true;
+			breakaway_ramp_ticks = 0u;
+			breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
 		}
 	} else {
 		stuck_ticks = 0u;
 	}
 
-	/* 球向正方向运动时给负倾角刹车，反之亦然。 */
-	pidY_velocity_damping = -VELOCITY_DAMPING_K * filtered_velocity;
-	if(pidY_velocity_damping > VELOCITY_DAMPING_LIMIT) {
-		pidY_velocity_damping = VELOCITY_DAMPING_LIMIT;
-	} else if(pidY_velocity_damping < -VELOCITY_DAMPING_LIMIT) {
-		pidY_velocity_damping = -VELOCITY_DAMPING_LIMIT;
+	/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。
+	 *
+	 * 内环积分是消除稳态位置误差的关键：命令角 0° 只是上电机械零点，
+	 * 不等于力学水平角。两者之差加上滚动摩擦是一个常值扰动，
+	 * 纯 P 串级无法消除，小球只会停在“实际水平”的位置而不是目标位置。
+	 * 内环积分会持续调整倾角直到实测速度跟上目标速度，
+	 * 静止平衡时即自动找到真实水平角，外环误差随之收敛到 0。
+	 */
+	pidY_Speed.target = pidY.out;
+	pidY_Speed.now = pidY_filtered_velocity;
+
+	/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+	 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+	float iout_frozen = pidY_Speed.iout;
+	pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+	                SPEED_LOOP_I_LIMIT);
+	if(breakaway_active) {
+		pidY_Speed.iout = iout_frozen;
+		pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+		if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+			pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+		} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+			pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+		}
 	}
 
-	// 位置环倾角叠加速度制动；卡滞时保持最小起动倾角。
-	float cmd_angle = pidY.out + pidY_velocity_damping;
+	pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+
+	// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+	float cmd_angle = pidY_velocity_damping;
 	if(breakaway_active) {
-		if(breakaway_start_error < 0.0f && cmd_angle < BREAKAWAY_POS_ANGLE) {
-			cmd_angle = BREAKAWAY_POS_ANGLE;
-		} else if(breakaway_start_error > 0.0f && cmd_angle > BREAKAWAY_NEG_ANGLE) {
-			cmd_angle = BREAKAWAY_NEG_ANGLE;
+		if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+			cmd_angle = breakaway_angle;
+		} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+			cmd_angle = breakaway_angle;
 		}
 	}
 
 	// 负方向（下降）机构补偿 ×1.2。
 	if(cmd_angle < 0.0f) {
 		cmd_angle *= 1.2f;
+	}
+
+	/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+	 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+	static float cmd_angle_last = 0.0f;
+	{
+		float delta = cmd_angle - cmd_angle_last;
+		if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+		else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+		cmd_angle = cmd_angle_last + delta;
+		cmd_angle_last = cmd_angle;
 	}
 	motor_set_angle(cmd_angle);
 

@@ -54,7 +54,7 @@
 /* USER CODE BEGIN PV */
 
 // 钢球位置误差/速度（由 USART2 中断从 MaixCAM 数据解析）
-float ball_velocity = 0.0f;        // 钢球速度（cm/s）
+volatile float ball_velocity = 0.0f;  // 钢球速度（cm/s），USART2 中断写、主循环读，必须 volatile
 
 // ── PID 实例（声明在 pid.h）──
 
@@ -139,10 +139,13 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  /* 位置单环：f 参数仅在增量式 PID 中使用，位置式设为 0。 */
-  pid_init(&pidY, POSITION_PID, 0.090f, 0.0f, 0.50f, 0.0f);
-  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.0f, 0.0f, 0.0f);
-  ball_target_set(5.0f);
+  /* 串级 PID：外位置环输出目标速度，内速度环输出平台倾角。 */
+  /* 内环 I=0.01/tick（50Hz → 0.5/s）：唯一职责是把"命令 0° 并非真正水平"的
+   * 机械零点偏差与滚动摩擦这个常值扰动积掉，由 SPEED_LOOP_I_LIMIT 限幅 ±2.5°。
+   * 外环保持 I=0（POS_LOOP_I_LIMIT 也为 0），位置环靠内环消稳态误差即可。 */
+  pid_init(&pidY, POSITION_PID, 0.40f, 0.0f, 0.00f, 0.0f);
+  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.01f, 0.0f, 0.0f);//P=1.1 I=0.01/tick
+  ball_target_set(-5.0f);
   while (1)
   {
     /* USER CODE END WHILE */
@@ -167,15 +170,16 @@ int main(void)
     {
       last_vofa_time = HAL_GetTick();
 
-      // ===== VOFA+ 发送：5通道 =====
+      // ===== VOFA+ 发送：6通道 =====
       // 所有通道均 ×100 发送，VOFA+ 中 ÷100 后为真实值。
-      int32_t vofa_data[5];
+      int32_t vofa_data[6];
       vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0: 开环目标角度(°)
       vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1: 小球位置(cm)
-      vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 计算的小球速度(cm/s)
-      vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环输出(°)
-      vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4: 视觉速度制动倾角(°)
-      Vofa_usage_SendString(vofa_data, 5);
+      vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 原始速度(cm/s)，仅诊断
+      vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环目标速度(cm/s)
+      vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4: 速度环输出倾角(°)
+      vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);    // ch5: 本地差分+低通后的控制速度(cm/s)
+      Vofa_usage_SendString(vofa_data, 6);
     }
 
     // ========== 处理 MaixCAM 视觉数据 ==========

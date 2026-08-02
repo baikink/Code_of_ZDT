@@ -307,7 +307,7 @@ void USART2_IRQHandler(void)
           // 突变检测：与上次误差差距不超过10cm（放宽，避免数据冻结）⭐
           if(fabsf(new_error - ball_error) < 10.0f || ball_error == 0.0f)
           {
-            extern float ball_velocity;
+            extern volatile float ball_velocity;
             ball_error = new_error;
             ball_velocity = -new_velocity;  // MaixCAM 发送 error 的导数，取负后与 ball_error 坐标同向
             rxMaixcamFlag = true;  // 设置接收完成标志
@@ -316,7 +316,7 @@ void USART2_IRQHandler(void)
           {
             // ⭐ 突变过大，但仍设置标志（防止完全卡死）
             // 使用限幅后的数据
-            extern float ball_velocity;
+            extern volatile float ball_velocity;
             if(new_error > ball_error + 10.0f) {
               ball_error = ball_error + 10.0f;
             } else if(new_error < ball_error - 10.0f) {
