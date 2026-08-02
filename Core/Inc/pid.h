@@ -146,24 +146,7 @@ void pidout_Servo_limit(pid_t *pid);
 #define TARGET_HOLD_POSITION_ENTER  0.50f
 #define TARGET_HOLD_POSITION_EXIT   0.60f
 #define TARGET_HOLD_SPEED_LIMIT     0.25f
-
-/* 小球偏离目标且持续不动时，用起动倾角克服静摩擦。
- *
- * 不再使用固定单一的 breakaway 角。
- * 现改为“分级加力”：先给一个较小起动角，若球仍不动，就每隔一段时间再加一点，
- * 直到上限。这样既能在轻微卡滞时保持动作柔和，也能在重静摩擦时继续加力，避免
- * 像之前那样一直卡死在固定的 -3.6° 上。
- */
-#define STUCK_POSITION_THRESHOLD      0.6f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
-#define STUCK_POSITION_DELTA          0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
-#define STUCK_TICKS_REQUIRED          10u     /* 连续 10 × 20ms = 200ms 不动后进入 breakaway */
-#define BREAKAWAY_POS_ANGLE_BASE      2.0f    /* 正向起动角初值 (°) */
-#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
-#define BREAKAWAY_POS_ANGLE_MAX       4.0f    /* 正向起动角上限 (°) */
-#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
-#define BREAKAWAY_ANGLE_STEP          0.5f    /* 每次加力的步长 (°) */
-#define BREAKAWAY_RAMP_TICKS          8u      /* 每 8 × 20ms = 160ms 仍不动则再加一级 */
-#define BREAKAWAY_RELEASE_DISTANCE    0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
+#define TARGET_HOLD_SETTLE_TICKS    6u    /* 进入最终保持前，位置与速度需连续稳定 6 × 20ms = 120ms */
 
 extern float Y;
 extern float Y_last;

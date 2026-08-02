@@ -752,15 +752,9 @@ void pid_control__26Y(void)
 {
 	static float relative_y_last = 0.0f;
 	static float target_y_last = 0.0f;
-#if !POSITION_LOOP_DIRECT_DRIVE
-	static float breakaway_start_error = 0.0f;
-	static float breakaway_angle = 0.0f;
-	static uint8_t stuck_ticks = 0u;
-	static uint8_t breakaway_ramp_ticks = 0u;
-	static bool breakaway_active = false;
-#endif
 	static bool control_initialized = false;
 	static bool target_hold_active = false;
+	static uint8_t target_hold_settle_ticks = 0u;
 
 	if(!g_pid_segment_initialized) {
 		pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
@@ -776,28 +770,18 @@ void pid_control__26Y(void)
 	 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
 	if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
 		if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
-			pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+			pid_apply_segment_profile(-5.5f, 0.9f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
 			g_pid_segment = PID_SEGMENT_TO_NEG_55;
 			control_initialized = false;
 			target_hold_active = false;
-#if !POSITION_LOOP_DIRECT_DRIVE
-			stuck_ticks = 0u;
-			breakaway_ramp_ticks = 0u;
-			breakaway_active = false;
-			breakaway_angle = 0.0f;
-#endif
+			target_hold_settle_ticks = 0u;
 		}
 	} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
 		if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
 			g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
 			control_initialized = false;
 			target_hold_active = false;
-#if !POSITION_LOOP_DIRECT_DRIVE
-			stuck_ticks = 0u;
-			breakaway_ramp_ticks = 0u;
-			breakaway_active = false;
-			breakaway_angle = 0.0f;
-#endif
+			target_hold_settle_ticks = 0u;
 		}
 	}
 
@@ -808,13 +792,8 @@ void pid_control__26Y(void)
 
 	/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
 	if(target_changed) {
-#if !POSITION_LOOP_DIRECT_DRIVE
-		stuck_ticks = 0u;
-		breakaway_ramp_ticks = 0u;
-		breakaway_active = false;
-		breakaway_angle = 0.0f;
-#endif
 		target_hold_active = false;
+		target_hold_settle_ticks = 0u;
 		relative_y_last = relative_y;
 		target_y_last = target_y;
 		control_initialized = true;
@@ -829,32 +808,39 @@ void pid_control__26Y(void)
 	 */
 	float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
 	float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+	float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
 
 	/* 最终保持只在第二段完成后生效。
-	 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。 */
+	 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+	 *
+	 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+	 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
 	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
 		if(target_hold_active) {
 			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
 				target_hold_active = false;
+				target_hold_settle_ticks = 0u;
 			}
-		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
-			target_hold_active = true;
+		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+		          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+			if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+				target_hold_settle_ticks++;
+			}
+			if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+				target_hold_active = true;
+			}
+		} else {
+			target_hold_settle_ticks = 0u;
 		}
 	} else {
 		target_hold_active = false;
+		target_hold_settle_ticks = 0u;
 	}
 
 	if(target_hold_active) {
 		/* 进入误差保持区后，只停止位置环继续推球：
 		 *   1) 外环目标速度稍后压到 0；
-		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
-		 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
-#if !POSITION_LOOP_DIRECT_DRIVE
-		stuck_ticks = 0u;
-		breakaway_ramp_ticks = 0u;
-		breakaway_active = false;
-		breakaway_angle = 0.0f;
-#endif
+		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
 	}
 
 	/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
@@ -899,94 +885,15 @@ void pid_control__26Y(void)
 	pidY_Speed.dout = 0.0f;
 
 	float cmd_angle = pidY.out;
-#else
-	/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
-	 *
-	 * breakaway 现改为“分级加力”：
-	 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
-	 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
-	 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
-	 *
-	 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
-	 */
-	if(breakaway_active) {
-		if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
-		   (breakaway_start_error < 0.0f &&
-		    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
-		   (breakaway_start_error > 0.0f &&
-		    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
-			breakaway_active = false;
-			breakaway_angle = 0.0f;
-			breakaway_ramp_ticks = 0u;
-		} else if(position_delta > -STUCK_POSITION_DELTA &&
-		          position_delta < STUCK_POSITION_DELTA) {
-			if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
-				breakaway_ramp_ticks++;
-			} else {
-				breakaway_ramp_ticks = 0u;
-				if(breakaway_start_error < 0.0f) {
-					breakaway_angle += BREAKAWAY_ANGLE_STEP;
-					if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
-						breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
-					}
-				} else {
-					breakaway_angle -= BREAKAWAY_ANGLE_STEP;
-					if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
-						breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
-					}
-				}
-			}
-		} else {
-			breakaway_ramp_ticks = 0u;
-		}
-		stuck_ticks = 0u;
-	} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
-	          position_delta > -STUCK_POSITION_DELTA &&
-	          position_delta < STUCK_POSITION_DELTA) {
-		if(stuck_ticks < STUCK_TICKS_REQUIRED) {
-			stuck_ticks++;
-		}
-		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
-			breakaway_start_error = relative_y;
-			breakaway_active = true;
-			breakaway_ramp_ticks = 0u;
-			breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
-		}
-	} else {
-		stuck_ticks = 0u;
-	}
-
-	/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
-	pidY_Speed.target = pidY.out;
-	pidY_Speed.now = pidY_filtered_velocity;
-
-	/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
-	 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
-	float iout_frozen = pidY_Speed.iout;
-	pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
-	                SPEED_LOOP_I_LIMIT);
-	if(breakaway_active) {
-		pidY_Speed.iout = iout_frozen;
-		pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
-		if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
-			pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
-		} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
-			pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
-		}
-	}
-
-	pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
-
-	// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
-	float cmd_angle = pidY_velocity_damping;
-	if(breakaway_active) {
-		if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
-			cmd_angle = breakaway_angle;
-		} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
-			cmd_angle = breakaway_angle;
-		}
-	}
-#endif
+	#else
+		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+		pidY_Speed.target = pidY.out;
+		pidY_Speed.now = pidY_filtered_velocity;
+		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+		                SPEED_LOOP_I_LIMIT);
+		pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+		float cmd_angle = pidY_velocity_damping;
+	#endif
 
 	// 负方向（下降）机构补偿 ×1.2。
 	if(cmd_angle < 0.0f) {
