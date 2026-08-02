@@ -139,16 +139,12 @@ void pidout_Servo_limit(pid_t *pid);
 
 /* 接近目标后的稳态区。
  *
- * 这里不再“退出闭环并锁角/回零”，而是仅在非常靠近目标时，把外环目标速度压到 0，
- * 让内环继续以“0 速度”闭环保持小球静止。这样既能继续收敛，又不会在目标附近追来追去。
- *
- * 进入条件收紧到 0.15cm，退出条件为 0.30cm：
- *   - 明显优于 ±1cm 的验收线；
- *   - 又留出 0.15cm 回差，避免边界抖动。
- * 仍要求速度也足够小，防止球高速穿过目标点时过早进入稳态区。
+ * 需求改为：|位置误差| <= 0.5cm 时就停止 PID 调节。
+ * 为避免视觉噪声和轻微回弹导致反复进出保持区，退出门限留 0.1cm 回差，
+ * 即误差重新增大到 0.6cm 以上才恢复闭环。
  */
-#define TARGET_HOLD_POSITION_ENTER  0.15f
-#define TARGET_HOLD_POSITION_EXIT   0.30f
+#define TARGET_HOLD_POSITION_ENTER  0.50f
+#define TARGET_HOLD_POSITION_EXIT   0.60f
 #define TARGET_HOLD_SPEED_LIMIT     0.25f
 
 /* 小球偏离目标且持续不动时，用起动倾角克服静摩擦。

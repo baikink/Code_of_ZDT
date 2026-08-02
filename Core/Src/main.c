@@ -141,13 +141,10 @@ int main(void)
 
   uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
 
-  /* 串级 PID：外位置环输出目标速度，内速度环输出平台倾角。 */
-  /* 内环 I=0.01/tick（50Hz → 0.5/s）：唯一职责是把"命令 0° 并非真正水平"的
-   * 机械零点偏差与滚动摩擦这个常值扰动积掉，由 SPEED_LOOP_I_LIMIT 限幅 ±2.5°。
-   * 外环保持 I=0（POS_LOOP_I_LIMIT 也为 0），位置环靠内环消稳态误差即可。 */
-  pid_init(&pidY, POSITION_PID, 0.8f, 0.0f, 0.00f, 0.0f);
-  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.01f, 0.0f, 0.0f);// 从0到5 pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
-  ball_target_set(-5.5f);  // 初始目标位置（cm），负=左，正=右
+  /* 串级 PID 参数与目标点由 pid.c 内部的分段状态机统一装载：
+   *   1) 先从 0cm 运动到 +5.6cm；
+   *   2) 达到 +5.6cm ±0.5cm 后立刻切到 -5.5cm；
+   *   3) 最终在 -5.5cm ±0.5cm 处稳定保持。 */
   BT_Tune_Init();
   while (1)
   {

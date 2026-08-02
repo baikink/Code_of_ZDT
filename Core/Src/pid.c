@@ -64,6 +64,29 @@ pid_t pidY_Speed;
 float pidY_velocity_damping;
 float pidY_filtered_velocity = 0.0f;  /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
 
+typedef enum {
+	PID_SEGMENT_TO_POS_56 = 0,
+	PID_SEGMENT_TO_NEG_55,
+	PID_SEGMENT_HOLD_NEG_55,
+} pid_segment_t;
+
+static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+static bool g_pid_segment_initialized = false;
+
+static float pid_absf(float value)
+{
+	return (value >= 0.0f) ? value : -value;
+}
+
+static void pid_apply_segment_profile(float target_y,
+	                                  float pos_p, float pos_i, float pos_d,
+	                                  float spd_p, float spd_i, float spd_d)
+{
+	pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+	pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+	ball_target_set(target_y);
+}
+
 void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
 {
 	pid->pid_mode = mode;
@@ -739,7 +762,44 @@ void pid_control__26Y(void)
 	static bool control_initialized = false;
 	static bool target_hold_active = false;
 
+	if(!g_pid_segment_initialized) {
+		pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+		g_pid_segment = PID_SEGMENT_TO_POS_56;
+		g_pid_segment_initialized = true;
+	}
+
 	Y = ball_error;  // 视觉小球绝对位置
+
+	/* 分段状态机：
+	 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+	 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+	 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+	if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+		if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+			pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+			g_pid_segment = PID_SEGMENT_TO_NEG_55;
+			control_initialized = false;
+			target_hold_active = false;
+#if !POSITION_LOOP_DIRECT_DRIVE
+			stuck_ticks = 0u;
+			breakaway_ramp_ticks = 0u;
+			breakaway_active = false;
+			breakaway_angle = 0.0f;
+#endif
+		}
+	} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+		if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+			g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+			control_initialized = false;
+			target_hold_active = false;
+#if !POSITION_LOOP_DIRECT_DRIVE
+			stuck_ticks = 0u;
+			breakaway_ramp_ticks = 0u;
+			breakaway_active = false;
+			breakaway_angle = 0.0f;
+#endif
+		}
+	}
 
 	/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
 	float target_y = ball_target_get();
@@ -769,30 +829,26 @@ void pid_control__26Y(void)
 	 */
 	float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
 	float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
-	float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
 
-	/* 接近目标后的到位保持。
-	 *
-	 * 这里不是简单的“位置一小就停”，而是同时满足：
-	 *   1) |位置误差| <= 0.4cm：比 ±1cm 的验收线明显更紧，真正贴近目标；
-	 *   2) |速度| <= 0.4cm/s：球确实已经慢下来，而不是高速穿越目标点。
-	 *
-	 * 一旦进入保持态，就直接撤掉控制输出，让平台回到 0°；
-	 * 只有当误差重新长到 0.6cm 以上时才恢复闭环。这个回差能避免视觉噪声、
-	 * 步进脉冲量化和轻微回弹把系统卡在“进死区/出死区”的反复切换里。
-	 */
-	if(target_hold_active) {
-		if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
-			target_hold_active = false;
+	/* 最终保持只在第二段完成后生效。
+	 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。 */
+	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+		if(target_hold_active) {
+			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+				target_hold_active = false;
+			}
+		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+			target_hold_active = true;
 		}
-	} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
-	          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
-		target_hold_active = true;
+	} else {
+		target_hold_active = false;
 	}
 
 	if(target_hold_active) {
-		/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
-		 * 单环模式下这里只保留到位保持；串级模式下还要顺手清掉 breakaway 状态。 */
+		/* 进入误差保持区后，只停止位置环继续推球：
+		 *   1) 外环目标速度稍后压到 0；
+		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+		 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
 #if !POSITION_LOOP_DIRECT_DRIVE
 		stuck_ticks = 0u;
 		breakaway_ramp_ticks = 0u;
