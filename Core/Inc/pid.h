@@ -92,10 +92,11 @@ void pidout_Servo_limit(pid_t *pid);
 
 ////////////////////26//////////////
 /* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
-#define ANGLE_LIMIT_MAX   10.0f    /* 正向最终机械保护角度 (°) */
+#define ANGLE_LIMIT_MAX   12.0f    /* 正向最终机械保护角度 (°) */
 #define ANGLE_LIMIT_MIN  -12.0f    /* 反向最终机械保护角度 (°) */
 
 /* 串级控制的正常工作范围；最终机械限幅仅作为最后一级保护。 */
+#define POSITION_LOOP_DIRECT_DRIVE    0       /* 1: 位置环直接输出电机角度，便于单独调位置环；0: 恢复串级 PID */
 #define BALL_VELOCITY_CONTROL_LIMIT  8.0f  /* 进入速度环前的速度反馈限幅 (cm/s) */
 
 /* 外位置环输出的目标速度限幅 (cm/s)。
@@ -105,8 +106,8 @@ void pidout_Servo_limit(pid_t *pid);
  * 1.5cm/s，而实际下滑速度可达 6cm/s，内环立刻输出满量程负角提前刹车，
  * 球在离目标还有 10cm 处就被摁住甚至被推回，无法抵达目标。不要再调回该值。
  */
-#define BALL_TARGET_SPEED_LIMIT       5.0f
-#define SPEED_LOOP_ANGLE_LIMIT        4.0f  /* 内速度环输出的正常倾角限幅 (°) */
+#define BALL_TARGET_SPEED_LIMIT       10.0f
+#define SPEED_LOOP_ANGLE_LIMIT        10.0f  /* 内速度环输出的正常倾角限幅 (°) */
 
 /* 内速度环积分限幅 (°)：积分项唯一职责是补偿"命令 0° 并非真正水平"的机械零点
  * 偏差与滚动摩擦，因此上限取略小于正常倾角限幅，避免积分独自吃满整个工作范围。
@@ -176,8 +177,8 @@ extern volatile float ball_target_y;
 void ball_target_set(float target_y);
 float ball_target_get(void);
 
-extern pid_t pidY;        /* 外环：位置 -> 小球目标速度 */
-extern pid_t pidY_Speed;  /* 内环：小球速度 -> 平台倾角 */
+extern pid_t pidY;        /* 单环直驱时：位置 -> 平台倾角；串级时：位置 -> 小球目标速度 */
+extern pid_t pidY_Speed;  /* 串级模式下：小球速度 -> 平台倾角 */
 extern float pidY_velocity_damping;  /* 保留旧变量名，当前为速度环倾角输出 */
 extern float pidY_filtered_velocity; /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
 

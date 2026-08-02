@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include "Emm_V5.h"
 #include "UART_vofa_usage.h"
+#include "bt_tune.h"
 #include "pid.h"
 /* USER CODE END Includes */
 
@@ -108,6 +109,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
   MX_USART3_UART_Init();
+  MX_UART4_Init();
   /* USER CODE BEGIN 2 */
 
   // ========== 启动 UART1 DMA 接收（步进电机） ==========
@@ -143,14 +145,17 @@ int main(void)
   /* 内环 I=0.01/tick（50Hz → 0.5/s）：唯一职责是把"命令 0° 并非真正水平"的
    * 机械零点偏差与滚动摩擦这个常值扰动积掉，由 SPEED_LOOP_I_LIMIT 限幅 ±2.5°。
    * 外环保持 I=0（POS_LOOP_I_LIMIT 也为 0），位置环靠内环消稳态误差即可。 */
-  pid_init(&pidY, POSITION_PID, 0.40f, 0.0f, 0.00f, 0.0f);
-  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.01f, 0.0f, 0.0f);//P=1.1 I=0.01/tick
-  ball_target_set(-5.0f);
+  pid_init(&pidY, POSITION_PID, 0.8f, 0.0f, 0.00f, 0.0f);
+  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.01f, 0.0f, 0.0f);// 从0到5 pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+  ball_target_set(-5.5f);  // 初始目标位置（cm），负=左，正=右
+  BT_Tune_Init();
   while (1)
   {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    BT_Tune_Process();
+
  if(g_flag_10ms)
     {
         g_flag_10ms = false;    // 清标志

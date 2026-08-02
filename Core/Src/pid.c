@@ -729,11 +729,13 @@ void pid_control__26Y(void)
 {
 	static float relative_y_last = 0.0f;
 	static float target_y_last = 0.0f;
+#if !POSITION_LOOP_DIRECT_DRIVE
 	static float breakaway_start_error = 0.0f;
 	static float breakaway_angle = 0.0f;
 	static uint8_t stuck_ticks = 0u;
 	static uint8_t breakaway_ramp_ticks = 0u;
 	static bool breakaway_active = false;
+#endif
 	static bool control_initialized = false;
 	static bool target_hold_active = false;
 
@@ -744,12 +746,14 @@ void pid_control__26Y(void)
 	float relative_y = Y - target_y;
 	bool target_changed = !control_initialized || target_y != target_y_last;
 
-	/* 切换目标时丢弃旧的卡滞状态，避免沿旧目标方向施加起动倾角。 */
+	/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
 	if(target_changed) {
+#if !POSITION_LOOP_DIRECT_DRIVE
 		stuck_ticks = 0u;
 		breakaway_ramp_ticks = 0u;
 		breakaway_active = false;
 		breakaway_angle = 0.0f;
+#endif
 		target_hold_active = false;
 		relative_y_last = relative_y;
 		target_y_last = target_y;
@@ -788,14 +792,13 @@ void pid_control__26Y(void)
 
 	if(target_hold_active) {
 		/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
-		 * 做法是：仅禁止 breakaway，且稍后把外环目标速度压到 0，
-		 * 让内环继续按“0 速度”闭环保持球静止。
-		 * 这样既保留了微调能力，又避免平台在目标附近追来追去。
-		 */
+		 * 单环模式下这里只保留到位保持；串级模式下还要顺手清掉 breakaway 状态。 */
+#if !POSITION_LOOP_DIRECT_DRIVE
 		stuck_ticks = 0u;
 		breakaway_ramp_ticks = 0u;
 		breakaway_active = false;
 		breakaway_angle = 0.0f;
+#endif
 	}
 
 	/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
@@ -815,8 +818,8 @@ void pid_control__26Y(void)
 		pidY.out = 0.0f;
 	}
 
-	/* 先限制本地估计速度，再低通滤波，避免位置量化造成的单帧尖峰把速度环推入饱和。
-	 * VOFA ch2 继续保留 MaixCAM 原始速度，仅用于诊断比较，不再直接参与控制。
+	/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+	 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
 	 */
 	float control_velocity = estimated_velocity;
 	if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
@@ -827,6 +830,20 @@ void pid_control__26Y(void)
 	pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
 	                         (control_velocity - pidY_filtered_velocity);
 
+#if POSITION_LOOP_DIRECT_DRIVE
+	/* 单环调试模式：位置环直接输出平台倾角。
+	 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+	 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+	pidY_velocity_damping = 0.0f;
+	pidY_Speed.target = 0.0f;
+	pidY_Speed.now = pidY_filtered_velocity;
+	pidY_Speed.out = 0.0f;
+	pidY_Speed.pout = 0.0f;
+	pidY_Speed.iout = 0.0f;
+	pidY_Speed.dout = 0.0f;
+
+	float cmd_angle = pidY.out;
+#else
 	/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
 	 *
 	 * breakaway 现改为“分级加力”：
@@ -883,14 +900,7 @@ void pid_control__26Y(void)
 		stuck_ticks = 0u;
 	}
 
-	/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。
-	 *
-	 * 内环积分是消除稳态位置误差的关键：命令角 0° 只是上电机械零点，
-	 * 不等于力学水平角。两者之差加上滚动摩擦是一个常值扰动，
-	 * 纯 P 串级无法消除，小球只会停在“实际水平”的位置而不是目标位置。
-	 * 内环积分会持续调整倾角直到实测速度跟上目标速度，
-	 * 静止平衡时即自动找到真实水平角，外环误差随之收敛到 0。
-	 */
+	/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
 	pidY_Speed.target = pidY.out;
 	pidY_Speed.now = pidY_filtered_velocity;
 
@@ -920,6 +930,7 @@ void pid_control__26Y(void)
 			cmd_angle = breakaway_angle;
 		}
 	}
+#endif
 
 	// 负方向（下降）机构补偿 ×1.2。
 	if(cmd_angle < 0.0f) {

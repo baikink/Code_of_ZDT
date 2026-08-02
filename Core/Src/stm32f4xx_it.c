@@ -23,6 +23,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "Emm_V5.h"
+#include "bt_tune.h"
 #include <string.h>  // 用于 memcpy
 #include <math.h>    // 用于 fabsf
 /* USER CODE END Includes */
@@ -63,6 +64,7 @@ extern DMA_HandleTypeDef hdma_usart1_tx;
 extern DMA_HandleTypeDef hdma_usart2_rx;
 extern UART_HandleTypeDef huart1;
 extern UART_HandleTypeDef huart2;
+extern UART_HandleTypeDef huart4;
 /* USER CODE BEGIN EV */
 extern volatile uint32_t g_tick_10ms;
 extern volatile bool g_flag_10ms;
@@ -372,6 +374,27 @@ void DMA2_Stream7_IRQHandler(void)
   /* USER CODE END DMA2_Stream7_IRQn 1 */
 }
 
+/**
+  * @brief This function handles UART4 global interrupt.
+  */
+void UART4_IRQHandler(void)
+{
+  /* USER CODE BEGIN UART4_IRQn 0 */
+
+  /* USER CODE END UART4_IRQn 0 */
+  HAL_UART_IRQHandler(&huart4);
+  /* USER CODE BEGIN UART4_IRQn 1 */
+
+  /* USER CODE END UART4_IRQn 1 */
+}
+
 /* USER CODE BEGIN 1 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if(huart->Instance == UART4) {
+    BT_Tune_ByteReceived();
+  }
+}
+
 
 /* USER CODE END 1 */
