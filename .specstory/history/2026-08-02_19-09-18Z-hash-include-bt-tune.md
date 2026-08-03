@@ -2,7 +2,7 @@
 
 # 2026-08-02 19:09:18Z
 
-<!-- Claude Code Session 431fff85-4818-466d-9d9c-10ebff5d905f (2026-08-02 19:09:18Z) -->
+<!-- Claude Code Session 069a0196-6fe2-4d6d-8ec2-b1d12f4294bb (2026-08-02 19:09:18Z) -->
 
 _**User (2026-08-02 19:09:18Z)**_
 
@@ -5605,7 +5605,7 @@ _**Agent (claude-opus-4-8 2026-08-02 19:33:08Z)**_
 ```
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:33:29Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:52:49Z)**_
 
 对，现在你贴出来的代码里，工作限幅确实已经是 `10°`，这一点没问题。
 
@@ -5688,194 +5688,965 @@ _**Agent (claude-opus-4-8 2026-08-02 19:33:29Z)**_
 
 ---
 
-_**User (2026-08-02 19:45:45Z)**_
+_**User (2026-08-02 19:54:14Z)**_
 
 <ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
 
-现在改一下小球停止逻辑，先让小球往+5cm移动，当检测到小球在+5cm时，马上把目标改为-5cm然后稳定在-5cm
+现在我要调这个串级pid的参数，先调位置环，你把位置环的输出先给我加载到电机，我先单调位置环
 
 ---
 
-_**Agent (claude-opus-4-8 2026-08-02 19:45:58Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:54:29Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Planning PID and target control updates**
+**Inspecting PID control loop files**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:00Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:54:30Z)**_
+
+我先把控制链路看完整，确认最小改法：位置环直接出角度命令，暂时旁路速度环，不动你现有无线调参接口。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:54:32Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ 梳理当前串级 PID 控制链路
+- [ ] 🌡️ 改为位置环直接驱动电机角度
+- [ ] 🌡️ 构建验证单环模式
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:54:38Z)**_
+
+我会保留现在的调参串口和 VOFA 通道，只把 `pid_control__26Y()` 的执行路径切成“位置环单环直驱”。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:54:38Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+760		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+761	
+762		/* 内环速度反馈改为本地位置差分速度。
+763		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+764		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+765		 */
+766		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+767		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+768		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+769	
+770		/* 接近目标后的到位保持。
+771		 *
+772		 * 这里不是简单的“位置一小就停”，而是同时满足：
+773		 *   1) |位置误差| <= 0.4cm：比 ±1cm 的验收线明显更紧，真正贴近目标；
+774		 *   2) |速度| <= 0.4cm/s：球确实已经慢下来，而不是高速穿越目标点。
+775		 *
+776		 * 一旦进入保持态，就直接撤掉控制输出，让平台回到 0°；
+777		 * 只有当误差重新长到 0.6cm 以上时才恢复闭环。这个回差能避免视觉噪声、
+778		 * 步进脉冲量化和轻微回弹把系统卡在“进死区/出死区”的反复切换里。
+779		 */
+780		if(target_hold_active) {
+781			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+782				target_hold_active = false;
+783			}
+784		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+785		          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+786			target_hold_active = true;
+787		}
+788	
+789		if(target_hold_active) {
+790			/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
+791			 * 做法是：仅禁止 breakaway，且稍后把外环目标速度压到 0，
+792			 * 让内环继续按“0 速度”闭环保持球静止。
+793			 * 这样既保留了微调能力，又避免平台在目标附近追来追去。
+794			 */
+795			stuck_ticks = 0u;
+796			breakaway_ramp_ticks = 0u;
+797			breakaway_active = false;
+798			breakaway_angle = 0.0f;
+799		}
+800	
+801		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+802		pidY.target = 0.0f;
+803		pidY.now = relative_y;
+804		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+805		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+806		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+807		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+808		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+809		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+810		                POS_LOOP_I_LIMIT);
+811		if(target_hold_active) {
+812			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+813			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+814			 */
+815			pidY.out = 0.0f;
+816		}
+817	
+818		/* 先限制本地估计速度，再低通滤波，避免位置量化造成的单帧尖峰把速度环推入饱和。
+819		 * VOFA ch2 继续保留 MaixCAM 原始速度，仅用于诊断比较，不再直接参与控制。
+820		 */
+821		float control_velocity = estimated_velocity;
+822		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+823			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+824		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+825			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+826		}
+827		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+828		                         (control_velocity - pidY_filtered_velocity);
+829	
+830		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+831		 *
+832		 * breakaway 现改为“分级加力”：
+833		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+834		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+835		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+836		 *
+837		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+838		 */
+839		if(breakaway_active) {
+840			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+841			   (breakaway_start_error < 0.0f &&
+842			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+843			   (breakaway_start_error > 0.0f &&
+844			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+845				breakaway_active = false;
+846				breakaway_angle = 0.0f;
+847				breakaway_ramp_ticks = 0u;
+848			} else if(position_delta > -STUCK_POSITION_DELTA &&
+849			          position_delta < STUCK_POSITION_DELTA) {
+850				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+851					breakaway_ramp_ticks++;
+852				} else {
+853					breakaway_ramp_ticks = 0u;
+854					if(breakaway_start_error < 0.0f) {
+855						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+856						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+857							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+858						}
+859					} else {
+860						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+861						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+862							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+863						}
+864					}
+865				}
+866			} else {
+867				breakaway_ramp_ticks = 0u;
+868			}
+869			stuck_ticks = 0u;
+870		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+871		          position_delta > -STUCK_POSITION_DELTA &&
+872		          position_delta < STUCK_POSITION_DELTA) {
+873			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+874				stuck_ticks++;
+875			}
+876			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+877				breakaway_start_error = relative_y;
+878				breakaway_active = true;
+879				breakaway_ramp_ticks = 0u;
+880				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+881			}
+882		} else {
+883			stuck_ticks = 0u;
+884		}
+885	
+886		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。
+887		 *
+888		 * 内环积分是消除稳态位置误差的关键：命令角 0° 只是上电机械零点，
+889		 * 不等于力学水平角。两者之差加上滚动摩擦是一个常值扰动，
+890		 * 纯 P 串级无法消除，小球只会停在“实际水平”的位置而不是目标位置。
+891		 * 内环积分会持续调整倾角直到实测速度跟上目标速度，
+892		 * 静止平衡时即自动找到真实水平角，外环误差随之收敛到 0。
+893		 */
+894		pidY_Speed.target = pidY.out;
+895		pidY_Speed.now = pidY_filtered_velocity;
+896	
+897		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+898		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+899		float iout_frozen = pidY_Speed.iout;
+900		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+901		                SPEED_LOOP_I_LIMIT);
+902		if(breakaway_active) {
+903			pidY_Speed.iout = iout_frozen;
+904			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+905			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+906				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+907			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+908				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+909			}
+910		}
+911	
+912		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+913	
+914		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+915		float cmd_angle = pidY_velocity_damping;
+916		if(breakaway_active) {
+917			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+918				cmd_angle = breakaway_angle;
+919			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+920				cmd_angle = breakaway_angle;
+921			}
+922		}
+923	
+924		// 负方向（下降）机构补偿 ×1.2。
+925		if(cmd_angle < 0.0f) {
+926			cmd_angle *= 1.2f;
+927		}
+928	
+929		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+930		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+931		static float cmd_angle_last = 0.0f;
+932		{
+933			float delta = cmd_angle - cmd_angle_last;
+934			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+935			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+936			cmd_angle = cmd_angle_last + delta;
+937			cmd_angle_last = cmd_angle;
+938		}
+939		motor_set_angle(cmd_angle);
+940	
+941		relative_y_last = relative_y;
+942		Y_last = Y;
+943	}
+944	
+945	void pidout_limit_Y(pid_t *pid)
+946	{
+947		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+948	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:54:38Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+1	#ifndef __PID_h_
+2	#define __PID_h_
+3	#include <stdint.h>
+4	#include <stdbool.h>
+5	
+6	
+7	extern int redX_last;
+8	extern int redY_last;
+9	extern int redXSpeed;
+10	extern int redYSpeed;
+11	
+12	enum
+13	{
+14	  POSITION_PID = 0,  // ��???
+15	  DELTA_PID,         // ?????
+16	};
+17	
+18	typedef struct
+19	{
+20		float target;	
+21		float target_last;
+22		float now;
+23		float error[3];		
+24		float error_taget;	
+25		float p,i,d,f;
+26		float pout, dout, iout,fout;
+27		float out;   
+28		
+29		uint32_t pid_mode;
+30	
+31	}pid_t;
+32	
+33	/* 输出限幅宏（反算式抗积分饱和）
+34	 * 超出 [lo, hi] 时把超出量从 iout 里减回来。
+35	 * 用法：PIDOUT_CLAMP(&pidXxx, -50.0f, 50.0f);
+36	 *
+37	 * ⚠️ 仅适用于「饱和确实由积分项造成」的场合。若比例项单独就能大幅越限
+38	 *    （小球平衡内环：error 可达 ±13cm/s × P1.1 = ±14° vs 4° 限幅），
+39	 *    反算会把**比例项的溢出量**写进 iout：
+40	 *      - Ki = 0 时该偏置永久不化，环路从此带一个常值反向偏置；
+41	 *      - Ki > 0 时也要数秒才能爬回，期间持续反顶外环。
+42	 *    串级环请改用 pid.c 的 pid_cal_clamped()（条件积分，绝不污染 iout）。
+43	 */
+44	#define PIDOUT_CLAMP(pid, lo, hi)                               \
+45	    do {                                                        \
+46	        if((pid)->out > (float)(hi)) {                          \
+47	            (pid)->iout -= ((pid)->out - (float)(hi));          \
+48	            (pid)->out   = (float)(hi);                         \
+49	        }                                                       \
+50	        if((pid)->out < (float)(lo)) {                          \
+51	            (pid)->iout -= ((pid)->out - (float)(lo));          \
+52	            (pid)->out   = (float)(lo);                         \
+53	        }                                                       \
+54	    } while(0)
+55	
+56	/*extern pid_t motorA;
+57	extern pid_t motorB;
+58	extern pid_t motorC;
+59	extern pid_t motorD;
+60	
+61	extern pid_t weizhiA;
+62	extern pid_t weizhiB;
+63	extern pid_t weizhiC;
+64	extern pid_t weizhiD;
+65	
+66	extern pid_t ServoA;
+67	extern pid_t ServoB;*/
+68	
+69	/*extern pid_t ServoA_Speed;
+70	extern pid_t ServoB_Speed;
+71	
+72	extern pid_t ServoA_Pid;
+73	extern pid_t ServoB_Pid;*/
+74	
+75	void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f);
+76	void pid_cal(pid_t *pid);
+77	/*void motor_target_set(int spe1, int spe2);*/
+78	void pidout_limit(pid_t *pid);
+79	
+80	/*void pid_control(void);
+81	void pid_control_speed(void);
+82	void pid_control_speed_CD(void);
+83	void pid_control_Position_CD(int C,int D);
+84	void pid_control_Speed_Position_CD(int C,int D,int SC,int SD);
+85	void pid_control_Speed_Position_AB(int A,int B,int SA,int SB);*/
+86	
+87	/*void pid_control_X(void);
+88	void pid_control_Y(void);*/
+89	
+90	
+91	void pidout_Servo_limit(pid_t *pid);
+92	
+93	////////////////////26//////////////
+94	/* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
+95	#define ANGLE_LIMIT_MAX   10.0f    /* 正向最终机械保护角度 (°) */
+96	#define ANGLE_LIMIT_MIN  -12.0f    /* 反向最终机械保护角度 (°) */
+97	
+98	/* 串级控制的正常工作范围；最终机械限幅仅作为最后一级保护。 */
+99	#define BALL_VELOCITY_CONTROL_LIMIT  8.0f  /* 进入速度环前的速度反馈限幅 (cm/s) */
+100	
+101	/* 外位置环输出的目标速度限幅 (cm/s)。
+102	 * 必须满足 限幅 ≈ 外环P × 位置半量程（0.40 × 12.5 ≈ 5.0），否则误差一超过
+103	 * 限幅/P 的距离，外环就恒定饱和，位置信息丢失，串级退化成纯调速器。
+104	 * 曾用 1.5f：外环在 |error| > 3.75cm 即饱和，球从远处滚来时目标速度恒为
+105	 * 1.5cm/s，而实际下滑速度可达 6cm/s，内环立刻输出满量程负角提前刹车，
+106	 * 球在离目标还有 10cm 处就被摁住甚至被推回，无法抵达目标。不要再调回该值。
+107	 */
+108	#define BALL_TARGET_SPEED_LIMIT       10.0f
+109	#define SPEED_LOOP_ANGLE_LIMIT        10.0f  /* 内速度环输出的正常倾角限幅 (°) */
+110	
+111	/* 内速度环积分限幅 (°)：积分项唯一职责是补偿"命令 0° 并非真正水平"的机械零点
+112	 * 偏差与滚动摩擦，因此上限取略小于正常倾角限幅，避免积分独自吃满整个工作范围。
+113	 */
+114	#define SPEED_LOOP_I_LIMIT            2.5f
+115	
+116	/* 外位置环积分限幅 (cm/s)：外环目前 Ki=0，故取 0 —— 配合 pid_cal_clamped()
+117	 * 可保证 iout 恒为 0，任何饱和都不会在 Ki=0 的环上留下永久偏置。
+118	 * 若将来给外环加积分，把这里改成非零上限即可。
+119	 */
+120	#define POS_LOOP_I_LIMIT              0.0f
+121	
+122	/* 倾角变化率限制：限制每个控制周期(20ms)命令角度的最大变化量，
+123	 * 仅用于避免相邻周期从 +限幅 直接跳到 -限幅 的机械冲击，不应成为主要滞后来源。
+124	 * 1.0°/20ms = 50°/s：全量程 ±4° 换向约需 160ms，仍远快于小球动力学。
+125	 * 注意：0.15°/tick(7.5°/s) 会让 4° 命令需要 540ms 才到位，
+126	 * 相位滞后远超小球响应时间，会直接导致越过目标后无法收敛，不要再调回该值。
+127	 */
+128	#define ANGLE_SLEW_PER_TICK          1.0f
+129	
+130	/* 控制周期与本地速度估计。
+131	 * 主循环实际每 20ms 调一次控制，因此直接用位置差分 / 0.02s 估计球速。
+132	 * 位置量测比 MaixCAM 直接给出的速度更连续稳定，适合作为内环反馈。
+133	 */
+134	#define PID_CONTROL_PERIOD_S        0.02f
+135	
+136	/* 本地估计速度低通：滤波后的速度作为串级速度环的当前值。 */
+137	#define BALL_VELOCITY_FILTER_ALPHA  0.25f
+138	
+139	/* 接近目标后的稳态区。
+140	 *
+141	 * 这里不再“退出闭环并锁角/回零”，而是仅在非常靠近目标时，把外环目标速度压到 0，
+142	 * 让内环继续以“0 速度”闭环保持小球静止。这样既能继续收敛，又不会在目标附近追来追去。
+143	 *
+144	 * 进入条件收紧到 0.15cm，退出条件为 0.30cm：
+145	 *   - 明显优于 ±1cm 的验收线；
+146	 *   - 又留出 0.15cm 回差，避免边界抖动。
+147	 * 仍要求速度也足够小，防止球高速穿过目标点时过早进入稳态区。
+148	 */
+149	#define TARGET_HOLD_POSITION_ENTER  0.15f
+150	#define TARGET_HOLD_POSITION_EXIT   0.30f
+151	#define TARGET_HOLD_SPEED_LIMIT     0.25f
+152	
+153	/* 小球偏离目标且持续不动时，用起动倾角克服静摩擦。
+154	 *
+155	 * 不再使用固定单一的 breakaway 角。
+156	 * 现改为“分级加力”：先给一个较小起动角，若球仍不动，就每隔一段时间再加一点，
+157	 * 直到上限。这样既能在轻微卡滞时保持动作柔和，也能在重静摩擦时继续加力，避免
+158	 * 像之前那样一直卡死在固定的 -3.6° 上。
+159	 */
+160	#define STUCK_POSITION_THRESHOLD      0.6f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
+161	#define STUCK_POSITION_DELTA          0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
+162	#define STUCK_TICKS_REQUIRED          10u     /* 连续 10 × 20ms = 200ms 不动后进入 breakaway */
+163	#define BREAKAWAY_POS_ANGLE_BASE      2.0f    /* 正向起动角初值 (°) */
+164	#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
+165	#define BREAKAWAY_POS_ANGLE_MAX       4.0f    /* 正向起动角上限 (°) */
+166	#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
+167	#define BREAKAWAY_ANGLE_STEP          0.5f    /* 每次加力的步长 (°) */
+168	#define BREAKAWAY_RAMP_TICKS          8u      /* 每 8 × 20ms = 160ms 仍不动则再加一级 */
+169	#define BREAKAWAY_RELEASE_DISTANCE    0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
+170	
+171	extern float Y;
+172	extern float Y_last;
+173	
+174	/* 小球目标位置，单位 cm，坐标系与 Y 保持一致；可在运行中随时更新。 */
+175	extern volatile float ball_target_y;
+176	void ball_target_set(float target_y);
+177	float ball_target_get(void);
+178	
+179	extern pid_t pidY;        /* 外环：位置 -> 小球目标速度 */
+180	extern pid_t pidY_Speed;  /* 内环：小球速度 -> 平台倾角 */
+181	extern float pidY_velocity_damping;  /* 保留旧变量名，当前为速度环倾角输出 */
+182	extern float pidY_filtered_velocity; /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+183	
+184	void pid_control__26Y(void);
+185	void motor_set_angle(float target_deg);
+186	float motor_get_command_angle(void);
+187	
+188	void pidout_limit_Y(pid_t *pid);
+189	
+190	
+191	
+192	
+193	
+194	
+195	
+196	#endif
+197
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:54:48Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Defining detection threshold for target switching**
+**Clarifying code modification approach**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:03Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:54:50Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Evaluating immediate target switching logic**
+**Planning single-loop position control edits**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:07Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:54:52Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Refining threshold crossing logic**
+**Deciding angle output clamping strategy**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:07Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:54:58Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Planning integrator reset on target switch**
+**Updating comments for direct angle output**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:09Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:54:59Z)**_
 
-我先看一下 `main.c` 当前目标设置和循环结构，然后把“先去 +5，再切到 -5 并停住”的状态机直接接进去。
+<think><details><summary>Thought Process</summary>
+**Planning clean single-loop tuning mode**
+</details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:10Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 19:55:02Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing direct mode for pid_control__26Y**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting loop tuning and output mapping**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:09Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning position loop direct drive macro**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:13Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Finalizing direct drive macro default setup**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adding direct drive position loop define**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning direct drive mode patch in pid_control**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating direct motor angle setting risks**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning comment updates for direct mode**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:55:27Z)**_
+
+我准备把它做成一个明确的“单环直驱模式”开关，默认打开：位置环直接输出角度到电机，速度环只保留变量但不参与控制，便于你先把位置环调顺。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:56:41Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Add single-loop tuning mode switch in pid header
+
+```bash
+apply_patch <<'PATCH'
+*** Begin Patch
+*** Update File: d:/File/2026diansaiH/Code_of_ZDT/Core/Inc/pid.h
+@@
+ /* 串级控制的正常工作范围；最终机械限幅仅作为最后一级保护。 */
++#define POSITION_LOOP_DIRECT_DRIVE    1       /* 1: 位置环直接输出电机角度，便于单独调位置环；0: 恢复串级 PID */
+ #define BALL_VELOCITY_CONTROL_LIMIT  8.0f  /* 进入速度环前的速度反馈限幅 (cm/s) */
+@@
+-extern pid_t pidY;        /* 外环：位置 -> 小球目标速度 */
+-extern pid_t pidY_Speed;  /* 内环：小球速度 -> 平台倾角 */
++extern pid_t pidY;        /* 单环直驱时：位置 -> 平台倾角；串级时：位置 -> 小球目标速度 */
++extern pid_t pidY_Speed;  /* 串级模式下：小球速度 -> 平台倾角 */
+*** End Patch
+PATCH
+```
+
+```text
+Exit code 127
+/usr/bin/bash: line 14: apply_patch: command not found
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:56:45Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Switching to Edit tool for patching**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:56:46Z)**_
+
+环境里没有 `apply_patch` 命令，我改用精确文件补丁继续，不影响结果。接下来把单环直驱开关和控制分支补进去。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:56:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:56:59Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:57:04Z)**_
+
+我现在改 `pid.c` 的执行路径：保持位置误差定义、保持区和斜坡限幅，但让 `pidY.out` 直接作为电机角度命令。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:03Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:11Z)**_
+
+改动已经进去了：`POSITION_LOOP_DIRECT_DRIVE=1` 时，`pidY.out` 会直接作为目标角走后面的负向补偿、角度变化率限制和电机输出。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:17Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware in position-loop direct-drive mode
+
+`cmake --build build/Debug`
+
+```text
+[1/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c: In function 'pid_control__26Y':
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:736:21: warning: variable 'breakaway_active' set but not used [-Wunused-but-set-variable]
+  736 |         static bool breakaway_active = false;
+      |                     ^~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:735:24: warning: variable 'breakaway_ramp_ticks' set but not used [-Wunused-but-set-variable]
+  735 |         static uint8_t breakaway_ramp_ticks = 0u;
+      |                        ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:734:24: warning: variable 'stuck_ticks' set but not used [-Wunused-but-set-variable]
+  734 |         static uint8_t stuck_ticks = 0u;
+      |                        ^~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:733:22: warning: variable 'breakaway_angle' set but not used [-Wunused-but-set-variable]
+  733 |         static float breakaway_angle = 0.0f;
+      |                      ^~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:732:22: warning: unused variable 'breakaway_start_error' [-Wunused-variable]
+  732 |         static float breakaway_start_error = 0.0f;
+      |                      ^~~~~~~~~~~~~~~~~~~~~
+[2/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[3/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/bt_tune.c.obj
+[4/4] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37200 B         1 MB      3.55%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:21Z)**_
+
+构建过了，只有因为旁路速度环产生的未使用变量告警。我把这些告警顺手收掉，保持代码干净。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:26Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:30Z)**_
+
+我再复建一次，确认单环模式下无告警通过。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:32Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 梳理当前串级 PID 控制链路
+- [X] 🌡️ 改为位置环直接驱动电机角度
+- [⚡] 🌡️ 构建验证单环模式
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:39Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild after cleaning direct-drive warnings
+
+`cmake --build build/Debug`
+
+```text
+Exit code 1
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+FAILED: CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj 
+D:\STM32CubeCLT\STM32CubeCLT_1.19.0\GNU-tools-for-STM32\bin\arm-none-eabi-gcc.exe -DDEBUG -DSTM32F407xx -DUSE_HAL_DRIVER -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Core/Inc -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/STM32F4xx_HAL_Driver/Inc -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/CMSIS/Device/ST/STM32F4xx/Include -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/CMSIS/Include -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard  -Wall -fdata-sections -ffunction-sections -fstack-usage -O0 -g3 -std=gnu11 -fdiagnostics-color=always -MD -MT CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj -MF CMakeFiles\Code_of_ZDT.dir\Core\Src\pid.c.obj.d -o CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj -c D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c: In function 'pid_control__26Y':
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:751:17: error: 'stuck_ticks' undeclared (first use in this function)
+  751 |                 stuck_ticks = 0u;
+      |                 ^~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:751:17: note: each undeclared identifier is reported only once for each function it appears in
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:752:17: error: 'breakaway_ramp_ticks' undeclared (first use in this function)
+  752 |                 breakaway_ramp_ticks = 0u;
+      |                 ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:753:17: error: 'breakaway_active' undeclared (first use in this function)
+  753 |                 breakaway_active = false;
+      |                 ^~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:754:17: error: 'breakaway_angle' undeclared (first use in this function)
+  754 |                 breakaway_angle = 0.0f;
+      |                 ^~~~~~~~~~~~~~~
+ninja: build stopped: subcommand failed.
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:44Z)**_
+
+我漏看了前面“目标切换/保持态”里也在复位 breakaway 状态；把这些复位逻辑一起包进条件编译就行。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:45Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+740		static bool target_hold_active = false;
+741	
+742		Y = ball_error;  // 视觉小球绝对位置
+743	
+744		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+745		float target_y = ball_target_get();
+746		float relative_y = Y - target_y;
+747		bool target_changed = !control_initialized || target_y != target_y_last;
+748	
+749		/* 切换目标时丢弃旧的卡滞状态，避免沿旧目标方向施加起动倾角。 */
+750		if(target_changed) {
+751			stuck_ticks = 0u;
+752			breakaway_ramp_ticks = 0u;
+753			breakaway_active = false;
+754			breakaway_angle = 0.0f;
+755			target_hold_active = false;
+756			relative_y_last = relative_y;
+757			target_y_last = target_y;
+758			control_initialized = true;
+759		}
+760	
+761		float position_delta = relative_y - relative_y_last;
+762		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+763	
+764		/* 内环速度反馈改为本地位置差分速度。
+765		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+766		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+767		 */
+768		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+769		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+770		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+771	
+772		/* 接近目标后的到位保持。
+773		 *
+774		 * 这里不是简单的“位置一小就停”，而是同时满足：
+775		 *   1) |位置误差| <= 0.4cm：比 ±1cm 的验收线明显更紧，真正贴近目标；
+776		 *   2) |速度| <= 0.4cm/s：球确实已经慢下来，而不是高速穿越目标点。
+777		 *
+778		 * 一旦进入保持态，就直接撤掉控制输出，让平台回到 0°；
+779		 * 只有当误差重新长到 0.6cm 以上时才恢复闭环。这个回差能避免视觉噪声、
+780		 * 步进脉冲量化和轻微回弹把系统卡在“进死区/出死区”的反复切换里。
+781		 */
+782		if(target_hold_active) {
+783			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+784				target_hold_active = false;
+785			}
+786		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+787		          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+788			target_hold_active = true;
+789		}
+790	
+791		if(target_hold_active) {
+792			/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
+793			 * 做法是：仅禁止 breakaway，且稍后把外环目标速度压到 0，
+794			 * 让内环继续按“0 速度”闭环保持球静止。
+795			 * 这样既保留了微调能力，又避免平台在目标附近追来追去。
+796			 */
+797			stuck_ticks = 0u;
+798			breakaway_ramp_ticks = 0u;
+799			breakaway_active = false;
+800			breakaway_angle = 0.0f;
+801		}
+802	
+803		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+804		pidY.target = 0.0f;
+805		pidY.now = relative_y;
+806		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+807		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+808		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+809		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:48Z)**_
+
+我把这些 breakaway 复位只在串级模式下保留，单环模式下不再引用这几个变量。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:58:55Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:59:05Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:59:09Z)**_
+
+现在再编一次，确认单环位置直驱模式稳定可用。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:59:14Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild single-loop position mode
+
+`cmake --build build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37120 B         1 MB      3.54%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:59:17Z)**_
+
+单环位置模式已经编过。下面我把你现在实际会看到的 VOFA 含义一起说明清楚。
+
+_**Agent (claude-opus-4-8 2026-08-02 19:59:19Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 梳理当前串级 PID 控制链路
+- [X] 🌡️ 改为位置环直接驱动电机角度
+- [X] 🌡️ 构建验证单环模式
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 19:59:33Z)**_
+
+已经改成“先单调位置环”的模式，并且构建通过了 ✅
+
+现在控制链路是：
+
+- `pidY`：`位置误差 -> 电机目标角度`
+- `pidY_Speed`：暂时旁路，不参与控制
+- 电机仍然经过角度变化率限制和最终机械角度限幅
+
+关键改动：
+
+- 在 [pid.h:99](Core/Inc/pid.h#L99) 增加了开关 `POSITION_LOOP_DIRECT_DRIVE`
+- 当前设为 `1`，表示位置环直接驱动电机
+- 在 [pid.c:821](Core/Src/pid.c#L821) 开始，单环模式下 `pidY.out` 直接作为 `cmd_angle`
+- 串级模式代码我保留了，之后把 `POSITION_LOOP_DIRECT_DRIVE` 改回 `0` 就能恢复
+
+你现在调位置环时，VOFA 可以这样看：
+
+- `ch0`：最终下发给电机的角度
+- `ch1`：小球位置
+- `ch3`：现在就是位置环输出角度命令的原始值
+- `ch4`：此时被我清成 `0`，因为速度环已旁路
+- `ch5`：本地差分速度，仍可拿来观察球实际运动
+
+也就是说，**现在重点看 `ch1 / ch3 / ch0`** 就行：
+
+- `ch3` 大小是否合理
+- `ch0` 是否平滑跟上 `ch3`
+- `ch1` 是否朝目标收敛
+
+我已经重新构建通过：`cmake --build build/Debug` 成功。  
+你现在可以直接开始只调 `Pos_P / Pos_I / Pos_D`。建议先：
+
+1. `Pos_I = 0`
+2. `Pos_D = 0`
+3. 只调 `Pos_P`
+4. 有基本收敛后再少量加 `D`
+5. 最后再决定要不要加 `I`
+
+等你把位置环手感调顺，再切回串级会更稳。
+
+---
+
+_**User (2026-08-02 20:10:43Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+现在我调好了位置环的P时0.68，D项和I项都没有，现在改回串级，我调速度环的pid
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 20:10:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning PID initialization update**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:10:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Updating cascade mode and PID initialization**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:10:53Z)**_
+
+我把开关切回串级，并把位置环默认参数落成你刚调好的 `P=0.68, I=0, D=0`，然后直接编译验证。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:10:55Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ 恢复串级控制开关
+- [ ] 🌡️ 固化位置环默认参数
+- [ ] 🌡️ 构建验证串级模式
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:01Z)**_
+
+我会只动两个地方：`pid.h` 的模式开关、`main.c` 的 `pid_init(&pidY, ...)` 默认值。其他无线调参和 VOFA 保持不变。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:01Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+95	#define ANGLE_LIMIT_MAX   10.0f    /* 正向最终机械保护角度 (°) */
+96	#define ANGLE_LIMIT_MIN  -12.0f    /* 反向最终机械保护角度 (°) */
+97	
+98	/* 串级控制的正常工作范围；最终机械限幅仅作为最后一级保护。 */
+99	#define POSITION_LOOP_DIRECT_DRIVE    1       /* 1: 位置环直接输出电机角度，便于单独调位置环；0: 恢复串级 PID */
+100	#define BALL_VELOCITY_CONTROL_LIMIT  8.0f  /* 进入速度环前的速度反馈限幅 (cm/s) */
+101	
+102	/* 外位置环输出的目标速度限幅 (cm/s)。
+103	 * 必须满足 限幅 ≈ 外环P × 位置半量程（0.40 × 12.5 ≈ 5.0），否则误差一超过
+104	 * 限幅/P 的距离，外环就恒定饱和，位置信息丢失，串级退化成纯调速器。
+105	 * 曾用 1.5f：外环在 |error| > 3.75cm 即饱和，球从远处滚来时目标速度恒为
+106	 * 1.5cm/s，而实际下滑速度可达 6cm/s，内环立刻输出满量程负角提前刹车，
+107	 * 球在离目标还有 10cm 处就被摁住甚至被推回，无法抵达目标。不要再调回该值。
+108	 */
+109	#define BALL_TARGET_SPEED_LIMIT       10.0f
+110	#define SPEED_LOOP_ANGLE_LIMIT        10.0f  /* 内速度环输出的正常倾角限幅 (°) */
+111	
+112	/* 内速度环积分限幅 (°)：积分项唯一职责是补偿"命令 0° 并非真正水平"的机械零点
+113	 * 偏差与滚动摩擦，因此上限取略小于正常倾角限幅，避免积分独自吃满整个工作范围。
+114	 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:01Z)**_
 
 <tool-use data-tool-type="read" data-tool-name="Read"><details>
 <summary>Tool use: **Read**</summary>
  `./\Core\Src\main.c`
 
 ```text
-1	/* USER CODE BEGIN Header */
-2	/**
-3	  ******************************************************************************
-4	  * @file           : main.c
-5	  * @brief          : Main program body
-6	  ******************************************************************************
-7	  * @attention
-8	  *
-9	  * Copyright (c) 2026 STMicroelectronics.
-10	  * All rights reserved.
-11	  *
-12	  * This software is licensed under terms that can be found in the LICENSE file
-13	  * in the root directory of this software component.
-14	  * If no LICENSE file comes with this software, it is provided AS-IS.
-15	  *
-16	  ******************************************************************************
-17	  */
-18	/* USER CODE END Header */
-19	/* Includes ------------------------------------------------------------------*/
-20	#include "main.h"
-21	#include "dma.h"
-22	#include "usart.h"
-23	#include "gpio.h"
-24	
-25	/* Private includes ----------------------------------------------------------*/
-26	/* USER CODE BEGIN Includes */
-27	#include "Emm_V5.h"
-28	#include "UART_vofa_usage.h"
-29	#include "bt_tune.h"
-30	#include "pid.h"
-31	/* USER CODE END Includes */
-32	
-33	/* Private typedef -----------------------------------------------------------*/
-34	/* USER CODE BEGIN PTD */
-35	
-36	/* USER CODE END PTD */
-37	
-38	/* Private define ------------------------------------------------------------*/
-39	/* USER CODE BEGIN PD */
-40	
-41	// ========== 步进电机通信参数 ==========
-42	#define MOTOR_ADDR  1      // 电机地址
-43	#define MOTOR_SPEED 1500   // RPM
-44	#define MOTOR_ACC   100    // 加速度档位
-45	
-46	/* USER CODE END PD */
-47	
-48	/* Private macro -------------------------------------------------------------*/
-49	/* USER CODE BEGIN PM */
-50	
-51	/* USER CODE END PM */
-52	
-53	/* Private variables ---------------------------------------------------------*/
-54	
-55	/* USER CODE BEGIN PV */
-56	
-57	// 钢球位置误差/速度（由 USART2 中断从 MaixCAM 数据解析）
-58	volatile float ball_velocity = 0.0f;  // 钢球速度（cm/s），USART2 中断写、主循环读，必须 volatile
-59	
-60	// ── PID 实例（声明在 pid.h）──
-61	
-62	// ── 20ms 控制定时标志（SysTick 派生，50Hz）──
-63	volatile uint32_t g_tick_10ms = 0;
-64	volatile bool g_flag_10ms = false;
-65	
-66	/* USER CODE END PV */
-67	
-68	/* Private function prototypes -----------------------------------------------*/
-69	void SystemClock_Config(void);
-70	/* USER CODE BEGIN PFP */
-71	
-72	/* USER CODE END PFP */
-73	
-74	/* Private user code ---------------------------------------------------------*/
-75	/* USER CODE BEGIN 0 */
-76	
-77	/* USER CODE END 0 */
-78	
-79	/**
-80	  * @brief  The application entry point.
-81	  * @retval int
-82	  */
-83	int main(void)
-84	{
-85	
-86	  /* USER CODE BEGIN 1 */
-87	
-88	  /* USER CODE END 1 */
-89	
-90	  /* MCU Configuration--------------------------------------------------------*/
-91	
-92	  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-93	  HAL_Init();
-94	
-95	  /* USER CODE BEGIN Init */
-96	
-97	  /* USER CODE END Init */
-98	
-99	  /* Configure the system clock */
-100	  SystemClock_Config();
-101	
-102	  /* USER CODE BEGIN SysInit */
-103	
-104	  /* USER CODE END SysInit */
-105	
-106	  /* Initialize all configured peripherals */
-107	  MX_GPIO_Init();
-108	  MX_DMA_Init();
-109	  MX_USART1_UART_Init();
-110	  MX_USART2_UART_Init();
-111	  MX_USART3_UART_Init();
-112	  MX_UART4_Init();
-113	  /* USER CODE BEGIN 2 */
-114	
-115	  // ========== 启动 UART1 DMA 接收（步进电机） ==========
-116	  HAL_UART_Receive_DMA(&huart1, (uint8_t*)rxCmd, CMD_LEN);
-117	  __HAL_UART_ENABLE_IT(&huart1, UART_IT_IDLE);  // 使能 UART 空闲中断
-118	
-119	  // ========== 启动 UART2 DMA 接收（MaixCAM 视觉） ==========
-120	  HAL_UART_Receive_DMA(&huart2, (uint8_t*)rxMaixcam, RX_MAIXCAM_SIZE);
-121	  __HAL_UART_ENABLE_IT(&huart2, UART_IT_IDLE);  // 使能 UART 空闲中断
-122	
-123	  // ========== VOFA+ 通道准备（USART3） ==========
-124	  Vofa_usage_prepare();
-125	
-126	  // ========== 步进电机初始化 ==========
-127	  HAL_Delay(500);  // 等待串口和电机驱动器就绪
-128	/*
-129	  // 使能电机（只通电锁轴，不会转动）
-130	  Emm_V5_En_Control(MOTOR_ADDR, 1, 0);
-131	  HAL_Delay(100);
-132	*/
-133	  // 等待驱动器上电自动回零完成（0点已在张大头上位机设置好）
-134	  HAL_Delay(3000);
-135	  HAL_Delay(10);
-136	
-137	  /* USER CODE END 2 */
-138	
-139	  /* Infinite loop */
 140	  /* USER CODE BEGIN WHILE */
 141	
 142	  uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
@@ -5884,9 +6655,9 @@ _**Agent (claude-opus-4-8 2026-08-02 19:46:10Z)**_
 145	  /* 内环 I=0.01/tick（50Hz → 0.5/s）：唯一职责是把"命令 0° 并非真正水平"的
 146	   * 机械零点偏差与滚动摩擦这个常值扰动积掉，由 SPEED_LOOP_I_LIMIT 限幅 ±2.5°。
 147	   * 外环保持 I=0（POS_LOOP_I_LIMIT 也为 0），位置环靠内环消稳态误差即可。 */
-148	  pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.00f, 0.0f);
+148	  pid_init(&pidY, POSITION_PID, 0.90f, 0.0f, 0.00f, 0.0f);
 149	  pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.01f, 0.0f, 0.0f);//P=1.1 I=0.01/tick
-150	  ball_target_set(5.0f);
+150	  ball_target_set(0.0f);
 151	  BT_Tune_Init();
 152	  while (1)
 153	  {
@@ -5896,14 +6667,1978 @@ _**Agent (claude-opus-4-8 2026-08-02 19:46:10Z)**_
 157	    BT_Tune_Process();
 158	
 159	 if(g_flag_10ms)
-160	    {
-161	        g_flag_10ms = false;    // 清标志
-162	        pid_control__26Y();
-163	    }
-164	
-165	    // ========== 视觉数据：每帧更新 ==========
-166	    if(rxMaixcamFlag)
-167	    {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:05Z)**_
+
+我现在把开关改回 `0`，并把位置环默认值落成 `0.68 / 0 / 0`。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:09Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:16Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:20Z)**_
+
+串级已经恢复，外环默认参数也固化好了。我现在直接编译确认。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:21Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 恢复串级控制开关
+- [X] 🌡️ 固化位置环默认参数
+- [⚡] 🌡️ 构建验证串级模式
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:30Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after restoring cascaded PID mode
+
+`cmake --build build/Debug`
+
+```text
+[1/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[2/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[3/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/bt_tune.c.obj
+[4/4] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37976 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:34Z)**_
+
+构建通过。我再抓一下关键位置，方便你后面继续调速度环时对照。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:40Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 恢复串级控制开关
+- [X] 🌡️ 固化位置环默认参数
+- [X] 🌡️ 构建验证串级模式
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:11:52Z)**_
+
+已经改回串级了，并且编译通过 ✅
+
+当前状态：
+
+- [pid.h:99](Core/Inc/pid.h#L99) `POSITION_LOOP_DIRECT_DRIVE = 0`
+- [main.c:148](Core/Src/main.c#L148) 位置环默认参数改为 `P=0.68, I=0, D=0`
+- 速度环默认还是 [main.c:149](Core/Src/main.c#L149) 的 `P=1.1, I=0.01, D=0`
+
+也就是说现在链路恢复为：
+
+- `pidY`：位置 -> 目标速度
+- `pidY_Speed`：目标速度 -> 平台角度
+
+你接下来调速度环时，VOFA 主要看这几个：
+
+- `ch3`：位置环输出的目标速度
+- `ch5`：实际控制用速度反馈
+- `ch4`：速度环输出角度
+- `ch0`：最终下发给电机的角度
+
+调速度环建议顺序很直接：
+
+1. 先固定位置环 `P=0.68, I=0, D=0`
+2. 先调 `Spd_P`
+3. 再慢慢加 `Spd_I`
+4. `Spd_D` 先保持 `0`
+
+经验上你会重点盯：
+- `ch3` 和 `ch5` 是否跟得上
+- `ch4` 是否频繁打满
+- `ch0` 是否来回抖得太厉害
+
+当前固件已通过 `cmake --build build/Debug`。
+
+---
+
+_**User (2026-08-02 20:45:11Z)**_
+
+上升角度限幅加大两度
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Increasing upward angle limit by 2 degrees**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preparing to edit and build with commentary**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:22Z)**_
+
+我把正向上升角的最终限幅从 `10°` 提到 `12°`，负向和其他控制参数不动，然后编译确认。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:25Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:31Z)**_
+
+正向机械保护角已经改成 `12°`。现在复建一次，确保没有连带问题。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:37Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after increasing positive angle limit
+
+`cmake --build build/Debug`
+
+```text
+[1/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[2/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[3/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/bt_tune.c.obj
+[4/4] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37976 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:45:41Z)**_
+
+已经改了，正向上升角最终限幅从 `10°` 提到 `12°`。
+
+修改位置在 [pid.h:95](Core/Inc/pid.h#L95)：
+```c
+#define ANGLE_LIMIT_MAX   12.0f
+```
+
+负向限幅 `-12°` 没动，串级控制链路也没动。  
+我已经重新编译通过，当前固件可直接下载。
+
+---
+
+_**User (2026-08-02 20:49:20Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+现在无线调参，电机归零写了吗？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 20:49:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting bt_tune.c for GET_0 usage**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:49:33Z)**_
+
+我确认一下调参协议里 `GET_0` 分支和它实际调用的电机回零函数。
+
+_**Agent (claude-opus-4-8 2026-08-02 20:49:33Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\bt_tune.c` pattern `GET_0|Origin_Trigger_Return|BT_Tune_SendOk`
+
+```text
+25:static void BT_Tune_SendOk(void)
+214:    if(strcmp(cmd, "GET_0") == 0) {
+218:        Emm_V5_Origin_Trigger_Return(BT_TUNE_MOTOR_ADDR, 0, 0);
+219:        BT_Tune_SendOk();
+240:        BT_Tune_SendOk();
+252:        BT_Tune_SendOk();
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:49:33Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\Emm_V5.c` pattern `void Emm_V5_Origin_Trigger_Return`
+
+```text
+352:void Emm_V5_Origin_Trigger_Return(uint8_t addr, uint8_t o_mode, bool snF)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 20:49:45Z)**_
+
+写了，已经接进无线调参里了。
+
+现在在 [bt_tune.c:214](Core/Src/bt_tune.c#L214) 有这个分支：
+
+- 收到 `GET_0`
+- 调用 [Emm_V5.c:352](Core/Src/Emm_V5.c#L352) 的 `Emm_V5_Origin_Trigger_Return(...)`
+- 然后回 `ok`
+
+当前实际调用是：
+
+```c
+Emm_V5_Origin_Trigger_Return(BT_TUNE_MOTOR_ADDR, 0, 0);
+```
+
+也就是：
+- 电机地址：`1`
+- 回零模式：`0`
+- 不做同步启动
+
+你现在可以这样发：
+
+```text
+[GET_0]
+```
+
+或者：
+
+```text
+GET_0#
+```
+
+如果你发了没动作，那大概率不是“没写”，而是下面这几种之一：
+
+1. 驱动器当前保存的回零参数/回零方式不对应 `o_mode = 0`
+2. 归零点没有在驱动器里正确设置
+3. 无线串口发包格式不对，STM32 没解析到 `GET_0`
+4. 电机驱动器本身当前不接受回零触发
+
+如果你要更稳一点，我可以把 `GET_0` 扩成：
+- `GET_0` 归零
+- `STOP_0` 中断归零
+- `GETPID` / `GET_0` / `RST_I` 分开明确回包
+
+这样你现场调的时候会更清楚。
+
+---
+
+_**User (2026-08-02 21:24:37Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+误差范围在0.5左右，PID还会调节吗？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:24:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining PID adjustment for 0.5 error range**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:24:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Detailing PID output and thresholds with code references**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:25:06Z)**_
+
+会，`0.5` 左右的误差现在还会继续调节。
+
+按你当前代码：
+
+- 进入“近目标保持”的条件是误差小于等于 `0.15 cm`，见 [pid.h:149-151](Core/Inc/pid.h#L149-L151)
+- 退出保持的条件是误差大于等于 `0.30 cm`，见 [pid.h:149-151](Core/Inc/pid.h#L149-L151)
+
+所以当误差在 `0.5 cm` 左右时：
+
+1. 已经明显大于 `0.30 cm`
+2. 不会处于保持态
+3. 位置环和速度环都会继续工作
+
+对应逻辑在 [pid.c:782-816](Core/Src/pid.c#L782-L816)：
+- 只有很靠近目标时才把 `pidY.out` 压成 `0`
+- `0.5 cm` 不满足这个条件，所以 `pidY.out` 仍然会输出
+
+按你现在的位置环 `P=0.68` 来算，若误差是 `0.5 cm`，且 `I=0, D=0`，位置环大约会给出：
+
+```text
+0.68 × 0.5 = 0.34
+```
+
+也就是大约 `0.34 cm/s` 的目标速度，然后交给速度环再换成平台角度。
+
+但有个细节要注意：
+
+- `0.5 cm` 时虽然 PID 还在调
+- 可是“卡滞补偿”还没启动，因为它的阈值是 `0.6 cm`，见 [pid.h:160](Core/Inc/pid.h#L160)
+
+所以如果你现场看到“误差卡在 0.5 左右不怎么动”，那不是 PID 停了，而更可能是：
+
+- 位置环输出太小
+- 速度环给出的角度太小
+- 静摩擦没被克服
+- 小球已经接近临界不太容易继续滚
+
+一句话总结：
+
+**`0.5 cm` 时 PID 还在调，只是这时既不属于保持区，也还没到 breakaway 起动补偿区。**
+
+你现在调速度环时，如果发现老是卡在 `0.4~0.6 cm` 一带，这通常就是速度环力度或静摩擦补偿还不够。
+
+---
+
+_**User (2026-08-02 21:34:41Z)**_
+
+误差在0.5cm时停止PID调节
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:34:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning PID adjustment threshold change**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:34:56Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Deciding hysteresis for PID hold thresholds**
+</details></think>
+
+---
+
+_**User (2026-08-02 21:34:57Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-02 21:35:13Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+误差在0.5cm时停止PID调节
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting PID hold enter/exit thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Revising PID hold logic and comments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:27Z)**_
+
+我直接把“到位保持”改成以位置误差 `0.5cm` 为门限触发，去掉原来的速度条件，并保留一点回差避免抖动。改完会编译确认。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:28Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ 调整 0.5cm 停止调节门限
+- [ ] 🌡️ 同步更新保持逻辑注释
+- [ ] 🌡️ 构建验证改动
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:40Z)**_
+
+我会只改 `pid.h` 的保持区阈值和 `pid.c` 的进入条件，其他串级与无线调参不动。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:40Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+139	
+140	/* 接近目标后的稳态区。
+141	 *
+142	 * 这里不再“退出闭环并锁角/回零”，而是仅在非常靠近目标时，把外环目标速度压到 0，
+143	 * 让内环继续以“0 速度”闭环保持小球静止。这样既能继续收敛，又不会在目标附近追来追去。
+144	 *
+145	 * 进入条件收紧到 0.15cm，退出条件为 0.30cm：
+146	 *   - 明显优于 ±1cm 的验收线；
+147	 *   - 又留出 0.15cm 回差，避免边界抖动。
+148	 * 仍要求速度也足够小，防止球高速穿过目标点时过早进入稳态区。
+149	 */
+150	#define TARGET_HOLD_POSITION_ENTER  0.15f
+151	#define TARGET_HOLD_POSITION_EXIT   0.30f
+152	#define TARGET_HOLD_SPEED_LIMIT     0.25f
+153	
+154	/* 小球偏离目标且持续不动时，用起动倾角克服静摩擦。
+155	 *
+156	 * 不再使用固定单一的 breakaway 角。
+157	 * 现改为“分级加力”：先给一个较小起动角，若球仍不动，就每隔一段时间再加一点，
+158	 * 直到上限。这样既能在轻微卡滞时保持动作柔和，也能在重静摩擦时继续加力，避免
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:40Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+772		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+773	
+774		/* 接近目标后的到位保持。
+775		 *
+776		 * 这里不是简单的“位置一小就停”，而是同时满足：
+777		 *   1) |位置误差| <= 0.4cm：比 ±1cm 的验收线明显更紧，真正贴近目标；
+778		 *   2) |速度| <= 0.4cm/s：球确实已经慢下来，而不是高速穿越目标点。
+779		 *
+780		 * 一旦进入保持态，就直接撤掉控制输出，让平台回到 0°；
+781		 * 只有当误差重新长到 0.6cm 以上时才恢复闭环。这个回差能避免视觉噪声、
+782		 * 步进脉冲量化和轻微回弹把系统卡在“进死区/出死区”的反复切换里。
+783		 */
+784		if(target_hold_active) {
+785			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+786				target_hold_active = false;
+787			}
+788		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+789		          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+790			target_hold_active = true;
+791		}
+792	
+793		if(target_hold_active) {
+794			/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
+795			 * 单环模式下这里只保留到位保持；串级模式下还要顺手清掉 breakaway 状态。 */
+796	#if !POSITION_LOOP_DIRECT_DRIVE
+797			stuck_ticks = 0u;
+798			breakaway_ramp_ticks = 0u;
+799			breakaway_active = false;
+800			breakaway_angle = 0.0f;
+801	#endif
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:47Z)**_
+
+我把进入门限改成 `0.50cm`，退出门限设成 `0.60cm`，这样“到 0.5 就停”同时还有 0.1cm 回差，不容易在边界抖。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:35:55Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:02Z)**_
+
+下一步把 `pid.c` 的进入条件从“位置+速度”改成只看位置误差。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:08Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:12Z)**_
+
+逻辑已经改成“0.5cm 内停调”。我现在编译确认没有副作用。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:14Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 调整 0.5cm 停止调节门限
+- [X] 🌡️ 同步更新保持逻辑注释
+- [⚡] 🌡️ 构建验证改动
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:23Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after changing 0.5cm stop threshold
+
+`cmake --build build/Debug`
+
+```text
+[1/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[2/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c: In function 'pid_control__26Y':
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:772:15: warning: unused variable 'abs_estimated_velocity' [-Wunused-variable]
+  772 |         float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+      |               ^~~~~~~~~~~~~~~~~~~~~~
+[3/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/bt_tune.c.obj
+[4/4] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37952 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:27Z)**_
+
+功能已生效，只有一个无用变量告警；我顺手清掉这个告警，保持构建干净。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:31Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:37Z)**_
+
+我再复建一次，确认最终是无告警通过。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:42Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild after removing unused variable warning
+
+`cmake --build build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37920 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:49Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 调整 0.5cm 停止调节门限
+- [X] 🌡️ 同步更新保持逻辑注释
+- [X] 🌡️ 构建验证改动
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:36:55Z)**_
+
+已经改好了：现在误差进到 `0.5cm` 以内就停止 PID 调节。
+
+具体行为是：
+
+- `|error| <= 0.50cm`：进入保持态，停止 PID 调节
+- `|error| >= 0.60cm`：退出保持态，恢复闭环
+
+这样保留了 `0.1cm` 的回差，避免在 `0.5cm` 边界来回抖。
+
+改动位置：
+
+- [pid.h:140-152](Core/Inc/pid.h#L140-L152)
+- [pid.c:774-789](Core/Src/pid.c#L774-L789)
+
+我已经重新编译通过，当前固件可直接下载。
+
+---
+
+_**User (2026-08-02 21:41:39Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+538,0,0,70,-38
+67,-538,0,0,70,-38
+56,-538,0,0,60,-28
+56,-538,0,0,60,-28
+44,-538,0,0,53,-21
+44,-538,0,0,53,-21
+44,-538,0,0,47,-16
+44,-538,0,0,47,-16
+33,-538,0,0,43,-12
+33,-538,0,0,43,-12
+33,-538,0,0,40,-9
+33,-538,0,0,40,-9
+-56,-529,496,0,-73,98
+-56,-529,0,0,-73,98
+-56,-529,0,0,-48,73
+-56,-529,0,0,-48,73
+-33,-529,0,0,-29,55
+-33,-529,0,0,-29,55
+-11,-529,0,0,-15,41
+-11,-529,-492,0,-15,41
+78,-538,0,0,106,-73
+78,-538,0,0,106,-73
+-11,-529,497,0,-23,49
+-11,-529,497,0,-23,49
+-11,-529,0,0,-10,37
+-11,-529,0,0,-10,37
+0,-529,0,0,-1,27
+0,-529,0,0,-1,27
+0,-529,0,0,5,20
+0,-529,0,0,5,20
+0,-529,0,0,10,15
+0,-529,0,0,10,15
+11,-529,0,0,14,11
+11,-529,0,0,14,11
+11,-529,0,0,17,8
+11,-529,0,0,17,8
+11,-529,0,0,20,6
+11,-529,0,0,20,6
+11,-529,0,0,21,4
+11,-529,0,0,21,4
+22,-529,0,0,23,3
+22,-529,0,0,23,3
+22,-529,0,0,24,2
+22,-529,0,0,24,2
+22,-529,0,0,24,2
+22,-529,0,0,24,2
+22,-529,0,0,25,1
+22,-529,0,0,25,1
+22,-529,0,0,25,1
+22,-529,0,0,25,1
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+-67,-521,552,0,-84,105
+-67,-521,552,0,-84,105
+22,-529,-508,0,53,-26
+22,-529,0,0,53,-26
+44,-529,0,0,47,-19
+44,-529,0,0,47,-19
+33,-529,0,0,41,-14
+33,-529,0,0,41,-14
+33,-529,0,0,38,-11
+33,-529,0,0,38,-11
+33,-529,0,0,35,-8
+33,-529,0,0,35,-8
+22,-529,0,0,33,-6
+22,-529,0,0,33,-6
+22,-529,0,0,31,-4
+22,-529,0,0,31,-4
+22,-529,0,0,30,-3
+22,-529,0,0,30,-3
+22,-529,0,0,29,-2
+22,-529,0,0,29,-2
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+22,-529,0,0,26,0
+-67,-521,499,0,-84,104
+-67,-521,499,0,-84,104
+22,-529,-502,0,53,-26
+22,-529,0,0,53,-26
+44,-529,0,0,47,-19
+44,-529,489,0,47,-19
+-44,-521,489,0,-69,90
+-44,-521,-480,0,-69,90
+44,-529,0,0,65,-37
+44,-529,0,0,65,-37
+44,-529,0,0,55,-27
+44,-529,0,0,55,-27
+44,-529,0,0,48,-20
+44,-529,0,0,48,-20
+33,-529,0,0,42,-15
+33,-529,0,0,42,-15
+33,-529,0,0,38,-11
+33,-529,0,0,38,-11
+33,-529,497,0,35,-8
+33,-529,497,0,35,-8
+22,-529,-513,0,33,-6
+22,-529,-513,0,33,-6
+22,-529,0,0,32,-4
+22,-529,0,0,32,-4
+22,-529,0,0,30,-3
+22,-529,0,0,30,-3
+22,-529,0,0,29,-2
+22,-529,0,0,29,-2
+22,-529,0,0,29,-2
+22,-529,0,0,29,-2
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,28,-1
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,0,0,27,0
+22,-529,499,0,27,0
+22,-529,499,0,27,0
+-67,-521,0,0,-84,104
+-67,-521,0,0,-84,104
+22,-529,-504,0,53,-26
+22,-529,0,0,53,-26
+44,-529,0,0,47,-19
+44,-529,0,0,47,-19
+33,-529,0,0,42,-14
+33,-529,0,0,42,-14
+33,-529,0,0,38,-11
+33,-529,0,0,38,-11
+33,-529,0,0,35,-8
+33,-529,0,0,35,-8
+22,-529,0,0,33,-6
+22,-529,0,0,33,-6
+22,-529,0,0,31,-4
+22,-529,0,0,31,-4
+22,-529,0,0,30,-3
+22,-529,0,0,30,-3
+22,-529,493,0,29,-2
+22,-529,493,0,29,-2
+-67,-521,0,0,-82,103
+-67,-521,0,0,-82,103
+22,-529,-499,0,55,-27
+22,-529,0,0,55,-27
+44,-529,0,0,48,-20
+44,-529,0,0,48,-20
+33,-529,0,0,42,-15
+33,-529,0,0,42,-15
+33,-529,0,0,38,-11
+33,-529,0,0,38,-11
+33,-529,0,0,35,-8
+33,-529,0,0,35,-8
+-56,-521,494,0,-77,98
+-56,-521,0,0,-77,98
+-56,-521,0,0,-52,73
+-56,-521,0,0,-52,73
+-33,-521,0,0,-33,55
+-33,-521,0,0,-33,55
+-22,-521,0,0,-19,41
+-22,-521,0,0,-19,41
+0,-521,0,0,-9,31
+0,-521,0,0,-9,31
+0,-521,0,0,-1,23
+0,-521,-514,0,-1,23
+89,-529,-514,0,116,-87
+89,-529,0,0,116,-87
+89,-529,0,0,93,-65
+89,-529,502,0,93,-65
+0,-521,0,0,-34,55
+0,-521,0,0,-34,55
+89,-529,-512,0,91,-63
+89,-529,-512,0,91,-63
+0,-521,489,0,-36,57
+0,-521,489,0,-36,57
+-22,-521,0,0,-21,43
+-22,-521,-515,0,-21,43
+67,-529,-515,0,100,-72
+67,-529,0,0,100,-72
+78,-529,501,0,82,-54
+78,-529,501,0,82,-54
+-11,-521,0,0,-42,64
+-11,-521,0,0,-42,64
+-22,-521,0,0,-26,48
+-22,-521,0,0,-26,48
+-11,-521,0,0,-14,36
+-11,-521,0,0,-14,36
+0,-521,0,0,-4,27
+0,-521,0,0,-4,27
+0,-521,0,0,2,20
+0,-521,0,0,2,20
+0,-521,0,0,7,15
+0,-521,0,0,7,15
+101,-529,-503,0,122,-93
+101,-529,-503,0,122,-93
+89,-529,0,0,98,-70
+89,-529,0,0,98,-70
+78,-529,0,0,80,-52
+78,-529,0,0,80,-52
+56,-529,0,0,67,-39
+56,-529,0,0,67,-39
+56,-529,0,0,57,-29
+56,-529,0,0,57,-29
+146,-538,-505,0,160,-127
+146,-538,-505,0,160,-127
+123,-538,0,0,128,-95
+123,-538,0,0,128,-95
+101,-538,0,0,104,-71
+101,-538,0,0,104,-71
+78,-538,0,0,85,-53
+78,-538,0,0,85,-53
+67,-538,0,0,72,-40
+67,-538,0,0,72,-40
+56,-538,0,0,61,-30
+56,-538,0,0,61,-30
+44,-538,0,0,54,-22
+44,-538,0,0,54,-22
+44,-538,0,0,48,-16
+44,-538,0,0,48,-16
+33,-538,0,0,44,-12
+33,-538,0,0,44,-12
+33,-538,520,0,40,-9
+33,-538,520,0,40,-9
+-56,-529,0,0,-72,97
+-56,-529,0,0,-72,97
+-56,-529,0,0,-47,73
+-56,-529,0,0,-47,73
+-33,-529,0,0,-29,55
+-33,-529,0,0,-29,55
+-11,-529,0,0,-15,41
+-11,-529,514,0,-15,41
+-112,-521,0,0,-115,135
+-112,-521,0,0,-115,135
+-89,-521,0,0,-81,101
+-89,-521,0,0,-81,101
+-56,-521,0,0,-55,76
+-56,-521,0,0,-55,76
+-33,-521,0,0,-35,57
+-33,-521,0,0,-35,57
+-22,-521,0,0,-21,43
+-22,-521,0,0,-21,43
+-11,-521,0,0,-10,32
+-11,-521,0,0,-10,32
+78,-529,-501,0,109,-80
+78,-529,-501,0,109,-80
+78,-529,0,0,88,-60
+78,-529,0,0,88,-60
+67,-529,0,0,73,-45
+67,-529,0,0,73,-45
+56,-529,0,0,61,-34
+56,-529,0,0,61,-34
+44,-529,501,0,53,-25
+44,-529,501,0,53,-25
+-44,-521,0,0,-64,85
+-44,-521,0,0,-64,85
+-44,-521,0,0,-42,64
+-44,-521,0,0,-42,64
+-22,-521,0,0,-26,48
+-22,-521,0,0,-26,48
+-11,-521,0,0,-14,36
+-11,-521,0,0,-14,36
+0,-521,0,0,-4,27
+0,-521,0,0,-4,27
+0,-521,-513,0,1,20
+0,-521,-513,0,1,20
+101,-529,0,0,118,-89
+101,-529,0,0,118,-89
+89,-529,0,0,95,-67
+89,-529,0,0,95,-67
+67,-529,0,0,78,-50
+67,-529,502,0,78,-50
+-11,-521,502,0,-45,67
+-11,-521,0,0,-45,67
+-33,-521,0,0,-28,50
+-33,-521,-489,0,-28,50
+56,-529,503,0,95,-67
+56,-529,503,0,95,-67
+-33,-521,0,0,-32,54
+-33,-521,0,0,-32,54
+-22,-521,0,0,-19,40
+-22,-521,-409,0,-19,40
+67,-529,-409,0,102,-74
+67,-529,0,0,102,-74
+78,-529,0,0,83,-55
+78,-529,0,0,83,-55
+67,-529,250,0,69,-41
+67,-529,250,0,69,-41
+56,-529,-415,0,58,-31
+56,-529,-415,0,58,-31
+44,-529,0,0,50,-23
+44,-529,494,0,50,-23
+-44,-521,494,0,-66,87
+-44,-521,-499,0,-66,87
+44,-529,-499,0,67,-39
+44,-529,0,0,67,-39
+56,-529,0,0,57,-29
+56,-529,0,0,57,-29
+44,-529,0,0,49,-22
+44,-529,0,0,49,-22
+33,-529,0,0,43,-16
+33,-529,0,0,43,-16
+33,-529,0,0,39,-12
+33,-529,495,0,39,-12
+-56,-521,495,0,-74,95
+-56,-521,0,0,-74,95
+-56,-521,0,0,-50,71
+-56,-521,0,0,-50,71
+-33,-521,0,0,-32,53
+-33,-521,0,0,-32,53
+-11,-521,0,0,-18,40
+-11,-521,0,0,-18,40
+0,-521,0,0,-8,30
+0,-521,-511,0,-8,30
+89,-529,-511,0,110,-82
+89,-529,495,0,110,-82
+0,-521,-476,0,-21,43
+0,-521,-476,0,-21,43
+89,-529,0,0,100,-72
+89,-529,0,0,100,-72
+78,-529,0,0,82,-54
+78,-529,0,0,82,-54
+67,-529,0,0,68,-40
+67,-529,-493,0,68,-40
+157,-538,-493,0,169,-135
+157,-538,0,0,169,-135
+123,-538,0,0,134,-101
+123,-538,0,0,134,-101
+101,-538,0,0,108,-76
+101,-538,0,0,108,-76
+78,-538,0,0,89,-57
+78,-538,0,0,89,-57
+67,-538,0,0,74,-42
+67,-538,0,0,74,-42
+56,-538,0,0,63,-32
+56,-538,0,0,63,-32
+44,-538,0,0,55,-24
+44,-538,0,0,55,-24
+44,-538,0,0,49,-18
+44,-538,0,0,49,-18
+33,-538,0,0,44,-13
+33,-538,0,0,44,-13
+33,-538,0,0,41,-10
+33,-538,0,0,41,-10
+33,-538,0,0,38,-7
+33,-538,0,0,38,-7
+33,-538,0,0,36,-5
+33,-538,0,0,36,-5
+33,-538,0,0,35,-4
+33,-538,0,0,35,-4
+-56,-529,483,0,-76,101
+-56,-529,483,0,-76,101
+-157,-521,509,0,-162,181
+-157,-521,0,0,-162,181
+-134,-521,0,0,-115,136
+-134,-521,0,0,-115,136
+-89,-521,0,0,-81,102
+-89,-521,0,0,-81,102
+-56,-521,0,0,-55,76
+-56,-521,0,0,-55,76
+-33,-521,0,0,-35,57
+-33,-521,0,0,-35,57
+56,-529,-503,0,90,-61
+56,-529,0,0,90,-61
+67,-529,0,0,74,-46
+67,-529,0,0,74,-46
+56,-529,0,0,62,-34
+56,-529,0,0,62,-34
+44,-529,0,0,53,-26
+44,-529,0,0,53,-26
+-44,-521,507,0,-64,85
+-44,-521,507,0,-64,85
+44,-529,-497,0,68,-40
+44,-529,0,0,68,-40
+56,-529,0,0,58,-30
+56,-529,0,0,58,-30
+44,-529,0,0,50,-23
+44,-529,-470,0,50,-23
+146,-538,506,0,155,-122
+146,-538,506,0,155,-122
+44,-529,0,0,13,13
+44,-529,0,0,13,13
+11,-529,0,0,16,9
+11,-529,0,0,16,9
+11,-529,0,0,19,7
+11,-529,0,0,19,7
+11,-529,0,0,21,5
+11,-529,-458,0,21,5
+112,-538,-458,0,133,-100
+112,-538,0,0,133,-100
+101,-538,502,0,108,-75
+101,-538,502,0,108,-75
+78,-538,-506,0,88,-56
+78,-538,-506,0,88,-56
+0,-529,508,0,-36,62
+0,-529,493,0,-36,62
+-101,-521,493,0,-132,151
+-101,-521,0,0,-132,151
+-101,-521,0,0,-93,113
+-101,-521,0,0,-93,113
+-67,-521,0,0,-64,85
+-67,-521,0,0,-64,85
+22,-529,-508,0,68,-40
+22,-529,-508,0,68,-40
+-56,-521,497,0,-53,74
+-56,-521,-493,0,-53,74
+33,-529,-493,0,77,-49
+33,-529,506,0,77,-49
+-44,-521,506,0,-46,68
+-44,-521,0,0,-46,68
+-33,-521,0,0,-29,51
+-33,-521,0,0,-29,51
+-11,-521,0,0,-16,38
+-11,-521,0,0,-16,38
+0,-521,0,0,-6,28
+0,-521,-528,0,-6,28
+89,-529,-528,0,112,-83
+89,-529,0,0,112,-83
+89,-529,0,0,90,-62
+89,-529,0,0,90,-62
+67,-529,0,0,74,-46
+67,-529,0,0,74,-46
+56,-529,0,0,62,-35
+56,-529,0,0,62,-35
+44,-529,0,0,53,-26
+44,-529,0,0,53,-26
+44,-529,0,0,47,-19
+44,-529,0,0,47,-19
+33,-529,0,0,42,-14
+33,-529,0,0,42,-14
+33,-529,-504,0,38,-11
+33,-529,-504,0,38,-11
+134,-538,0,0,146,-113
+134,-538,0,0,146,-113
+112,-538,0,0,117,-85
+112,-538,0,0,117,-85
+89,-538,0,0,96,-63
+89,-538,0,0,96,-63
+78,-538,0,0,79,-47
+78,-538,0,0,79,-47
+67,-538,0,0,67,-35
+67,-538,0,0,67,-35
+56,-538,0,0,58,-26
+56,-538,0,0,58,-26
+44,-538,0,0,51,-20
+44,-538,0,0,51,-20
+44,-538,0,0,46,-15
+44,-538,0,0,46,-15
+33,-538,0,0,42,-11
+33,-538,0,0,42,-11
+33,-538,0,0,39,-8
+33,-538,0,0,39,-8
+33,-538,0,0,37,-6
+33,-538,0,0,37,-6
+33,-538,0,0,36,-4
+33,-538,0,0,36,-4
+33,-538,0,0,34,-3
+33,-538,0,0,34,-3
+33,-538,0,0,33,-2
+33,-538,0,0,33,-2
+22,-538,0,0,33,-2
+22,-538,0,0,33,-2
+22,-538,0,0,32,-1
+22,-538,0,0,32,-1
+22,-538,0,0,32,-1
+22,-538,0,0,32,-1
+22,-538,0,0,32,0
+22,-538,0,0,32,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+22,-538,0,0,31,0
+为啥在在误差范围内，PID还在调节？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:41:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing channel data formatting and meanings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:41:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying target and error calculations**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:41:58Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting hold zone speed loop behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying PID loop behavior during hold condition**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining incomplete PID stopping in hold mode**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting target_hold_active code branch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:06Z)**_
+
+我先核对一下你当前保持分支的实际逻辑，避免口头判断和代码不一致。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:06Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+800		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+801		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+802		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+803		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+804		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+805		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+806		                POS_LOOP_I_LIMIT);
+807		if(target_hold_active) {
+808			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+809			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+810			 */
+811			pidY.out = 0.0f;
+812		}
+813	
+814		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+815		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+816		 */
+817		float control_velocity = estimated_velocity;
+818		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+819			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+820		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+821			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+822		}
+823		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+824		                         (control_velocity - pidY_filtered_velocity);
+825	
+826	#if POSITION_LOOP_DIRECT_DRIVE
+827		/* 单环调试模式：位置环直接输出平台倾角。
+828		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+829		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+830		pidY_velocity_damping = 0.0f;
+831		pidY_Speed.target = 0.0f;
+832		pidY_Speed.now = pidY_filtered_velocity;
+833		pidY_Speed.out = 0.0f;
+834		pidY_Speed.pout = 0.0f;
+835		pidY_Speed.iout = 0.0f;
+836		pidY_Speed.dout = 0.0f;
+837	
+838		float cmd_angle = pidY.out;
+839	#else
+840		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+841		 *
+842		 * breakaway 现改为“分级加力”：
+843		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+844		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+845		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+846		 *
+847		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+848		 */
+849		if(breakaway_active) {
+850			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+851			   (breakaway_start_error < 0.0f &&
+852			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+853			   (breakaway_start_error > 0.0f &&
+854			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+855				breakaway_active = false;
+856				breakaway_angle = 0.0f;
+857				breakaway_ramp_ticks = 0u;
+858			} else if(position_delta > -STUCK_POSITION_DELTA &&
+859			          position_delta < STUCK_POSITION_DELTA) {
+860				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+861					breakaway_ramp_ticks++;
+862				} else {
+863					breakaway_ramp_ticks = 0u;
+864					if(breakaway_start_error < 0.0f) {
+865						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+866						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+867							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+868						}
+869					} else {
+870						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+871						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+872							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+873						}
+874					}
+875				}
+876			} else {
+877				breakaway_ramp_ticks = 0u;
+878			}
+879			stuck_ticks = 0u;
+880		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+881		          position_delta > -STUCK_POSITION_DELTA &&
+882		          position_delta < STUCK_POSITION_DELTA) {
+883			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+884				stuck_ticks++;
+885			}
+886			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+887				breakaway_start_error = relative_y;
+888				breakaway_active = true;
+889				breakaway_ramp_ticks = 0u;
+890				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+891			}
+892		} else {
+893			stuck_ticks = 0u;
+894		}
+895	
+896		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+897		pidY_Speed.target = pidY.out;
+898		pidY_Speed.now = pidY_filtered_velocity;
+899	
+900		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+901		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+902		float iout_frozen = pidY_Speed.iout;
+903		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+904		                SPEED_LOOP_I_LIMIT);
+905		if(breakaway_active) {
+906			pidY_Speed.iout = iout_frozen;
+907			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+908			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+909				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+910			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+911				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+912			}
+913		}
+914	
+915		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+916	
+917		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+918		float cmd_angle = pidY_velocity_damping;
+919		if(breakaway_active) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:06Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\main.c`
+
+```text
+144	  /* 串级 PID：外位置环输出目标速度，内速度环输出平台倾角。 */
+145	  /* 内环 I=0.01/tick（50Hz → 0.5/s）：唯一职责是把"命令 0° 并非真正水平"的
+146	   * 机械零点偏差与滚动摩擦这个常值扰动积掉，由 SPEED_LOOP_I_LIMIT 限幅 ±2.5°。
+147	   * 外环保持 I=0（POS_LOOP_I_LIMIT 也为 0），位置环靠内环消稳态误差即可。 */
+148	  pid_init(&pidY, POSITION_PID, 0.8f, 0.0f, 0.00f, 0.0f);
+149	  pid_init(&pidY_Speed, POSITION_PID, 1.05f, 0.01f, 0.0f, 0.0f);// 从0到5 pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+150	  ball_target_set(-5.5f);  // 初始目标位置（cm），负=左，正=右
+151	  BT_Tune_Init();
+152	  while (1)
+153	  {
+154	    /* USER CODE END WHILE */
+155
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:19Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Investigating VOFA channel mismatch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying six-channel data interpretation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining PID inner loop adjustment and suggesting full stop options**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Detailing PID channel states and complete stop requirements**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:42:42Z)**_
+
+因为你现在实现的是“**位置环停调**”，不是“**所有 PID 全停**”。
+
+从你这组数据里，典型一行像这样：
+
+```text
+67,-538,0,0,70,-38
+```
+
+按当前 VOFA 通道定义，它表示：
+
+- `ch0 = 0.67°`：电机命令角
+- `ch1 = -5.38 cm`：小球位置
+- `ch2 = 0`
+- `ch3 = 0.00`：位置环输出
+- `ch4 = 0.70°`：速度环输出
+- `ch5 = -0.38 cm/s`：滤波后的速度反馈
+
+你当前目标在 [main.c:150](Core/Src/main.c#L150) 是 `-5.5 cm`，  
+所以这一行的实际误差大约是：
+
+```text
+|-5.38 - (-5.5)| = 0.12 cm
+```
+
+已经在你设定的 `0.5 cm` 范围内了。
+
+而这时：
+
+- `ch3 = 0`
+- 说明**位置环确实已经停了**
+
+但你看到：
+
+- `ch4` 还不是 0
+- `ch0` 也还不是 0
+
+这是因为代码里在保持态只做了这件事：
+
+- 把 `pidY.out = 0`，也就是外环目标速度压成 0  
+  见 [pid.c:805-812](Core/Src/pid.c#L805-L812)
+
+然后内环还继续工作：
+
+- `pidY_Speed.target = pidY.out`
+- 也就是速度环还在按“目标速度 = 0”继续控球  
+  见 [pid.c:896-918](Core/Src/pid.c#L896-L918)
+
+所以当前逻辑其实是：
+
+1. 误差进 `0.5 cm` 内
+2. 位置环停止继续给目标速度
+3. 速度环继续努力把球速压到 0
+4. 因此还会给一点电机角度
+
+这正是你日志里看到的现象：
+
+- `ch3 = 0`，外环停了
+- `ch5` 还有 `-0.38 / 0.23 / -0.28 ...` 这类残余速度
+- 所以 `ch4` 还会有一点角度输出
+
+更进一步说，即使 `ch5` 接近 0，速度环的 `I=0.01` 也可能保留一点小角度，用来补偿机械零偏和摩擦，这也是你看到它没有立刻归零的原因。
+
+结论很直接：
+
+- 现在不是“误差范围内 PID 还在全调节”
+- 而是“**位置环已经停了，但速度环还在做 0 速度保持**”
+
+你这组数据里，`ch3=0` 就是证据。
+
+要改成你理解的“**误差在 0.5cm 内，所有 PID 都停止**”，就不能只把 `pidY.out` 置 0，而要在保持分支里直接：
+
+1. 清 `pidY_Speed.iout`
+2. 清 `pidY_Speed.out`
+3. 直接 `motor_set_angle(0.0f)`，甚至直接 `return`
+
+这样进了范围以后，内外环都会停。
+
+---
+
+_**User (2026-08-02 21:44:55Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+那在误差范围内 所有的PID 都停止”
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:14Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning code modifications and commentary updates**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:15Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Detailing PID hold branch reset logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:15Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Considering target change on hold entry**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:15Z)**_
+
+我把保持逻辑改成“进误差范围后内外环全停”，不是只停位置环。会同时清两个 PID 的输出/积分，并把电机命令角拉回 `0°`。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:17Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ 改为误差范围内全部 PID 停止
+- [ ] 🌡️ 同步更新保持分支注释
+- [ ] 🌡️ 构建验证停调逻辑
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:21Z)**_
+
+我会只动 `pid.c` 的保持态分支，不改你的误差门限和无线调参。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:22Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+772	
+773		/* 接近目标后的到位保持。
+774		 *
+775		 * 当前策略改为只看位置误差：|error| <= 0.5cm 时直接停止 PID 调节；
+776		 * 当误差重新增大到 0.6cm 以上再恢复闭环，利用回差避免边界抖动。
+777		 */
+778		if(target_hold_active) {
+779			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+780				target_hold_active = false;
+781			}
+782		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+783			target_hold_active = true;
+784		}
+785	
+786		if(target_hold_active) {
+787			/* 进入近目标稳态区后，不退出闭环，也不回零/锁角。
+788			 * 单环模式下这里只保留到位保持；串级模式下还要顺手清掉 breakaway 状态。 */
+789	#if !POSITION_LOOP_DIRECT_DRIVE
+790			stuck_ticks = 0u;
+791			breakaway_ramp_ticks = 0u;
+792			breakaway_active = false;
+793			breakaway_angle = 0.0f;
+794	#endif
+795		}
+796	
+797		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+798		pidY.target = 0.0f;
+799		pidY.now = relative_y;
+800		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+801		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+802		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+803		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+804		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+805		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+806		                POS_LOOP_I_LIMIT);
+807		if(target_hold_active) {
+808			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+809			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+810			 */
+811			pidY.out = 0.0f;
+812		}
+813	
+814		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+815		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+816		 */
+817		float control_velocity = estimated_velocity;
+818		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+819			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+820		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+821			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+822		}
+823		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+824		                         (control_velocity - pidY_filtered_velocity);
+825	
+826	#if POSITION_LOOP_DIRECT_DRIVE
+827		/* 单环调试模式：位置环直接输出平台倾角。
+828		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+829		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+830		pidY_velocity_damping = 0.0f;
+831		pidY_Speed.target = 0.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:26Z)**_
+
+我会把保持态改成直接清空两个 PID 状态并 `motor_set_angle(0.0f); return;`，这样在误差范围内就不会再走速度环。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:38Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:42Z)**_
+
+现在保持态会直接提前返回，不再执行后面的外环/速度环/电机角更新路径。我编译确认一下。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:44Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 改为误差范围内全部 PID 停止
+- [X] 🌡️ 同步更新保持分支注释
+- [⚡] 🌡️ 构建验证停调逻辑
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:54Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after stopping all PID in hold range
+
+`cmake --build build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38048 B         1 MB      3.63%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:45:58Z)**_
+
+编译通过，逻辑已经生效。你之后在误差范围内再看 VOFA，`ch3/ch4/ch0` 都应该被拉回 0。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:46:00Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 改为误差范围内全部 PID 停止
+- [X] 🌡️ 同步更新保持分支注释
+- [X] 🌡️ 构建验证停调逻辑
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:46:07Z)**_
+
+已经改成“误差进入范围后，所有 PID 都停止”了。
+
+现在逻辑是：
+
+- `|error| <= 0.5cm`：进入保持态
+- 进入后会直接：
+  - 清 `pidY`
+  - 清 `pidY_Speed`
+  - 清速度环积分
+  - `motor_set_angle(0.0f)`
+  - 直接 `return`
+
+所以在误差范围内，不会再继续跑位置环，也不会再让速度环做 0 速度保持。
+
+改动位置在 [pid.c:786](Core/Src/pid.c#L786) 这一段。  
+我已经重新编译通过。
+
+你接下来再看 VOFA，理论上进入误差范围后应该看到：
+
+- `ch3 -> 0`
+- `ch4 -> 0`
+- `ch0 -> 0`
+
+如果你愿意，我下一步会把“进入保持态”的状态也单独打到 VOFA 一个通道里，这样你现场一眼就能看出当前是不是已经触发了停调区。
+
+---
+
+_**User (2026-08-02 21:48:26Z)**_
+
+[05:46:58.197] 157,16,-1995,-453,159,-720
+[05:46:58.207] 157,16,-1508,-453,159,-720
+[05:46:58.217] 202,-8,-1508,-432,204,-740
+[05:46:58.227] 202,-8,-459,-432,204,-740
+[05:46:58.237] 123,-17,-459,-426,130,-660
+[05:46:58.246] 123,-17,-548,-426,130,-660
+[05:46:58.257] 67,-25,-2033,-419,75,-600
+[05:46:58.267] 67,-25,-2033,-419,75,-600
+[05:46:58.277] 157,-59,-498,-392,159,-650
+[05:46:58.287] 157,-59,-498,-392,159,-650
+[05:46:58.297] 236,-101,-1965,-359,237,-687
+[05:46:58.307] 236,-101,-504,-359,237,-687
+[05:46:58.317] 168,-109,-504,-352,176,-620
+[05:46:58.327] 168,-109,-1879,-352,176,-620
+[05:46:58.337] 247,-143,-1879,-325,255,-665
+[05:46:58.347] 247,-143,-542,-325,255,-665
+[05:46:58.357] 191,-151,-507,-318,200,-604
+[05:46:58.367] 191,-151,-507,-318,200,-604
+[05:46:58.377] 157,-160,-507,-312,161,-558
+[05:46:58.387] 157,-160,-507,-312,161,-558
+[05:46:58.397] 258,-210,-1495,-271,271,-618
+[05:46:58.407] 258,-210,-514,-271,271,-618
+[05:46:58.417] 224,-218,-514,-264,229,-568
+[05:46:58.427] 224,-218,-1901,-264,229,-568
+[05:46:58.437] 314,-252,-1901,-238,321,-626
+[05:46:58.447] 314,-252,-540,-238,321,-626
+[05:46:58.457] 269,-260,-502,-231,278,-575
+[05:46:58.467] 269,-260,-502,-231,278,-575
+[05:46:58.477] 247,-269,-1501,-224,247,-536
+[05:46:58.487] 247,-269,-1501,-224,247,-536
+[05:46:58.497] 337,-319,-1514,-184,363,-602
+[05:46:58.507] 337,-319,-1514,-184,363,-602
+[05:46:58.517] 247,-319,-1514,-184,208,-451
+[05:46:58.527] 247,-319,-730,-184,208,-451
+[05:46:58.537] 314,-344,-730,-164,324,-538
+[05:46:58.547] 314,-344,-527,-164,324,-538
+[05:46:58.557] 303,-353,-527,-157,303,-509
+[05:46:58.567] 303,-353,-502,-157,303,-509
+[05:46:58.578] 281,-361,-2020,-150,290,-486
+[05:46:58.587] 281,-361,-2020,-150,290,-486
+[05:46:58.597] 382,-403,-501,-117,412,-565
+[05:46:58.607] 382,-403,-501,-117,412,-565
+[05:46:58.617] 382,-412,-504,-110,385,-528
+[05:46:58.627] 382,-412,-1390,-110,385,-528
+[05:46:58.637] 472,-437,-1390,-90,483,-596
+[05:46:58.647] 472,-437,-549,-90,483,-596
+[05:46:58.657] 438,-445,-549,-83,448,-552
+[05:46:58.667] 438,-445,-497,-83,448,-552
+[05:46:58.677] 416,-454,-972,-76,425,-519
+[05:46:58.687] 416,-454,-972,-76,425,-519
+[05:46:58.697] 517,-496,-1563,-43,539,-589
+[05:46:58.707] 517,-496,-1563,-43,539,-589
+[05:46:58.717] 416,-496,0,-43,389,-442
+[05:46:58.727] 416,-496,-466,-43,389,-442
+[05:46:58.736] 0,-504,-466,0,0,-442
+[05:46:58.746] 0,-504,0,0,0,-442
+[05:46:58.756] 0,-504,0,0,0,-442
+[05:46:58.766] 0,-504,0,0,0,-442
+[05:46:58.776] 0,-504,-991,0,0,-442
+[05:46:58.786] 0,-504,-991,0,0,-442
+[05:46:58.796] 0,-546,-514,0,0,-442
+[05:46:58.807] 0,-546,-514,0,0,-442
+[05:46:58.816] 0,-546,0,0,0,-442
+[05:46:58.826] 0,-546,-948,0,0,-442
+[05:46:58.836] 0,-563,-948,0,0,-442
+[05:46:58.846] 0,-563,0,0,0,-442
+[05:46:58.856] 0,-563,0,0,0,-442
+[05:46:58.866] 0,-563,0,0,0,-442
+[05:46:58.876] 0,-563,-251,0,0,-442
+[05:46:58.886] 0,-563,-251,0,0,-442
+[05:46:58.896] 0,-571,-251,0,0,-442
+[05:46:58.906] 0,-571,-251,0,0,-442
+[05:46:58.916] 0,-571,-251,0,0,-442
+[05:46:58.926] 0,-571,-817,0,0,-442
+[05:46:58.937] 517,-613,-817,50,617,-531
+[05:46:58.947] 517,-613,0,50,617,-531
+[05:46:58.957] 472,-613,0,50,482,-398
+[05:46:58.967] 472,-613,-491,50,482,-398
+[05:46:58.977] 494,-622,-491,57,499,-404
+[05:46:58.987] 494,-622,-503,57,499,-404
+[05:46:58.997] 506,-630,-503,64,515,-408
+[05:46:59.006] 506,-630,-503,64,515,-408
+[05:46:59.017] 404,-630,-503,64,412,-306
+[05:46:59.027] 404,-630,-503,64,412,-306
+[05:46:59.037] 449,-638,-167,71,453,-334
+[05:46:59.047] 449,-638,-1852,71,453,-334
+[05:46:59.057] 551,-672,-1852,97,609,-450
+[05:46:59.067] 551,-672,-550,97,609,-450
+[05:46:59.077] 607,-680,-550,104,613,-443
+[05:46:59.086] 607,-680,0,104,613,-443
+[05:46:59.096] 506,-680,0,104,501,-332
+[05:46:59.107] 506,-680,0,104,501,-332
+[05:46:59.117] 416,-680,0,104,417,-249
+[05:46:59.127] 416,-680,0,104,417,-249
+[05:46:59.137] 348,-680,0,104,355,-186
+[05:46:59.147] 348,-680,-125,104,355,-186
+[05:46:59.158] 416,-689,-125,111,427,-245
+[05:46:59.167] 416,-689,-499,111,427,-245
+[05:46:59.176] 483,-697,-499,118,484,-288
+这里0到500的电机跳变值是怎么回事？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:48:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting channel definitions and send logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:48:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Mapping log values to channels**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:48:39Z)**_
+
+我先按当前代码把这 6 个通道重新对一下，不然“0 到 500”可能指的是不同量。然后我给你结论，顺便指出是哪一段逻辑造成的。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:48:39Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\main.c`
+
+```text
 168	        rxMaixcamFlag = false;
 169	        HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
 170	    }
@@ -5934,237 +8669,25806 @@ _**Agent (claude-opus-4-8 2026-08-02 19:46:10Z)**_
 195	      // LED指示：收到一帧视觉数据
 196	      HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
 197	    }
-198	
-199	  }
-200	  /* USER CODE END 3 */
-201	}
-202	
-203	/**
-204	  * @brief System Clock Configuration
-205	  * @retval None
-206	  */
-207	void SystemClock_Config(void)
-208	{
-209	  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-210	  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-211	
-212	  /** Configure the main internal regulator output voltage
-213	  */
-214	  __HAL_RCC_PWR_CLK_ENABLE();
-215	  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
-216	
-217	  /** Initializes the RCC Oscillators according to the specified parameters
-218	  * in the RCC_OscInitTypeDef structure.
-219	  */
-220	  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-221	  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-222	  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-223	  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-224	  RCC_OscInitStruct.PLL.PLLM = 4;
-225	  RCC_OscInitStruct.PLL.PLLN = 168;
-226	  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-227	  RCC_OscInitStruct.PLL.PLLQ = 4;
-228	  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-229	  {
-230	    Error_Handler();
-231	  }
-232	
-233	  /** Initializes the CPU, AHB and APB buses clocks
-234	  */
-235	  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-236	                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-237	  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-238	  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-239	  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-240	  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 ```
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:23Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 21:48:39Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+780				target_hold_active = false;
+781			}
+782		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+783			target_hold_active = true;
+784		}
+785	
+786		if(target_hold_active) {
+787			/* 进入误差保持区后，内外环全部停止：
+788			 *   1) 清空位置环输出；
+789			 *   2) 清空速度环输出与积分；
+790			 *   3) 电机命令角直接回 0°；
+791			 * 这样可以保证误差进入 0.5cm 范围后，不再有任何 PID 继续调节。 */
+792	#if !POSITION_LOOP_DIRECT_DRIVE
+793			stuck_ticks = 0u;
+794			breakaway_ramp_ticks = 0u;
+795			breakaway_active = false;
+796			breakaway_angle = 0.0f;
+797	#endif
+798			pidY.pout = 0.0f;
+799			pidY.iout = 0.0f;
+800			pidY.dout = 0.0f;
+801			pidY.out = 0.0f;
+802			pidY_Speed.target = 0.0f;
+803			pidY_Speed.now = 0.0f;
+804			pidY_Speed.pout = 0.0f;
+805			pidY_Speed.iout = 0.0f;
+806			pidY_Speed.dout = 0.0f;
+807			pidY_Speed.out = 0.0f;
+808			pidY_velocity_damping = 0.0f;
+809			motor_set_angle(0.0f);
+810			relative_y_last = relative_y;
+811			Y_last = Y;
+812			return;
+813		}
+814	
+815		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+816		pidY.target = 0.0f;
+817		pidY.now = relative_y;
+818		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+819		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+820		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+821		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+822		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+823		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+824		                POS_LOOP_I_LIMIT);
+825		if(target_hold_active) {
+826			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+827			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+828			 */
+829			pidY.out = 0.0f;
+830		}
+831	
+832		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+833		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+834		 */
+835		float control_velocity = estimated_velocity;
+836		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+837			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+838		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+839			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+840		}
+841		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+842		                         (control_velocity - pidY_filtered_velocity);
+843	
+844	#if POSITION_LOOP_DIRECT_DRIVE
+845		/* 单环调试模式：位置环直接输出平台倾角。
+846		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+847		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+848		pidY_velocity_damping = 0.0f;
+849		pidY_Speed.target = 0.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:48:39Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `motor_set_angle\(|ANGLE_SLEW_PER_TICK|target_hold_active|motor_command_pulses|PULSES_PER_DEG`
+
+```text
+6:#define PULSES_PER_DEG  8.89f  /* 3200脉冲/圈，1°=8.89脉冲 */
+9:static int32_t motor_command_pulses = 0;
+12:#define PULSE_LIMIT_MAX  (ANGLE_LIMIT_MAX * PULSES_PER_DEG)            /* 正向限幅脉冲 */
+13:#define PULSE_LIMIT_MIN  (ANGLE_LIMIT_MIN * PULSES_PER_DEG)            /* 反向限幅脉冲 */
+14:#define PULSE_DEAD_MAX   ((ANGLE_LIMIT_MAX - 2.0f) * PULSES_PER_DEG)  /* 正向死区起点（限位前2°） */
+15:#define PULSE_DEAD_MIN   ((ANGLE_LIMIT_MIN + 2.0f) * PULSES_PER_DEG)  /* 反向死区起点（限位前2°） */
+704:	return (float)motor_command_pulses / PULSES_PER_DEG;
+707:void motor_set_angle(float target_deg)
+714:	int32_t target_pulses = (int32_t)(target_deg * PULSES_PER_DEG);
+715:	if(target_pulses == motor_command_pulses) {
+725:	motor_command_pulses = target_pulses;
+740:	static bool target_hold_active = false;
+757:		target_hold_active = false;
+778:	if(target_hold_active) {
+780:			target_hold_active = false;
+783:		target_hold_active = true;
+786:	if(target_hold_active) {
+809:		motor_set_angle(0.0f);
+825:	if(target_hold_active) {
+951:	/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+956:		if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+957:		else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+961:	motor_set_angle(cmd_angle);
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:49:01Z)**_
+
+你看到的“`0` 到 `500` 左右跳变”，本质上是 **保持态把电机命令角强制拉回 0°，退出保持态后串级又立刻重新给了大角度命令**。
+
+先把这 6 个数重新对一下。你当前 VOFA 是：
+
+- `ch0` 电机命令角度 `motor_get_command_angle()`
+- `ch1` 小球位置 `Y`
+- `ch2` MaixCAM 原始速度 `ball_velocity`
+- `ch3` 位置环输出 `pidY.out`
+- `ch4` 速度环输出角度 `pidY_velocity_damping`
+- `ch5` 本地滤波速度 `pidY_filtered_velocity`
+
+所以例如这一段：
+
+```text
+517,-496,-1563,-43,539,-589
+...
+0,-504,0,0,0,-442
+0,-546,0,0,0,-442
+...
+517,-613,-817,50,617,-531
+```
+
+意思是：
+
+1. 原来电机命令角 `ch0` 在 `5.17°`
+2. 误差进入你设定的保持范围后，代码直接执行：
+   - `pidY.out = 0`
+   - `pidY_Speed.out = 0`
+   - `motor_set_angle(0.0f)`
+   - `return`
+3. 所以 VOFA 里马上看到：
+   - `ch0 = 0`
+   - `ch3 = 0`
+   - `ch4 = 0`
+4. 但球实际上还在动，`ch5` 还明显不是 0，比如 `-4.42 cm/s`
+5. 很快误差又跑出保持区，闭环重新接管
+6. 位置环/速度环一下子重新给出较大角度，于是 `ch0` 又从 `0` 跳回 `5.xx°`
+
+这不是电机自己乱跳，是你现在这段保持逻辑造成的，位置就在 [pid.c:786-812](Core/Src/pid.c#L786-L812)。
+
+你现在的逻辑是“**只要进 0.5cm，就立刻全停并回 0°**”。  
+这会带来一个副作用：
+
+- 球还带着速度冲进来
+- 你一停调，它继续滚
+- 一超出 `0.6cm`，控制又重新启动
+- 于是出现 `0 -> 500` 这种命令角来回切换
+
+所以你现在看到的现象，严格说不是 PID 自己振荡，而是：
+
+**“保持区全停 + 回差重新启动”造成的开关式跳变。**
+
+更直白地说：
+
+- `0` 是你代码主动清零的
+- `500` 是退出保持区后串级重新算出来的
+
+如果你想避免这种跳变，有 3 种办法，按效果从直接到稳妥排：
+
+1. 不要“全停并回 0°”，改回“位置环停、速度环保 0 速度”
+   - 最稳
+   - 就是你前一个版本
+
+2. 保持“全停”，但进入条件加速度条件
+   - 例如只有 `|error| <= 0.5cm` 且 `|ch5| <= 0.2cm/s` 才全停
+   - 这样球真慢下来才断控制，不会刚冲进来就断
+
+3. 保持“全停”，但退出门限加大
+   - 比如进 `0.5cm`，出 `0.8cm`
+   - 会减少频繁切换，但本质还是开关控制
+
+你这组数据已经说明第 2 种更适合现在现场状态，因为你进入保持区时 `ch5` 还经常是 `-4.42`、`-5.31` 这种量级，球根本没停住。
+
+结论：
+
+- `0 -> 500` 不是电机异常
+- 是当前“误差进范围就全停”的逻辑导致的
+- 直接原因就是 [pid.c:809](Core/Src/pid.c#L809) 这句 `motor_set_angle(0.0f);`
+
+我建议你把保持逻辑改成：
+
+- `|error| <= 0.5cm` 且 `|pidY_filtered_velocity| <= 0.2~0.3cm/s` 时，才全停
+
+这样就不会在球还高速滚动时直接切断控制。
+
+---
+
+_**User (2026-08-02 21:49:58Z)**_
+
+那应该怎么解决这个电机跳变问题？你分析一下，先别改代码
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:50:09Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Planning manual code edits with apply_patch**
+**Analyzing hold logic and tradeoffs**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:23Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 21:50:10Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Defining ball position detection logic**
+**Identifying angle slew bypass causing jumps**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:24Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 21:50:10Z)**_
 
-我直接把目标切换逻辑放进 `main.c`：启动先追 `+5cm`，一旦检测到小球到达 `+5cm`，只切换一次到 `-5cm`，之后不再改目标。
+<think><details><summary>Thought Process</summary>
+**Noticing noisy Y triggering early hold**
+</details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:36Z)**_
+_**Agent (claude-opus-4-8 2026-08-02 21:50:35Z)**_
+
+核心问题我先给结论：
+
+**这个“电机从 0 突然跳到 500 左右”的现象，不是 PID 参数本身先天有问题，而是“保持区切断策略”和“切断时内部状态没同步”共同造成的。**
+
+**现在的跳变来源**
+
+看你当前逻辑，在 [pid.c](Core/Src/pid.c#L786) 这段里，一旦进入保持区：
+
+1. 清空 `pidY`
+2. 清空 `pidY_Speed`
+3. 直接 `motor_set_angle(0.0f)`
+4. `return`
+
+这意味着控制不是“渐渐收住”，而是**硬切断**。
+
+然后一旦误差又超过退出门限 `0.6cm`，闭环又立刻恢复，于是下一拍又会重新给出一个几度的角度命令。
+
+这就形成了：
+
+- 进区：`ch0/ch3/ch4 -> 0`
+- 出区：`ch0/ch4` 突然恢复到 `3°~6°`
+
+你日志里那种：
+
+```text
+517 ... 539 ...
+0   ... 0   ...
+517 ... 617 ...
+```
+
+就是这个模式。
+
+**为什么会频繁进出保持区**
+
+你现在的门限是：
+
+- 进入：`|error| <= 0.5cm`
+- 退出：`|error| >= 0.6cm`
+
+这本来有回差，但问题在于你现在“只看位置，不看速度”。
+
+也就是说，小球即使还带着明显速度冲过来，只要位置碰到 `0.5cm`，你就全停。  
+一停以后球还会继续滚，所以马上又出 `0.6cm`，控制重新接管。
+
+这相当于把系统从连续控制，变成了一个“到点断电、超线再上电”的开关系统。
+
+**还有一个更隐蔽的问题：斜坡限幅被绕开了**
+
+正常情况下，你后面有 `ANGLE_SLEW_PER_TICK` 做角度变化率限制，位置在 [pid.c](Core/Src/pid.c#L951) 附近。
+
+但你在保持区里是：
+
+- 直接 `motor_set_angle(0.0f);`
+- 然后 `return;`
+
+这会带来两个后果：
+
+1. 电机命令角被直接拉到 0，**没有经过斜坡**
+2. 斜坡内部记忆的 `cmd_angle_last` 没有同步更新
+
+这很关键。因为实际电机已经被你拉到 0 了，但斜坡模块“心里还以为”上一拍大概是 `5°`。  
+所以退出保持区后，后面的斜坡限幅并不会按“0 -> 5°”去平滑，而是按“5°附近 -> 新目标角”去算。
+
+结果就是：
+
+- 物理电机在 `0°`
+- 控制内部状态还停留在旧角度记忆
+- 一恢复控制就会显得特别跳
+
+这个比单纯“门限太敏感”还更伤。
+
+**所以问题本质是三层叠加**
+
+1. **保持区全停**
+   - 连速度环也停了
+2. **进入条件只看位置，不看速度**
+   - 球还在冲，也会被强行停
+3. **保持区里直接 `motor_set_angle(0)` 并提前 return**
+   - 绕开了角度斜坡，还让内部状态和实际执行脱节
+
+**从控制角度，怎么解决更合理**
+
+先不改代码，只说策略，我会这样分优先级看：
+
+1. **最稳的方案**
+   - 不要“所有 PID 全停”
+   - 保持区里只停位置环，速度环继续做“目标速度 = 0”的保持
+
+这其实是你之前那个版本的思路。  
+优点是不会突然撤掉平台角度，小球也不会因为惯性马上滚出保持区。  
+缺点是你看到 `ch4/ch0` 还会有小动作，不是“完全静止”。
+
+2. **如果你坚持要“误差范围内全停”**
+   - 那进入条件必须加速度条件
+   - 也就是不仅看 `|error| <= 0.5cm`，还要看 `|实际速度|` 足够小
+
+否则就是你现在这样，球还在跑，控制已经断了。
+
+3. **如果还想保留全停**
+   - 不能直接 `motor_set_angle(0)` 后 return
+   - 至少要让“保持区动作”和后面的斜坡状态一致
+   - 否则内部角度记忆和实际执行会错位
+
+4. **门限本身也可以再调**
+   - 现在 `0.5 / 0.6` 对你这套视觉噪声和球速来说偏紧
+   - 只靠 0.1cm 回差，不足以抑制这种来回进出
+
+**你现在应该怎么理解这组日志**
+
+不是“PID乱跳”，而是：
+
+- 小球接近目标
+- 位置误差碰到 `0.5cm`
+- 你当前代码立刻把控制全关并回 0°
+- 球因为惯性继续滚
+- 误差又超过 `0.6cm`
+- 控制重新上线，电机重新给角度
+- 于是出现 `0 <-> 500` 这一类跳变
+
+**我对这个问题的判断**
+
+如果你的目标是“稳定停住”，当前这版“误差进范围就全停”不适合球这种有惯性的对象。  
+它更像一个带回差的继电器控制，不像连续闭环。
+
+更合理的方向是：
+
+- 要么恢复“外环停、内环保速为 0”
+- 要么全停，但必须等到“位置够近且速度够小”再停
+- 另外还要处理保持区对斜坡状态的同步问题
+
+这是这个跳变的主因，不是单纯把某个 `P/I/D` 再拧一下就能消掉。
+
+---
+
+_**User (2026-08-02 21:52:18Z)**_
+
+那你用这个吧
+最稳的方案
+不要“所有 PID 全停”
+保持区里只停位置环，速度环继续做“目标速度 = 0”的保持
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning code rollback with comments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:27Z)**_
+
+我把保持区逻辑切回“只停位置环、速度环继续保 0 速度”，这样能把你看到的 0/500 跳变压下去，同时不改现有门限。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:29Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ 恢复保持区为仅停位置环
+- [ ] 🌡️ 清理全停分支残留逻辑
+- [ ] 🌡️ 构建验证保持区方案
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:33Z)**_
+
+我会撤回刚才那段 `motor_set_angle(0); return;`，回到“`pidY.out = 0`，速度环继续工作”的版本。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:34Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+772	
+773		/* 接近目标后的到位保持。
+774		 *
+775		 * 当前策略改为只看位置误差：|error| <= 0.5cm 时直接停止 PID 调节；
+776		 * 当误差重新增大到 0.6cm 以上再恢复闭环，利用回差避免边界抖动。
+777		 */
+778		if(target_hold_active) {
+779			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+780				target_hold_active = false;
+781			}
+782		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+783			target_hold_active = true;
+784		}
+785	
+786		if(target_hold_active) {
+787			/* 进入误差保持区后，内外环全部停止：
+788			 *   1) 清空位置环输出；
+789			 *   2) 清空速度环输出与积分；
+790			 *   3) 电机命令角直接回 0°；
+791			 * 这样可以保证误差进入 0.5cm 范围后，不再有任何 PID 继续调节。 */
+792	#if !POSITION_LOOP_DIRECT_DRIVE
+793			stuck_ticks = 0u;
+794			breakaway_ramp_ticks = 0u;
+795			breakaway_active = false;
+796			breakaway_angle = 0.0f;
+797	#endif
+798			pidY.pout = 0.0f;
+799			pidY.iout = 0.0f;
+800			pidY.dout = 0.0f;
+801			pidY.out = 0.0f;
+802			pidY_Speed.target = 0.0f;
+803			pidY_Speed.now = 0.0f;
+804			pidY_Speed.pout = 0.0f;
+805			pidY_Speed.iout = 0.0f;
+806			pidY_Speed.dout = 0.0f;
+807			pidY_Speed.out = 0.0f;
+808			pidY_velocity_damping = 0.0f;
+809			motor_set_angle(0.0f);
+810			relative_y_last = relative_y;
+811			Y_last = Y;
+812			return;
+813		}
+814	
+815		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+816		pidY.target = 0.0f;
+817		pidY.now = relative_y;
+818		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+819		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+820		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+821		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+822		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+823		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+824		                POS_LOOP_I_LIMIT);
+825		if(target_hold_active) {
+826			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+827			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+828			 */
+829			pidY.out = 0.0f;
+830		}
+831	
+832		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+833		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+834		 */
+835		float control_velocity = estimated_velocity;
+836		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+837			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+838		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+839			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+840		}
+841		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:38Z)**_
+
+我现在把这段恢复成“清 breakaway 状态，但不 return、不回零、不清速度环”，只保留 `pidY.out=0` 那层保持。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:52:58Z)**_
+
+全停分支已经撤掉，保持区现在只会把位置环输出压成 0。接着我编译确认。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:53:00Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 恢复保持区为仅停位置环
+- [X] 🌡️ 清理全停分支残留逻辑
+- [⚡] 🌡️ 构建验证保持区方案
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:53:09Z)**_
 
 <tool-use data-tool-type="shell" data-tool-name="Bash"><details>
 <summary>Tool use: **Bash**</summary>
-Update main target switching logic
+Build firmware after restoring velocity hold behavior
+
+`cmake --build build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37920 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:53:14Z)**_
+
+编译通过。这版会把你之前看到的“进保持区就直接回 0°”跳变去掉。
+
+_**Agent (claude-opus-4-8 2026-08-02 21:53:15Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 恢复保持区为仅停位置环
+- [X] 🌡️ 清理全停分支残留逻辑
+- [X] 🌡️ 构建验证保持区方案
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 21:53:21Z)**_
+
+已经按你说的改成“最稳的方案”了：
+
+- 进入误差范围后
+  - **只停位置环**
+  - **速度环继续做 0 速度保持**
+- 不再直接 `motor_set_angle(0.0f)`
+- 不再在保持区里 `return`
+
+这样电机命令角不会再因为“进保持区就强制回零”而出现你看到的 `0 <-> 500` 跳变。
+
+现在保持区的行为是：
+
+- `ch3` 会被压到 `0`
+- `ch4` 还会有一点小输出，用来把球速压住
+- `ch0` 会平滑跟着速度环，而不是突然掉到 `0`
+
+改动位置在 [pid.c:786](Core/Src/pid.c#L786) 这一段。  
+我已经重新编译通过。
+
+---
+
+_**User (2026-08-02 22:02:50Z)**_
+
+现在要求小球能从0位置点，往5.6cm处移动，小球一旦到达5.6cm处小球立刻往-5.5位置处移动，然后稳定在-5.5cm处。但是这两段位置移动使用分段PID控制，从0cm处到5.6cm处，PID控制参数为
+  pid_init(&pidY, POSITION_PID, 1.735f, 0.0f, 0.00f, 0.0f);
+  pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);//  pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+  ball_target_set(5.6f);
+从5.6cm到-5.5并且稳定在-5.5cm处的PID参数为
+  pid_init(&pidY, POSITION_PID, 0.8f, 0.0f, 0.00f, 0.0f);
+  pid_init(&pidY_Speed, POSITION_PID, 1.05f, 0.01f, 0.0f, 0.0f);// 从0到5 pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+  ball_target_set(-5.5f);  // 初始目标位置（cm），负=左，正=右
+位置最大误差为0.5cm
+你明白我意思吗？说一下你想怎么控制这一段
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:03:04Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining control with hysteresis and segmented PID**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:03:04Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Detailing segment switching logic with hysteresis and PID reset**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:03:25Z)**_
+
+明白，你要的不是“一个目标点的普通跟踪”，而是一个**两段式状态机控制**：
+
+1. **阶段 A：`0 -> +5.6cm`**
+   - 目标位置：`+5.6cm`
+   - 位置环参数：`P=1.735, I=0, D=0`
+   - 速度环参数：`P=0.99, I=0.01, D=0`
+
+2. **阶段 B：`+5.6cm -> -5.5cm`**
+   - 一旦球到达 `+5.6cm` 附近，立刻切换目标到 `-5.5cm`
+   - 同时把 PID 参数切换成第二组：
+     - 位置环：`P=0.8, I=0, D=0`
+     - 速度环：`P=1.05, I=0.01, D=0`
+
+3. **最终状态：稳定在 `-5.5cm`**
+   - 最终允许误差：`±0.5cm`
+
+我会这样控制这段，不会直接用一堆 if 临时拼，而是做成一个**明确的三状态流程**：
+
+### 1. 定义 3 个状态
+- `MOVE_TO_POS_56`
+- `MOVE_TO_NEG_55`
+- `HOLD_AT_NEG_55`
+
+### 2. 上电后先进入第一段
+启动时只加载第一段参数：
+- `pidY = 1.735 / 0 / 0`
+- `pidY_Speed = 0.99 / 0.01 / 0`
+- `ball_target = 5.6`
+
+### 3. 到达 `+5.6cm` 后，立刻切第二段
+判断条件我会用：
+
+```text
+|Y - 5.6| <= 0.5
+```
+
+一满足就立刻：
+- 切状态到 `MOVE_TO_NEG_55`
+- 重新 `pid_init()` 两个 PID
+- 清掉旧段积分和历史误差
+- `ball_target_set(-5.5f)`
+
+这里“重新 init”很重要，不然第一段留下来的速度环积分、位置环历史误差会污染第二段。
+
+### 4. 到达 `-5.5cm` 后进入最终保持
+第二段运行时，用第二组参数追 `-5.5cm`。  
+当满足：
+
+```text
+|Y - (-5.5)| <= 0.5
+```
+
+就进入最终保持态 `HOLD_AT_NEG_55`。
+
+这里我建议最终保持继续沿用你现在这个更稳的思路：
+
+- **位置环停**
+- **速度环继续做 0 速度保持**
+
+也就是：
+- `pidY.out = 0`
+- 速度环继续把球速压到 0
+
+这样不会像之前“全停并回 0°”那样出现电机角度 0/500 的硬跳变。
+
+### 5. 一个关键细节
+**从 `+5.6` 切到 `-5.5` 的那一刻，不要用“最终保持逻辑”拦住。**
+
+因为你的需求是：
+
+- 到 `+5.6` 只是一个“中途触发点”
+- 不是在那里停住
+- 是一到就立刻反向去 `-5.5`
+
+所以：
+- `+5.6` 的 `±0.5cm` 只是**切段条件**
+- `-5.5` 的 `±0.5cm` 才是**最终稳定条件**
+
+这两个在逻辑上要分开，不能共用同一个“到位保持”标志。
+
+### 6. 我会避免的坑
+这段控制里最容易出问题的是 3 个点：
+
+1. **重复切段**
+   - 球在 `5.6` 附近抖动时，不能反复切换参数
+   - 所以一定要靠状态机保证“第一段只切一次”
+
+2. **参数切换时旧积分残留**
+   - 必须重新初始化 `pidY` 和 `pidY_Speed`
+   - 尤其速度环积分不能继承上一段
+
+3. **最终停住时电机硬回零**
+   - 这个你已经看到副作用了
+   - 最终保持我不会再用“所有 PID 全停并强制 0°”的做法
+
+### 我对这段的理解，用一句话概括
+就是：
+
+**先用第一组 PID 把球从 0 推到 `5.6`，一旦进 `5.6±0.5` 立刻切第二组 PID，目标改成 `-5.5`，最后在 `-5.5±0.5` 用“外环停、内环保速 0”稳定住。**
+
+如果按这个思路落代码，我会把它做成一个小状态机，改动主要放在 [pid.c](Core/Src/pid.c) 的控制流程里，`main.c` 只保留初始化入口，不把分段逻辑散在主循环里。
+
+---
+
+_**User (2026-08-02 22:04:24Z)**_
+
+很好，那你现在开始写代码吧，要求逻辑严谨
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning PID change implementation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Examining PID initialization logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:32Z)**_
+
+我先把 `pid.c/pid.h/main.c` 再核一遍，确定状态切换点和参数装载位置，然后直接落成一个三状态流程。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:34Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ 梳理现有 pid 控制入口和保持逻辑
+- [ ] 🌡️ 实现两段目标切换状态机
+- [ ] 🌡️ 构建并校验分段 PID 行为
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning PID code implementation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Reading PID control and init functions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:45Z)**_
+
+我会把这段分成“到 +5.6 的第一段、切到 -5.5 的第二段、最终保持”三种状态，并且在切段时重新初始化两个 PID，避免上一段积分和历史误差串到下一段。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:45Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+1	#include "pid.h"
+2	#include "Emm_V5.h"              /* ball_error、Emm_V5_Pos_Control */
+3	
+4	extern volatile float ball_velocity;  /* 视觉小球速度，定义在 main.c，中断写主循环读 */
+5	
+6	#define PULSES_PER_DEG  8.89f  /* 3200脉冲/圈，1°=8.89脉冲 */
+7	
+8	/* 上一次下发的绝对目标脉冲，仅用于 VOFA 显示和避免重复发同一目标。 */
+9	static int32_t motor_command_pulses = 0;
+10	
+11	/* 由 pid.h 的角度限幅换算成脉冲阈值（仅 pid.c 内部使用） */
+12	#define PULSE_LIMIT_MAX  (ANGLE_LIMIT_MAX * PULSES_PER_DEG)            /* 正向限幅脉冲 */
+13	#define PULSE_LIMIT_MIN  (ANGLE_LIMIT_MIN * PULSES_PER_DEG)            /* 反向限幅脉冲 */
+14	#define PULSE_DEAD_MAX   ((ANGLE_LIMIT_MAX - 2.0f) * PULSES_PER_DEG)  /* 正向死区起点（限位前2°） */
+15	#define PULSE_DEAD_MIN   ((ANGLE_LIMIT_MIN + 2.0f) * PULSES_PER_DEG)  /* 反向死区起点（限位前2°） */
+16	
+17	#define MAX_DUTY  7200    /* 旧代码需要，PWM最大占空比 */
+18	#define MOTOR_ADDR 1      /* 旧代码需要，电机地址 */
+19	#define MOTOR_POSITION_SPEED_RPM  100u   /* 串口绝对位置命令速度 */
+20	
+21	/*pid_t motorA;
+22	pid_t motorB;
+23	pid_t motorC;
+24	pid_t motorD;
+25	
+26	pid_t weizhiA;
+27	pid_t weizhiB;
+28	pid_t weizhiC;
+29	pid_t weizhiD;
+30	
+31	pid_t ServoA;
+32	pid_t ServoB;
+33	
+34	pid_t ServoA_Speed;
+35	pid_t ServoB_Speed;
+36	
+37	pid_t ServoA_Pid;
+38	pid_t ServoB_Pid;
+39	
+40	int redX_last;
+41	int redY_last;*/
+42	
+43	int redXSpeed;
+44	int redYSpeed;
+45	
+46	float Y;
+47	float Y_last;
+48	
+49	/* 目标坐标与视觉 Y 使用同一坐标系，默认回到画面中心。 */
+50	volatile float ball_target_y = 0.0f;
+51	
+52	void ball_target_set(float target_y)
+53	{
+54		ball_target_y = target_y;
+55	}
+56	
+57	float ball_target_get(void)
+58	{
+59		return ball_target_y;
+60	}
+61	
+62	pid_t pidY;
+63	pid_t pidY_Speed;
+64	float pidY_velocity_damping;
+65	float pidY_filtered_velocity = 0.0f;  /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+66	
+67	void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
+68	{
+69		pid->pid_mode = mode;
+70		pid->p = p;
+71		pid->i = i;
+72		pid->d = d;
+73		pid->f = f;
+74		pid->target = 0;
+75		pid->now = 0;
+76		pid->out = 0;
+77		pid->iout = 0;
+78		pid->error[0] = pid->error[1] = pid->error[2] = 0;
+79		pid->target_last = 0;
+80	}
+81	
+82	/*void motor_target_set(int spe1, int spe2)
+83	{
+84		if(spe1 >= 0)
+85		{
+86			motorA_dir = 1;
+87			motorA.target = spe1;
+88		}
+89		else
+90		{
+91			motorA_dir = 0;
+92			motorA.target = -spe1;
+93		}
+94		
+95		if(spe2 >= 0)
+96		{
+97			motorB_dir = 1;
+98			motorB.target = spe2;
+99		}
+100		else
+101		{
+102			motorB_dir = 0;
+103			motorB.target = -spe2;
+104		}
+105	}
+106	
+107	void motor_target_set_CD(int spe1, int spe2)
+108	{
+109		if(spe1 >= 0)
+110		{
+111			motorC_dir = 1;
+112			motorC.target = spe1;
+113		}
+114		else
+115		{
+116			motorC_dir = 0;
+117			motorC.target = -spe1;
+118		}
+119		
+120		if(spe2 >= 0)
+121		{
+122			motorD_dir = 1;
+123			motorD.target = spe2;
+124		}
+125		else
+126		{
+127			motorD_dir = 0;
+128			motorD.target = -spe2;
+129		}
+130	}
+131	
+132	//void Servo_target_set(int spe1, int spe2)
+133	//{
+134	//	ServoA.target = spe1;
+135	//	ServoB.target = spe2;
+136	//	
+137	//	
+138	//}
+139	
+140	void pid_control(void)
+141	{
+142		// 1.�趨Ŀ���ٶ�
+143	//	motorA.target = 50;
+144		motor_target_set(30,30);
+145		// 2.��ȡ��ǰ�Ƕ�
+146		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedA;}
+147		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+148		Encoder_count1 = 0;
+149		Encoder_count2 = 0;
+150		// 3.PID�������������
+151		pid_cal(&motorA);
+152		pid_cal(&motorB);
+153		// �������޷�
+154		pidout_limit(&motorA);
+155		pidout_limit(&motorB);
+156		// 4.PID�����ֵ ��������
+157		motorA_duty(motorA.out);
+158		motorB_duty(motorB.out);
+159	}
+160	
+161	void pid_control_speed(void)
+162	{
+163		// 1.�趨Ŀ���ٶ�
+164	//	motorA.target = 50;
+165		motor_target_set(30,30);
+166		// 2.��ȡ��ǰ�Ƕ�
+167		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedA;}
+168		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+169		Encoder_count1 = 0;
+170		Encoder_count2 = 0;
+171		// 3.PID�������������
+172		pid_cal(&motorA);
+173		pid_cal(&motorB);
+174		// �������޷�
+175		pidout_limit(&motorA);
+176		pidout_limit(&motorB);
+177		// 4.PID�����ֵ ��������
+178		motorA_duty(motorA.out);
+179		motorB_duty(motorB.out);
+180	}
+181	
+182	void pid_control_speed_CD(void)
+183	{
+184		// 1.�趨Ŀ���ٶ�
+185	//	motorA.target = 50;
+186		motor_target_set_CD(200,200);
+187		// 2.��ȡ��ǰ�Ƕ�
+188		if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+189		if(motorD_dir){motorD.now = speedD;}else{motorD.now = -speedD;}
+190	//	if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+191	//	if(motorD_dir){PositionD = (((Encoder_Timer_Overflow_D-1)*65535)+(TIM_GetCounter(TIM5)));}
+192	//	else{PositionD = -(-(Encoder_Timer_Overflow_D*65535)+(65535-TIM_GetCounter(TIM5)));}
+193		Encoder_count3	= 0;
+194		Encoder_count4 = 0;
+195		// 3.PID�������������
+196		pid_cal(&motorC);
+197		pid_cal(&motorD);
+198		// �������޷�
+199		pidout_limit(&motorC);
+200		pidout_limit(&motorD);
+201		// 4.PID�����ֵ ��������
+202		motorC_duty(motorC.out);
+203		motorD_duty(motorD.out);
+204	}
+205	
+206	void pid_control_Position_CD(int C,int D)
+207	{
+208		// 1.�趨Ŀ��λ��
+209		weizhiC.target = C;
+210		weizhiD.target = D;
+211		//2��ȡ��ǰλ��
+212		weizhiC.now = PositionC;
+213		weizhiD.now = PositionD;
+214		//pid����
+215		pid_cal(&weizhiC);
+216		pid_cal(&weizhiD);
+217		//���뵽���
+218		motorC_duty(weizhiC.out);
+219		motorD_duty(weizhiD.out);
+220
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:45Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+720			Emm_V5_Pos_Control(MOTOR_ADDR, 0, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)target_pulses, 1, 0);
+721		} else {
+722			Emm_V5_Pos_Control(MOTOR_ADDR, 1, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)(-target_pulses), 1, 0);
+723		}
+724	
+725		motor_command_pulses = target_pulses;
+726	}
+727	
+728	void pid_control__26Y(void)
+729	{
+730		static float relative_y_last = 0.0f;
+731		static float target_y_last = 0.0f;
+732	#if !POSITION_LOOP_DIRECT_DRIVE
+733		static float breakaway_start_error = 0.0f;
+734		static float breakaway_angle = 0.0f;
+735		static uint8_t stuck_ticks = 0u;
+736		static uint8_t breakaway_ramp_ticks = 0u;
+737		static bool breakaway_active = false;
+738	#endif
+739		static bool control_initialized = false;
+740		static bool target_hold_active = false;
+741	
+742		Y = ball_error;  // 视觉小球绝对位置
+743	
+744		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+745		float target_y = ball_target_get();
+746		float relative_y = Y - target_y;
+747		bool target_changed = !control_initialized || target_y != target_y_last;
+748	
+749		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+750		if(target_changed) {
+751	#if !POSITION_LOOP_DIRECT_DRIVE
+752			stuck_ticks = 0u;
+753			breakaway_ramp_ticks = 0u;
+754			breakaway_active = false;
+755			breakaway_angle = 0.0f;
+756	#endif
+757			target_hold_active = false;
+758			relative_y_last = relative_y;
+759			target_y_last = target_y;
+760			control_initialized = true;
+761		}
+762	
+763		float position_delta = relative_y - relative_y_last;
+764		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+765	
+766		/* 内环速度反馈改为本地位置差分速度。
+767		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+768		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+769		 */
+770		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+771		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+772	
+773		/* 接近目标后的到位保持。
+774		 *
+775		 * 当前策略改为只看位置误差：|error| <= 0.5cm 时直接停止 PID 调节；
+776		 * 当误差重新增大到 0.6cm 以上再恢复闭环，利用回差避免边界抖动。
+777		 */
+778		if(target_hold_active) {
+779			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+780				target_hold_active = false;
+781			}
+782		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+783			target_hold_active = true;
+784		}
+785	
+786		if(target_hold_active) {
+787			/* 进入误差保持区后，只停止位置环继续推球：
+788			 *   1) 外环目标速度稍后压到 0；
+789			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+790			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+791	#if !POSITION_LOOP_DIRECT_DRIVE
+792			stuck_ticks = 0u;
+793			breakaway_ramp_ticks = 0u;
+794			breakaway_active = false;
+795			breakaway_angle = 0.0f;
+796	#endif
+797		}
+798	
+799		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+800		pidY.target = 0.0f;
+801		pidY.now = relative_y;
+802		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+803		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+804		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+805		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+806		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+807		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+808		                POS_LOOP_I_LIMIT);
+809		if(target_hold_active) {
+810			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+811			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+812			 */
+813			pidY.out = 0.0f;
+814		}
+815	
+816		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+817		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+818		 */
+819		float control_velocity = estimated_velocity;
+820		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+821			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+822		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+823			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+824		}
+825		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+826		                         (control_velocity - pidY_filtered_velocity);
+827	
+828	#if POSITION_LOOP_DIRECT_DRIVE
+829		/* 单环调试模式：位置环直接输出平台倾角。
+830		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+831		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+832		pidY_velocity_damping = 0.0f;
+833		pidY_Speed.target = 0.0f;
+834		pidY_Speed.now = pidY_filtered_velocity;
+835		pidY_Speed.out = 0.0f;
+836		pidY_Speed.pout = 0.0f;
+837		pidY_Speed.iout = 0.0f;
+838		pidY_Speed.dout = 0.0f;
+839	
+840		float cmd_angle = pidY.out;
+841	#else
+842		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+843		 *
+844		 * breakaway 现改为“分级加力”：
+845		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+846		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+847		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+848		 *
+849		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+850		 */
+851		if(breakaway_active) {
+852			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+853			   (breakaway_start_error < 0.0f &&
+854			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+855			   (breakaway_start_error > 0.0f &&
+856			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+857				breakaway_active = false;
+858				breakaway_angle = 0.0f;
+859				breakaway_ramp_ticks = 0u;
+860			} else if(position_delta > -STUCK_POSITION_DELTA &&
+861			          position_delta < STUCK_POSITION_DELTA) {
+862				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+863					breakaway_ramp_ticks++;
+864				} else {
+865					breakaway_ramp_ticks = 0u;
+866					if(breakaway_start_error < 0.0f) {
+867						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+868						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+869							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+870						}
+871					} else {
+872						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+873						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+874							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+875						}
+876					}
+877				}
+878			} else {
+879				breakaway_ramp_ticks = 0u;
+880			}
+881			stuck_ticks = 0u;
+882		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+883		          position_delta > -STUCK_POSITION_DELTA &&
+884		          position_delta < STUCK_POSITION_DELTA) {
+885			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+886				stuck_ticks++;
+887			}
+888			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+889				breakaway_start_error = relative_y;
+890				breakaway_active = true;
+891				breakaway_ramp_ticks = 0u;
+892				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+893			}
+894		} else {
+895			stuck_ticks = 0u;
+896		}
+897	
+898		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+899		pidY_Speed.target = pidY.out;
+900		pidY_Speed.now = pidY_filtered_velocity;
+901	
+902		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+903		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+904		float iout_frozen = pidY_Speed.iout;
+905		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+906		                SPEED_LOOP_I_LIMIT);
+907		if(breakaway_active) {
+908			pidY_Speed.iout = iout_frozen;
+909			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+910			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+911				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+912			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+913				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+914			}
+915		}
+916	
+917		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+918	
+919		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+920		float cmd_angle = pidY_velocity_damping;
+921		if(breakaway_active) {
+922			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+923				cmd_angle = breakaway_angle;
+924			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+925				cmd_angle = breakaway_angle;
+926			}
+927		}
+928	#endif
+929	
+930		// 负方向（下降）机构补偿 ×1.2。
+931		if(cmd_angle < 0.0f) {
+932			cmd_angle *= 1.2f;
+933		}
+934	
+935		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+936		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+937		static float cmd_angle_last = 0.0f;
+938		{
+939			float delta = cmd_angle - cmd_angle_last;
+940			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+941			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+942			cmd_angle = cmd_angle_last + delta;
+943			cmd_angle_last = cmd_angle;
+944		}
+945		motor_set_angle(cmd_angle);
+946	
+947		relative_y_last = relative_y;
+948		Y_last = Y;
+949	}
+950	
+951	void pidout_limit_Y(pid_t *pid)
+952	{
+953		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+954	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:45Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\main.c`
+
+```text
+138	
+139	  /* Infinite loop */
+140	  /* USER CODE BEGIN WHILE */
+141	
+142	  uint32_t last_vofa_time = HAL_GetTick();  // 上次读取+发送时间
+143	
+144	  /* 串级 PID：外位置环输出目标速度，内速度环输出平台倾角。 */
+145	  /* 内环 I=0.01/tick（50Hz → 0.5/s）：唯一职责是把"命令 0° 并非真正水平"的
+146	   * 机械零点偏差与滚动摩擦这个常值扰动积掉，由 SPEED_LOOP_I_LIMIT 限幅 ±2.5°。
+147	   * 外环保持 I=0（POS_LOOP_I_LIMIT 也为 0），位置环靠内环消稳态误差即可。 */
+148	  pid_init(&pidY, POSITION_PID, 0.7f, 0.0f, 0.00f, 0.0f);
+149	  pid_init(&pidY_Speed, POSITION_PID, 1.05f, 0.01f, 0.0f, 0.0f);// 从0到5 pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+150	  ball_target_set(-5.5f);  // 初始目标位置（cm），负=左，正=右
+151	  BT_Tune_Init();
+152	  while (1)
+153	  {
+154	    /* USER CODE END WHILE */
+155	
+156	    /* USER CODE BEGIN 3 */
+157	    BT_Tune_Process();
+158	
+159	 if(g_flag_10ms)
+160	    {
+161	        g_flag_10ms = false;    // 清标志
+162	        pid_control__26Y();
+163	    }
+164	
+165	    // ========== 视觉数据：每帧更新 ==========
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:45Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+160	#define BREAKAWAY_POS_ANGLE_BASE      2.0f    /* 正向起动角初值 (°) */
+161	#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
+162	#define BREAKAWAY_POS_ANGLE_MAX       4.0f    /* 正向起动角上限 (°) */
+163	#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
+164	#define BREAKAWAY_ANGLE_STEP          0.5f    /* 每次加力的步长 (°) */
+165	#define BREAKAWAY_RAMP_TICKS          8u      /* 每 8 × 20ms = 160ms 仍不动则再加一级 */
+166	#define BREAKAWAY_RELEASE_DISTANCE    0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
+167	
+168	extern float Y;
+169	extern float Y_last;
+170	
+171	/* 小球目标位置，单位 cm，坐标系与 Y 保持一致；可在运行中随时更新。 */
+172	extern volatile float ball_target_y;
+173	void ball_target_set(float target_y);
+174	float ball_target_get(void);
+175	
+176	extern pid_t pidY;        /* 单环直驱时：位置 -> 平台倾角；串级时：位置 -> 小球目标速度 */
+177	extern pid_t pidY_Speed;  /* 串级模式下：小球速度 -> 平台倾角 */
+178	extern float pidY_velocity_damping;  /* 保留旧变量名，当前为速度环倾角输出 */
+179	extern float pidY_filtered_velocity; /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+180	
+181	void pid_control__26Y(void);
+182	void motor_set_angle(float target_deg);
+183	float motor_get_command_angle(void);
+184	
+185	void pidout_limit_Y(pid_t *pid);
+186	
+187	
+188	
+189	
+190	
+191	
+192	
+193	#endif
+194
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:04:58Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning state machine implementation and initialization**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:01Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing PID state enums and initialization logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining stage transition logic based on position**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning staged profile transitions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing final hold state at -5.5**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:12Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Simplifying final hold state logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining state logic with explicit enum**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:19Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Defining ball sequence stages and PID profile helpers**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying sequence config visibility**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting target hold activation order**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Revising switch logic to use absolute position**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:35Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Standardizing tolerance constants**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:38Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning stage initialization and transitions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:38Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Maintaining filtered velocity for control accuracy**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:39Z)**_
+
+我现在开始落状态机：第一段到 `+5.6` 时立刻换第二组参数和目标，第二段到 `-5.5` 后进入终态，但终态仍允许用现有“外环停、内环保速 0”去稳住，不会再切回别的段。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:48Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:05:52Z)**_
+
+接着把初始化入口从 `main.c` 搬到状态机里，避免主程序默认参数和分段参数互相冲突。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:01Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:09Z)**_
+
+我现在把到 `+5.6` 的切段判断和到 `-5.5` 的最终保持判断嵌进控制开头，切段时强制重置两个 PID。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:25Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:29Z)**_
+
+最后把保持区逻辑限定为只在最终 `-5.5` 段生效，避免第一段到 `+5.6` 时误触发“停位置环”。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:37Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:41Z)**_
+
+分段状态机主体已经接上了。我还需要清掉 `main.c` 里原本写死的初始 PID/目标，避免和状态机双重初始化。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:55Z)**_
+
+我已经把 `main.c` 的初始值收口到状态机。现在做一次构建，把潜在的状态切换错误和未声明问题暴露出来。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:06:57Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 梳理现有 pid 控制入口和保持逻辑
+- [X] 🌡️ 实现两段目标切换状态机
+- [⚡] 🌡️ 构建并校验分段 PID 行为
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:09Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after adding segmented PID state machine
+
+`cmake --build build/Debug`
+
+```text
+[1/3] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[2/3] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[3/3] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38328 B         1 MB      3.66%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:16Z)**_
+
+构建过了。我再快速核一下关键状态切换点和最终保持行为，确保和你的需求一一对应。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:16Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `PID_SEGMENT_TO_POS_56|pid_apply_segment_profile\(|PID_SEGMENT_HOLD_NEG_55|target_hold_active = false;`
+
+```text
+68:	PID_SEGMENT_TO_POS_56 = 0,
+70:	PID_SEGMENT_HOLD_NEG_55,
+73:static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+81:static void pid_apply_segment_profile(float target_y,
+763:	static bool target_hold_active = false;
+766:		pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+767:		g_pid_segment = PID_SEGMENT_TO_POS_56;
+777:	if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+779:			pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+782:			target_hold_active = false;
+792:			g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+794:			target_hold_active = false;
+817:		target_hold_active = false;
+835:	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+838:				target_hold_active = false;
+844:		target_hold_active = false;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:16Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\main.c` pattern `分段状态机|最终在 -5.5cm`
+
+```text
+144:  /* 串级 PID 参数与目标点由 pid.c 内部的分段状态机统一装载：
+147:   *   3) 最终在 -5.5cm ±0.5cm 处稳定保持。 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:21Z)**_
+
+状态机、两组参数和最终保持都已经对上。我现在给你一个精简但准确的交付说明。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:23Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ 梳理现有 pid 控制入口和保持逻辑
+- [X] 🌡️ 实现两段目标切换状态机
+- [X] 🌡️ 构建并校验分段 PID 行为
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:07:44Z)**_
+
+已经按你的要求写好了，逻辑是严谨的三状态分段控制，并且编译通过 ✅
+
+现在的控制流程是：
+
+1. **第一段：`0 -> +5.6cm`**
+   - 自动加载第一组参数：
+   - `pidY = 1.735 / 0 / 0`
+   - `pidY_Speed = 0.99 / 0.01 / 0`
+   - 目标点：`+5.6cm`
+
+2. **到达 `+5.6 ± 0.5cm` 后立刻切第二段**
+   - 立刻重新 `pid_init()` 两个 PID
+   - 自动切到第二组参数：
+   - `pidY = 0.8 / 0 / 0`
+   - `pidY_Speed = 1.05 / 0.01 / 0`
+   - 目标点改成：`-5.5cm`
+
+3. **第二段：`+5.6 -> -5.5cm`**
+   - 用第二组参数继续闭环运动
+
+4. **到达 `-5.5 ± 0.5cm` 后进入最终保持**
+   - 最终保持采用你确认过的“最稳方案”：
+   - **位置环停**
+   - **速度环继续做 0 速度保持**
+   - 不会再出现“进范围就直接回 0°”导致的电机跳变
+
+关键实现位置：
+
+- 状态机和两组参数装载在 [pid.c:68](Core/Src/pid.c#L68) 到 [pid.c:92](Core/Src/pid.c#L92)
+- 第一段初始化在 [pid.c:766](Core/Src/pid.c#L766)
+- `+5.6` 切到 `-5.5` 在 [pid.c:777](Core/Src/pid.c#L777)
+- 最终进入 `-5.5` 保持在 [pid.c:790](Core/Src/pid.c#L790)
+- `main.c` 里的固定 PID 初始化已经删掉，统一交给状态机，见 [main.c:144](Core/Src/main.c#L144)
+
+我已经重新执行 `cmake --build build/Debug`，构建通过。  
+你现在下载后，应该能看到：
+
+- 球先去 `+5.6`
+- 一进 `±0.5cm` 就立刻反向去 `-5.5`
+- 最后稳定在 `-5.5` 附近
+
+建议你现场重点看 VOFA 的 `ch1/ch3/ch4/ch0`，这样最容易确认切段是否符合预期。
+
+---
+
+_**User (2026-08-02 22:18:37Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+那现在我还想调一下5到-5cm的PID，应该在那调节？
+
+_**User (2026-08-02 22:18:39Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-02 22:20:39Z)**_
+
+那现在我还想调一下5到-5cm的PID，应该在那调节？
+
+_**User (2026-08-02 22:22:58Z)**_
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+   - The user is developing STM32F407 embedded firmware for a ball-balancing / position control system using cascaded PID, MaixCAM vision input, a stepper motor driver over UART1, VOFA telemetry over USART3, and wireless tuning over UART4.
+   - The user first requested: “加入无线调参，使用串口PC10、PC11” — add wireless PID tuning using PC10/PC11.
+   - Then requested a wireless motor homing command: “增加电机归零指令‘GET_0’电机归零到归零点”.
+   - The user repeatedly tested VOFA output and asked for diagnosis of angle saturation and behavior.
+   - The user then requested to tune only the position loop first by bypassing the inner speed loop and directly loading position-loop output to the motor.
+   - After tuning, the user requested restoring cascaded PID with tuned position-loop defaults (`P=0.68`, `I=0`, `D=0`).
+   - Then requested increasing positive/upward angle limit by 2 degrees.
+   - Then asked whether wireless homing had been written.
+   - Then requested changing hold behavior so that within 0.5 cm error PID stops adjusting.
+   - After observing that only the outer loop stopped while the inner loop still acted, the user explicitly requested all PID stop within the 0.5 cm range.
+   - After observing 0↔500 motor-angle jumps, the user asked for analysis only: “那应该怎么解决这个电机跳变问题？你分析一下，先别改代码”.
+   - The user then selected the “most stable” solution: “不要‘所有 PID 全停’ 保持区里只停位置环，速度环继续做‘目标速度 = 0’的保持”.
+   - Finally, the user requested a rigorous segmented-PID motion sequence:
+     - From 0 cm to +5.6 cm with PID set A:
+       - `pid_init(&pidY, POSITION_PID, 1.735f, 0.0f, 0.00f, 0.0f);`
+       - `pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);`
+       - `ball_target_set(5.6f);`
+     - Immediately once the ball reaches +5.6 cm, switch to motion toward -5.5 cm with PID set B:
+       - `pid_init(&pidY, POSITION_PID, 0.8f, 0.0f, 0.00f, 0.0f);`
+       - `pid_init(&pidY_Speed, POSITION_PID, 1.05f, 0.01f, 0.0f, 0.0f);`
+       - `ball_target_set(-5.5f);`
+     - Maximum position error: 0.5 cm.
+   - The most recent explicit request before this summary was: “很好，那你现在开始写代码吧，要求逻辑严谨”.
+
+2. Key Technical Concepts:
+   - STM32F407 embedded firmware
+   - UART4 on PC10/PC11 (AF8) for wireless tuning
+   - HAL UART interrupt RX (`HAL_UART_Receive_IT`)
+   - `HAL_UART_RxCpltCallback`
+   - Stepper motor driver protocol (`Emm_V5`)
+   - Homing/origin return with `Emm_V5_Origin_Trigger_Return`
+   - Cascaded PID:
+     - Outer loop: position -> target speed
+     - Inner loop: speed -> platform angle
+   - Temporary single-loop direct-drive mode:
+     - Position loop directly outputs motor angle
+   - VOFA telemetry channels
+   - Hold-zone logic with hysteresis
+   - Breakaway/static-friction compensation
+   - Angle slew limiting
+   - Segmented PID state machine:
+     - 0 -> +5.6
+     - +5.6 -> -5.5
+     - final hold at -5.5
+   - Conditional compilation mode switch:
+     - `POSITION_LOOP_DIRECT_DRIVE`
+   - CMake-based STM32 build
+   - CubeMX `.ioc` synchronization
+
+3. Files and Code Sections:
+
+   - `Core/Inc/bt_tune.h`
+      - Created to declare wireless tuning interface.
+      - Important because it defines the UART4 tuning module’s public API.
+      - Created content:
+        ```c
+        #ifndef __BT_TUNE_H__
+        #define __BT_TUNE_H__
+
+        #include "main.h"
+
+        #define BT_BUF_SIZE 64
+
+        void BT_Tune_Init(void);
+        void BT_Tune_RestartRx(void);
+        void BT_Tune_ByteReceived(void);
+        void BT_Tune_Process(void);
+
+        #endif /* __BT_TUNE_H__ */
+        ```
+
+   - `Core/Src/bt_tune.c`
+      - Created and then extended multiple times.
+      - Important because it implements:
+        - UART4 byte-by-byte wireless protocol parsing
+        - PID tuning commands
+        - GETPID readback
+        - integrator reset
+        - GET_0 homing command
+      - Important code patterns added:
+        ```c
+        #include "bt_tune.h"
+        #include "usart.h"
+        #include "pid.h"
+        #include "Emm_V5.h"
+
+        #define BT_TUNE_MOTOR_ADDR 1u
+        ```
+      - UART4 tuning reply path:
+        ```c
+        static void BT_Tune_SendReply(const char *reply)
+        {
+            HAL_UART_Transmit(&huart4, (uint8_t *)reply, (uint16_t)strlen(reply), 20);
+        }
+        ```
+      - PID parameter mapping:
+        ```c
+        static bool BT_Tune_SetPidByKey(const char *key, float value)
+        {
+            if((strcmp(key, "1") == 0) || (strcmp(key, "Pos_P") == 0)) { pidY.p = value; return true; }
+            if((strcmp(key, "2") == 0) || (strcmp(key, "Pos_I") == 0)) { pidY.i = value; return true; }
+            if((strcmp(key, "3") == 0) || (strcmp(key, "Pos_D") == 0)) { pidY.d = value; return true; }
+            if((strcmp(key, "4") == 0) || (strcmp(key, "Spd_P") == 0)) { pidY_Speed.p = value; return true; }
+            if((strcmp(key, "5") == 0) || (strcmp(key, "Spd_I") == 0)) { pidY_Speed.i = value; return true; }
+            if((strcmp(key, "6") == 0) || (strcmp(key, "Spd_D") == 0)) { pidY_Speed.d = value; return true; }
+            return false;
+        }
+        ```
+      - GETPID support:
+        ```c
+        if(strcmp(cmd, "GETPID") == 0) {
+            BT_Tune_SendPid();
+            return;
+        }
+        ```
+      - GET_0 homing support:
+        ```c
+        if(strcmp(cmd, "GET_0") == 0) {
+            pidY.iout = 0.0f;
+            pidY_Speed.iout = 0.0f;
+            motor_set_angle(0.0f);
+            Emm_V5_Origin_Trigger_Return(BT_TUNE_MOTOR_ADDR, 0, 0);
+            BT_Tune_SendOk();
+            return;
+        }
+        ```
+      - Integrator reset command:
+        ```c
+        if((strcmp(cmd, "k") == 0) || (strcmp(cmd, "key") == 0)) {
+            if(strcmp(arg1, "rst") != 0) { BT_Tune_SendErr(); return; }
+            pidY.iout = 0.0f;
+            pidY_Speed.iout = 0.0f;
+            BT_Tune_SendOk();
+            return;
+        }
+        ```
+
+   - `Core/Inc/usart.h`
+      - Modified to expose UART4 and declare `MX_UART4_Init()`.
+      - Important additions:
+        ```c
+        extern UART_HandleTypeDef huart4;
+        void MX_UART4_Init(void);
+        ```
+
+   - `Core/Src/usart.c`
+      - Modified to add full UART4 initialization on PC10/PC11.
+      - Important because it physically enables wireless tuning hardware.
+      - Added:
+        ```c
+        UART_HandleTypeDef huart4;
+        ```
+      - Added `MX_UART4_Init()`:
+        ```c
+        void MX_UART4_Init(void)
+        {
+          huart4.Instance = UART4;
+          huart4.Init.BaudRate = 115200;
+          huart4.Init.WordLength = UART_WORDLENGTH_8B;
+          huart4.Init.StopBits = UART_STOPBITS_1;
+          huart4.Init.Parity = UART_PARITY_NONE;
+          huart4.Init.Mode = UART_MODE_TX_RX;
+          huart4.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+          huart4.Init.OverSampling = UART_OVERSAMPLING_16;
+          if (HAL_UART_Init(&huart4) != HAL_OK)
+          {
+            Error_Handler();
+          }
+        }
+        ```
+      - Added MSP init branch for UART4:
+        ```c
+        else if(uartHandle->Instance==UART4)
+        {
+          __HAL_RCC_UART4_CLK_ENABLE();
+          __HAL_RCC_GPIOC_CLK_ENABLE();
+          GPIO_InitStruct.Pin = GPIO_PIN_10|GPIO_PIN_11;
+          GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+          GPIO_InitStruct.Pull = GPIO_PULLUP;
+          GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+          GPIO_InitStruct.Alternate = GPIO_AF8_UART4;
+          HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+          HAL_NVIC_SetPriority(UART4_IRQn, 0, 0);
+          HAL_NVIC_EnableIRQ(UART4_IRQn);
+        }
+        ```
+
+   - `Core/Inc/stm32f4xx_it.h`
+      - Modified to declare:
+        ```c
+        void UART4_IRQHandler(void);
+        ```
+
+   - `Core/Src/stm32f4xx_it.c`
+      - Modified to include `bt_tune.h`, declare `huart4`, add `UART4_IRQHandler`, and override RX complete callback.
+      - Important snippet:
+        ```c
+        void UART4_IRQHandler(void)
+        {
+          HAL_UART_IRQHandler(&huart4);
+        }
+
+        void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+        {
+          if(huart->Instance == UART4) {
+            BT_Tune_ByteReceived();
+          }
+        }
+        ```
+
+   - `Core/Src/main.c`
+      - Modified several times over the conversation.
+      - Initially updated to include `bt_tune.h`, call `MX_UART4_Init()`, `BT_Tune_Init()`, and `BT_Tune_Process()`.
+      - Important additions for wireless tuning:
+        ```c
+        #include "bt_tune.h"
+        ...
+        MX_UART4_Init();
+        ...
+        BT_Tune_Init();
+        ...
+        BT_Tune_Process();
+        ```
+      - Later reverted various hardcoded PID values and targets depending on user tuning sessions.
+      - At the most recent state, hardcoded PID/target initialization was removed in favor of the segmented state machine in `pid.c`, leaving only explanatory comments and `BT_Tune_Init()`.
+      - Most recent replaced block:
+        ```c
+        /* 串级 PID 参数与目标点由 pid.c 内部的分段状态机统一装载：
+         *   1) 先从 0cm 运动到 +5.6cm；
+         *   2) 达到 +5.6cm ±0.5cm 后立刻切到 -5.5cm；
+         *   3) 最终在 -5.5cm ±0.5cm 处稳定保持。 */
+        BT_Tune_Init();
+        ```
+      - VOFA channel mapping remained:
+        ```c
+        vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);
+        vofa_data[1] = (int32_t)(Y * 100.0f);
+        vofa_data[2] = (int32_t)(ball_velocity * 100.0f);
+        vofa_data[3] = (int32_t)(pidY.out * 100.0f);
+        vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);
+        vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);
+        ```
+
+   - `CMakeLists.txt`
+      - Modified to include:
+        ```cmake
+        Core/Src/bt_tune.c
+        ```
+
+   - `Code_of_ZDT.ioc`
+      - Modified to synchronize CubeMX config with UART4:
+        - `Mcu.IP4=UART4`
+        - `PC10 -> UART4_TX`
+        - `PC11 -> UART4_RX`
+        - `NVIC.UART4_IRQn=true...`
+        - function list updated to include `MX_UART4_Init`
+      - Important because it prevents future CubeMX re-generation from discarding UART4 setup.
+
+   - `Core/Inc/Emm_V5.h` and `Core/Src/Emm_V5.c`
+      - Read to confirm homing function exists.
+      - Important confirmed API:
+        ```c
+        void Emm_V5_Origin_Trigger_Return(uint8_t addr, uint8_t o_mode, bool snF);
+        ```
+
+   - `Core/Inc/pid.h`
+      - Modified multiple times.
+      - Important additions/changes:
+        - Single-loop bypass switch:
+          ```c
+          #define POSITION_LOOP_DIRECT_DRIVE    0
+          ```
+          Was temporarily set to `1` during position-only tuning, later restored to `0`.
+        - Positive angle limit increased:
+          ```c
+          #define ANGLE_LIMIT_MAX   12.0f
+          ```
+        - Hold-zone thresholds changed to:
+          ```c
+          #define TARGET_HOLD_POSITION_ENTER  0.50f
+          #define TARGET_HOLD_POSITION_EXIT   0.60f
+          ```
+        - Comments updated to explain 0.5 cm hold intent.
+        - PID variable comments updated:
+          ```c
+          extern pid_t pidY;        /* 单环直驱时：位置 -> 平台倾角；串级时：位置 -> 小球目标速度 */
+          extern pid_t pidY_Speed;  /* 串级模式下：小球速度 -> 平台倾角 */
+          ```
+
+   - `Core/Src/pid.c`
+      - This was the main control logic file, modified heavily.
+      - Existing important patterns before changes:
+        - `motor_set_angle(float target_deg)` converts degrees to pulses and sends `Emm_V5_Pos_Control`.
+        - Cascaded loop:
+          - `pidY`: position -> target speed
+          - `pidY_Speed`: speed -> angle
+        - Breakaway logic for static friction.
+        - Hold logic originally only zeroed outer loop output.
+      - Single-loop direct-drive mode added temporarily under:
+        ```c
+        #if POSITION_LOOP_DIRECT_DRIVE
+        ...
+        #else
+        ...
+        #endif
+        ```
+      - Later restored to cascade mode.
+      - Hold logic changed several times:
+        1. Thresholds moved to 0.5 / 0.6
+        2. Briefly changed to “all PID stop + motor_set_angle(0) + return”
+        3. Then reverted to more stable approach: only outer loop stopped, inner loop still zero-speed hold
+      - Most recent major addition: segmented PID state machine.
+        Added at top:
+        ```c
+        typedef enum {
+        	PID_SEGMENT_TO_POS_56 = 0,
+        	PID_SEGMENT_TO_NEG_55,
+        	PID_SEGMENT_HOLD_NEG_55,
+        } pid_segment_t;
+
+        static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+        static bool g_pid_segment_initialized = false;
+
+        static float pid_absf(float value)
+        {
+        	return (value >= 0.0f) ? value : -value;
+        }
+
+        static void pid_apply_segment_profile(float target_y,
+        	                                  float pos_p, float pos_i, float pos_d,
+        	                                  float spd_p, float spd_i, float spd_d)
+        {
+        	pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+        	pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+        	ball_target_set(target_y);
+        }
+        ```
+      - Most recent control-entry initialization:
+        ```c
+        if(!g_pid_segment_initialized) {
+        	pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+        	g_pid_segment = PID_SEGMENT_TO_POS_56;
+        	g_pid_segment_initialized = true;
+        }
+        ```
+      - Segment switch logic:
+        ```c
+        if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+        	if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+        		pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+        		g_pid_segment = PID_SEGMENT_TO_NEG_55;
+        		control_initialized = false;
+        		target_hold_active = false;
+        #if !POSITION_LOOP_DIRECT_DRIVE
+        		stuck_ticks = 0u;
+        		breakaway_ramp_ticks = 0u;
+        		breakaway_active = false;
+        		breakaway_angle = 0.0f;
+        #endif
+        	}
+        } else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+        	if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+        		g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+        		control_initialized = false;
+        		target_hold_active = false;
+        #if !POSITION_LOOP_DIRECT_DRIVE
+        		stuck_ticks = 0u;
+        		breakaway_ramp_ticks = 0u;
+        		breakaway_active = false;
+        		breakaway_angle = 0.0f;
+        #endif
+        	}
+        }
+        ```
+      - Final hold only for last segment:
+        ```c
+        if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+        	if(target_hold_active) {
+        		if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+        			target_hold_active = false;
+        		}
+        	} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+        		target_hold_active = true;
+        	}
+        } else {
+        	target_hold_active = false;
+        }
+        ```
+      - Stable hold behavior restored:
+        ```c
+        if(target_hold_active) {
+        #if !POSITION_LOOP_DIRECT_DRIVE
+        	stuck_ticks = 0u;
+        	breakaway_ramp_ticks = 0u;
+        	breakaway_active = false;
+        	breakaway_angle = 0.0f;
+        #endif
+        }
+        ...
+        if(target_hold_active) {
+        	pidY.out = 0.0f;
+        }
+        ```
+      - This means:
+        - First segment does not stop at +5.6; it immediately switches to the second PID set.
+        - Final hold at -5.5 only stops the outer loop; inner loop still zero-speed holds.
+
+4. Errors and fixes:
+   - Error: attempted to use `apply_patch` through Bash.
+     - Output: `/usr/bin/bash: line 14: apply_patch: command not found`
+     - Fix: switched to `Edit` tool for exact replacements.
+   - Warning after enabling `POSITION_LOOP_DIRECT_DRIVE=1`:
+     - `breakaway_active`, `breakaway_ramp_ticks`, `stuck_ticks`, `breakaway_angle`, `breakaway_start_error` unused.
+     - Fix: wrapped those statics in `#if !POSITION_LOOP_DIRECT_DRIVE`.
+   - Build failure after wrapping breakaway statics:
+     - `stuck_ticks`, `breakaway_ramp_ticks`, `breakaway_active`, `breakaway_angle` undeclared in target-change and hold-reset sections.
+     - Fix: wrapped those reset references with `#if !POSITION_LOOP_DIRECT_DRIVE` too.
+   - Warning after changing hold-entry logic to position-only:
+     - `abs_estimated_velocity` unused.
+     - Fix: removed `abs_estimated_velocity`.
+   - Behavioral issue introduced by “all PID stop in hold range”:
+     - Direct `motor_set_angle(0.0f); return;` caused VOFA `ch0` to jump between `0` and `~500`, because control fully cut off while ball still moved and angle-slew/internal state became inconsistent.
+     - Fix: after analysis and user selection, reverted to “stop outer loop only, keep inner zero-speed hold”.
+   - Potential double initialization conflict:
+     - `main.c` still had hardcoded PID init/target while new segmented state machine also initialized in `pid.c`.
+     - Fix: removed hardcoded `pid_init(...)` and `ball_target_set(...)` from `main.c`, leaving initialization to `pid.c`.
+
+5. Problem Solving:
+   - Solved wireless tuning hardware/software integration using UART4 on PC10/PC11.
+   - Solved runtime wireless PID tuning with packet parser and readback.
+   - Solved wireless motor homing command via `GET_0`.
+   - Diagnosed VOFA logs:
+     - distinguished between working-limit saturation and ultimate mechanical limits
+     - explained why `10°` configured limit does not imply constant `10°` output
+     - explained that `ch4` is the real speed-loop output and `ch0` can lag due to slew limiting
+   - Implemented temporary single-loop position tuning mode to tune outer position loop separately.
+   - Restored cascade mode with tuned position-loop defaults.
+   - Increased positive angle limit from 10° to 12°.
+   - Changed hold-zone thresholds to 0.5/0.6 per user request.
+   - Analyzed and fixed “PID still moves in hold zone” misunderstanding by differentiating:
+     - outer-loop stopped vs all-loop stopped
+   - Analyzed motor 0↔500 jumps:
+     - caused by all-stop hold logic, not merely PID gains
+   - Restored stable hold approach: outer loop stops, inner loop continues zero-speed hold.
+   - Implemented rigorous segmented state machine with:
+     - phase 1: 0 -> +5.6 using first PID set
+     - automatic one-time switch to phase 2
+     - phase 2: +5.6 -> -5.5 using second PID set
+     - final hold only at -5.5 with 0.5 cm entry threshold
+   - Ensured state transitions reset PID state and breakaway state to avoid contamination between phases.
+
+6. All user messages:
+   - “#include "bt_tune.h" ... 加入无线调参，使用串口PC10、PC11”
+   - “增加电机归零指令“GET_0“电机归零到归零点”
+   - VOFA log dump ending with: “这是电机到限幅了吗？”
+   - VOFA log dump plus selected `pid.h` lines: “现在限幅不是 ... 十度吗？怎么是再517？”
+   - “现在我要调这个串级pid的参数，先调位置环，你把位置环的输出先给我加载到电机，我先单调位置环”
+   - “现在我调好了位置环的P时0.68，D项和I项都没有，现在改回串级，我调速度环的pid”
+   - “上升角度限幅加大两度”
+   - “现在无线调参，电机归零写了吗？”
+   - “误差范围在0.5左右，PID还会调节吗？”
+   - “误差在0.5cm时停止PID调节”
+   - “[Request interrupted by user] 误差在0.5cm时停止PID调节”
+   - Very long VOFA dump ending with: “为啥在在误差范围内，PID还在调节？”
+   - “那在误差范围内 所有的PID 都停止”
+   - Very long VOFA dump ending with: “这里0到500的电机跳变值是怎么回事？”
+   - “那应该怎么解决这个电机跳变问题？你分析一下，先别改代码”
+   - “那你用这个吧 最稳的方案 不要‘所有 PID 全停’ 保持区里只停位置环，速度环继续做‘目标速度 = 0’的保持”
+   - “现在要求小球能从0位置点，往5.6cm处移动，小球一旦到达5.6cm处小球立刻往-5.5位置处移动，然后稳定在-5.5cm处。但是这两段位置移动使用分段PID控制，从0cm处到5.6cm处，PID控制参数为
+       pid_init(&pidY, POSITION_PID, 1.735f, 0.0f, 0.00f, 0.0f);
+       pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);//  pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+       ball_target_set(5.6f);
+       从5.6cm到-5.5并且稳定在-5.5cm处的PID参数为
+       pid_init(&pidY, POSITION_PID, 0.8f, 0.0f, 0.00f, 0.0f);
+       pid_init(&pidY_Speed, POSITION_PID, 1.05f, 0.01f, 0.0f, 0.0f);// 从0到5 pid_init(&pidY_Speed, POSITION_PID, 0.99f, 0.01f, 0.0f, 0.0f);
+       ball_target_set(-5.5f);  // 初始目标位置（cm），负=左，正=右
+       位置最大误差为0.5cm
+       你明白我意思吗？说一下你想怎么控制这一段”
+   - “很好，那你现在开始写代码吧，要求逻辑严谨”
+
+7. Pending Tasks:
+   - No explicit pending task remains beyond presenting the result of the latest implementation.
+   - The latest requested coding task (segmented PID state machine) was implemented and built successfully, but the final user-facing explanation was interrupted by the summary request.
+   - Possible follow-up work not yet requested explicitly:
+     - runtime verification with new VOFA logs
+     - optional telemetry of segment state / hold state if needed
+
+8. Current Work:
+   - Immediately before the summary request, the assistant had just:
+     1. Implemented a rigorous segmented PID state machine in `Core/Src/pid.c`
+     2. Removed conflicting hardcoded PID initialization from `Core/Src/main.c`
+     3. Successfully built the firmware
+     4. Begun preparing a concise explanation to the user
+   - Exact state-machine behavior implemented:
+     - On first call to `pid_control__26Y()`:
+       ```c
+       pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+       g_pid_segment = PID_SEGMENT_TO_POS_56;
+       g_pid_segment_initialized = true;
+       ```
+     - While in `PID_SEGMENT_TO_POS_56`, if `|Y - 5.6| <= 0.5`, then:
+       ```c
+       pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+       g_pid_segment = PID_SEGMENT_TO_NEG_55;
+       control_initialized = false;
+       target_hold_active = false;
+       ```
+     - While in `PID_SEGMENT_TO_NEG_55`, if `|Y + 5.5| <= 0.5`, then:
+       ```c
+       g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+       control_initialized = false;
+       target_hold_active = false;
+       ```
+     - Only in `PID_SEGMENT_HOLD_NEG_55` is the final hold logic enabled.
+     - Final hold logic uses the stable approach previously chosen by the user:
+       - outer loop output set to zero
+       - speed loop continues zero-speed hold
+       - no direct `motor_set_angle(0.0f)` cut-off
+   - `main.c` no longer hardcodes:
+     ```c
+     pid_init(&pidY, ...);
+     pid_init(&pidY_Speed, ...);
+     ball_target_set(...);
+     ```
+     because `pid.c` now owns the segmented sequence.
+   - Build result immediately before summary request:
+     - `cmake --build build/Debug` succeeded
+     - Final reported memory:
+       - `RAM: 3504 B`
+       - `FLASH: 38328 B`
+
+9. Optional Next Step:
+   - Directly in line with the most recent work, the next step would be to report the implementation details and ask the user to test with VOFA logs for the new segmented sequence behavior.
+   - The exact most recent task context:
+     - User: “很好，那你现在开始写代码吧，要求逻辑严谨”
+     - Assistant action completed: implemented segmented state machine, compiled successfully, and was about to explain it.
+   - The precise next step would be:
+     - explain that segmented PID is now implemented in `pid.c`
+     - explain the three states and switching conditions
+     - ask for a fresh VOFA trace from:
+       1) startup 0 -> +5.6
+       2) automatic switch +5.6 -> -5.5
+       3) final hold at -5.5 within ±0.5 cm
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\bai-kink\.claude\projects\d--File-2026diansaiH-Code-of-ZDT\069a0196-6fe2-4d6d-8ec2-b1d12f4294bb.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:04Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning to verify code sections in pid.c**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:06Z)**_
+
+我先把 `pid.c` 里第二段参数装载的位置对齐出来，直接告诉你该改哪几行。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:06Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+60	}
+61	
+62	pid_t pidY;
+63	pid_t pidY_Speed;
+64	float pidY_velocity_damping;
+65	float pidY_filtered_velocity = 0.0f;  /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+66	
+67	typedef enum {
+68		PID_SEGMENT_TO_POS_56 = 0,
+69		PID_SEGMENT_TO_NEG_55,
+70		PID_SEGMENT_HOLD_NEG_55,
+71	} pid_segment_t;
+72	
+73	static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+74	static bool g_pid_segment_initialized = false;
+75	
+76	static float pid_absf(float value)
+77	{
+78		return (value >= 0.0f) ? value : -value;
+79	}
+80	
+81	static void pid_apply_segment_profile(float target_y,
+82		                                  float pos_p, float pos_i, float pos_d,
+83		                                  float spd_p, float spd_i, float spd_d)
+84	{
+85		pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+86		pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+87		ball_target_set(target_y);
+88	}
+89	
+90	void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
+91	{
+92		pid->pid_mode = mode;
+93		pid->p = p;
+94		pid->i = i;
+95		pid->d = d;
+96		pid->f = f;
+97		pid->target = 0;
+98		pid->now = 0;
+99		pid->out = 0;
+100		pid->iout = 0;
+101		pid->error[0] = pid->error[1] = pid->error[2] = 0;
+102		pid->target_last = 0;
+103	}
+104	
+105	/*void motor_target_set(int spe1, int spe2)
+106	{
+107		if(spe1 >= 0)
+108		{
+109			motorA_dir = 1;
+110			motorA.target = spe1;
+111		}
+112		else
+113		{
+114			motorA_dir = 0;
+115			motorA.target = -spe1;
+116		}
+117		
+118		if(spe2 >= 0)
+119		{
+120			motorB_dir = 1;
+121			motorB.target = spe2;
+122		}
+123		else
+124		{
+125			motorB_dir = 0;
+126			motorB.target = -spe2;
+127		}
+128	}
+129	
+130	void motor_target_set_CD(int spe1, int spe2)
+131	{
+132		if(spe1 >= 0)
+133		{
+134			motorC_dir = 1;
+135			motorC.target = spe1;
+136		}
+137		else
+138		{
+139			motorC_dir = 0;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:06Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+760		static bool breakaway_active = false;
+761	#endif
+762		static bool control_initialized = false;
+763		static bool target_hold_active = false;
+764	
+765		if(!g_pid_segment_initialized) {
+766			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+767			g_pid_segment = PID_SEGMENT_TO_POS_56;
+768			g_pid_segment_initialized = true;
+769		}
+770	
+771		Y = ball_error;  // 视觉小球绝对位置
+772	
+773		/* 分段状态机：
+774		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+775		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+776		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+777		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+778			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+779				pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+780				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+781				control_initialized = false;
+782				target_hold_active = false;
+783	#if !POSITION_LOOP_DIRECT_DRIVE
+784				stuck_ticks = 0u;
+785				breakaway_ramp_ticks = 0u;
+786				breakaway_active = false;
+787				breakaway_angle = 0.0f;
+788	#endif
+789			}
+790		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+791			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+792				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+793				control_initialized = false;
+794				target_hold_active = false;
+795	#if !POSITION_LOOP_DIRECT_DRIVE
+796				stuck_ticks = 0u;
+797				breakaway_ramp_ticks = 0u;
+798				breakaway_active = false;
+799				breakaway_angle = 0.0f;
+800	#endif
+801			}
+802		}
+803	
+804		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+805		float target_y = ball_target_get();
+806		float relative_y = Y - target_y;
+807		bool target_changed = !control_initialized || target_y != target_y_last;
+808	
+809		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+810		if(target_changed) {
+811	#if !POSITION_LOOP_DIRECT_DRIVE
+812			stuck_ticks = 0u;
+813			breakaway_ramp_ticks = 0u;
+814			breakaway_active = false;
+815			breakaway_angle = 0.0f;
+816	#endif
+817			target_hold_active = false;
+818			relative_y_last = relative_y;
+819			target_y_last = target_y;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:18Z)**_
+
+调 `+5.6 -> -5.5cm` 这一段，就改 [Core/Src/pid.c:779](Core/Src/pid.c#L779) 这一行里的第二组参数。
+
+你现在第二段用的是：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+```
+
+这 7 个参数含义是：
+
+```c
+pid_apply_segment_profile(
+    -5.5f,   // 目标位置 target_y
+    0.8f,    // 位置环 P
+    0.0f,    // 位置环 I
+    0.0f,    // 位置环 D
+    1.05f,   // 速度环 P
+    0.01f,   // 速度环 I
+    0.0f     // 速度环 D
+);
+```
+
+也就是说：
+
+- 想调 **5.6 到 -5.5 这一段的位置环**，改 `0.8f, 0.0f, 0.0f`
+- 想调 **5.6 到 -5.5 这一段的速度环**，改 `1.05f, 0.01f, 0.0f`
+
+第一段 `0 -> +5.6cm` 的参数在 [Core/Src/pid.c:766](Core/Src/pid.c#L766)：
+
+```c
+pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+```
+
+补一句，**无线调参现在调的是全局 `pidY / pidY_Speed` 当前值**，但你这个分段逻辑一旦切段，会再次 `pid_init()`，所以：
+
+- 你在跑第二段时用蓝牙改参数，当前段会生效
+- 但下次重新上电运行，还是会回到 [pid.c:779](Core/Src/pid.c#L779) 这里写死的第二组默认值
+
+所以你要把第二段参数“定下来”，最终还是改这行最稳。
+
+---
+
+_**User (2026-08-02 22:23:45Z)**_
+
+[06:22:15.993] -179,-496,0,0,-172,122
+[06:22:16.003] -168,-496,501,0,-141,92
+[06:22:16.013] -168,-496,501,0,-141,92
+[06:22:16.023] -258,-487,0,-49,-282,174
+[06:22:16.033] -258,-487,0,-49,-282,174
+[06:22:16.044] -281,-487,0,-49,-238,130
+[06:22:16.053] -281,-487,0,-49,-238,130
+[06:22:16.063] -236,-487,0,-49,-205,97
+[06:22:16.073] -236,-487,0,-49,-205,97
+[06:22:16.083] -213,-487,0,-49,-181,73
+[06:22:16.093] -213,-487,0,-49,-181,73
+[06:22:16.104] -191,-487,0,-49,-162,55
+[06:22:16.113] -191,-487,0,-49,-162,55
+[06:22:16.124] -168,-487,503,-49,-149,41
+[06:22:16.133] -168,-487,503,-49,-149,41
+[06:22:16.143] -269,-479,0,-56,-257,135
+[06:22:16.153] -269,-479,0,-56,-257,135
+[06:22:16.163] -258,-479,0,-56,-223,101
+[06:22:16.173] -258,-479,0,-56,-223,101
+[06:22:16.183] -236,-479,0,-56,-198,76
+[06:22:16.193] -236,-479,0,-56,-198,76
+[06:22:16.204] -213,-479,0,-56,-179,57
+[06:22:16.213] -213,-479,0,-56,-179,57
+[06:22:16.224] -191,-479,501,-56,-165,43
+[06:22:16.234] -191,-479,501,-56,-165,43
+[06:22:16.244] -292,-470,0,-63,-273,137
+[06:22:16.254] -292,-470,0,-63,-273,137
+[06:22:16.264] -281,-470,0,-63,-238,102
+[06:22:16.274] -281,-470,0,-63,-238,102
+[06:22:16.282] -247,-470,0,-63,-213,77
+[06:22:16.293] -247,-470,0,-63,-213,77
+[06:22:16.304] -224,-470,0,-63,-194,57
+[06:22:16.313] -224,-470,502,-63,-194,57
+[06:22:16.323] -326,-462,0,-70,-298,148
+[06:22:16.334] -326,-462,0,-70,-298,148
+[06:22:16.343] -303,-462,0,-70,-261,111
+[06:22:16.354] -303,-462,0,-70,-261,111
+[06:22:16.364] -404,-454,501,-76,-352,188
+[06:22:16.373] -404,-454,501,-76,-352,188
+[06:22:16.383] -359,-454,0,-76,-304,141
+[06:22:16.394] -359,-454,0,-76,-304,141
+[06:22:16.403] -314,-454,0,-76,-269,106
+[06:22:16.414] -314,-454,-649,-76,-269,106
+[06:22:16.423] -213,-462,-649,-70,-124,-25
+[06:22:16.433] -213,-462,0,-70,-124,-25
+[06:22:16.443] -157,-462,0,-70,-131,-19
+[06:22:16.454] -157,-462,0,-70,-131,-19
+[06:22:16.464] -247,-454,493,-76,-255,90
+[06:22:16.473] -247,-454,493,-76,-255,90
+[06:22:16.483] -269,-454,0,-76,-233,68
+[06:22:16.494] -269,-454,0,-76,-233,68
+[06:22:16.503] -258,-454,0,-76,-217,51
+[06:22:16.513] -258,-454,0,-76,-217,51
+[06:22:16.523] -236,-454,0,-76,-204,38
+[06:22:16.533] -236,-454,0,-76,-204,38
+[06:22:16.544] -224,-454,-496,-76,-195,28
+[06:22:16.554] -224,-454,-496,-76,-195,28
+[06:22:16.563] -134,-462,0,-70,-70,-83
+[06:22:16.573] -134,-462,0,-70,-70,-83
+[06:22:16.583] -101,-462,0,-70,-92,-62
+[06:22:16.593] -101,-462,0,-70,-92,-62
+[06:22:16.603] -123,-462,0,-70,-109,-46
+[06:22:16.613] -123,-462,0,-70,-109,-46
+[06:22:16.624] -146,-462,0,-70,-122,-35
+[06:22:16.634] -146,-462,0,-70,-122,-35
+[06:22:16.643] -157,-462,0,-70,-131,-26
+[06:22:16.654] -157,-462,0,-70,-131,-26
+[06:22:16.663] -157,-462,0,-70,-139,-19
+[06:22:16.673] -157,-462,0,-70,-139,-19
+[06:22:16.683] -56,-470,-457,-63,-26,-119
+[06:22:16.694] -56,-470,0,-63,-26,-119
+[06:22:16.703] -67,-470,0,-63,-57,-89
+[06:22:16.713] -67,-470,0,-63,-57,-89
+[06:22:16.723] -89,-470,0,-63,-81,-67
+[06:22:16.734] -89,-470,0,-63,-81,-67
+[06:22:16.744] -112,-470,0,-63,-99,-50
+[06:22:16.754] -112,-470,0,-63,-99,-50
+[06:22:16.763] -11,-479,-509,-56,5,-142
+[06:22:16.773] -11,-479,-509,-56,5,-142
+[06:22:16.784] -33,-479,0,-56,-31,-107
+[06:22:16.794] -33,-479,0,-56,-31,-107
+[06:22:16.803] -67,-479,0,-56,-59,-80
+[06:22:16.813] -67,-479,0,-56,-59,-80
+[06:22:16.823] -89,-479,0,-56,-80,-60
+[06:22:16.833] -89,-479,0,-56,-80,-60
+[06:22:16.844] -112,-479,-507,-56,-96,-45
+[06:22:16.854] -112,-479,-507,-56,-96,-45
+[06:22:16.863] -11,-487,0,-49,10,-138
+[06:22:16.873] -11,-487,0,-49,10,-138
+[06:22:16.883] -22,-487,0,-49,-25,-104
+[06:22:16.893] -22,-487,0,-49,-25,-104
+[06:22:16.903] -56,-487,0,-49,-52,-78
+[06:22:16.913] -56,-487,0,-49,-52,-78
+[06:22:16.923] -78,-487,0,-49,-73,-58
+[06:22:16.933] -78,-487,0,-49,-73,-58
+[06:22:16.944] -101,-487,0,-49,-88,-43
+[06:22:16.953] -101,-487,0,-49,-88,-43
+[06:22:16.963] -112,-487,0,-49,-100,-32
+[06:22:16.973] -112,-487,0,-49,-100,-32
+[06:22:16.983] -11,-496,-466,-43,9,-129
+[06:22:16.993] -11,-496,0,-43,9,-129
+[06:22:17.003] -22,-496,0,-43,-24,-97
+[06:22:17.013] -22,-496,0,-43,-24,-97
+[06:22:17.023] -56,-496,0,-43,-49,-72
+[06:22:17.034] -56,-496,0,-43,-49,-72
+[06:22:17.043] -78,-496,0,-43,-68,-54
+[06:22:17.053] -78,-496,0,-43,-68,-54
+[06:22:17.064] -89,-496,520,-43,-83,-41
+[06:22:17.074] -89,-496,520,-43,-83,-41
+[06:22:17.084] -191,-487,0,-49,-212,74
+[06:22:17.093] -191,-487,0,-49,-212,74
+[06:22:17.103] -224,-487,0,-49,-194,55
+[06:22:17.113] -224,-487,0,-49,-194,55
+[06:22:17.123] -213,-487,0,-49,-180,41
+[06:22:17.133] -213,-487,0,-49,-180,41
+[06:22:17.144] -202,-487,0,-49,-170,31
+[06:22:17.154] -202,-487,0,-49,-170,31
+[06:22:17.164] -191,-487,0,-49,-162,23
+[06:22:17.173] -191,-487,0,-49,-162,23
+[06:22:17.184] -179,-487,0,-49,-157,17
+[06:22:17.193] -179,-487,0,-49,-157,17
+[06:22:17.203] -179,-487,0,-49,-153,13
+[06:22:17.213] -179,-487,0,-49,-153,13
+[06:22:17.223] -179,-487,0,-49,-150,9
+[06:22:17.233] -179,-487,0,-49,-150,9
+[06:22:17.243] -168,-487,0,-49,-148,7
+[06:22:17.253] -168,-487,0,-49,-148,7
+[06:22:17.263] -168,-487,0,-49,-146,5
+[06:22:17.273] -168,-487,0,-49,-146,5
+[06:22:17.283] -269,-487,0,-49,-145,4
+[06:22:17.293] -269,-487,0,-49,-145,4
+[06:22:17.303] -359,-487,0,-49,-144,3
+[06:22:17.314] -359,-487,0,-49,-144,3
+[06:22:17.323] -359,-487,0,-49,-143,2
+[06:22:17.333] -359,-487,0,-49,-143,2
+[06:22:17.343] -359,-487,0,-49,-142,1
+[06:22:17.354] -359,-487,0,-49,-142,1
+[06:22:17.363] -359,-487,0,-49,-142,1
+[06:22:17.373] -359,-487,0,-49,-142,1
+[06:22:17.384] -359,-487,0,-49,-142,0
+[06:22:17.394] -359,-487,0,-49,-142,0
+[06:22:17.403] -359,-487,0,-49,-141,0
+[06:22:17.414] -359,-487,0,-49,-141,0
+[06:22:17.423] -359,-487,0,-49,-141,0
+[06:22:17.433] -359,-487,0,-49,-141,0
+[06:22:17.444] -359,-487,0,-49,-141,0
+[06:22:17.453] -359,-487,0,-49,-141,0
+[06:22:17.463] -416,-487,0,-49,-141,0
+[06:22:17.473] -416,-487,0,-49,-141,0
+[06:22:17.483] -416,-487,0,-49,-141,0
+[06:22:17.494] -416,-487,0,-49,-141,0
+[06:22:17.504] -416,-487,0,-49,-141,0
+[06:22:17.513] -416,-487,0,-49,-141,0
+[06:22:17.523] -416,-487,0,-49,-141,0
+[06:22:17.533] -416,-487,0,-49,-141,0
+[06:22:17.543] -416,-487,0,-49,-141,0
+[06:22:17.553] -416,-487,0,-49,-141,0
+[06:22:17.563] -416,-487,0,-49,-141,0
+[06:22:17.573] -416,-487,0,-49,-141,0
+[06:22:17.583] -416,-487,0,-49,-141,0
+[06:22:17.594] -416,-487,0,-49,-141,0
+[06:22:17.603] -416,-487,0,-49,-141,0
+[06:22:17.613] -416,-487,0,-49,-141,0
+[06:22:17.623] -416,-487,0,-49,-141,0
+[06:22:17.633] -416,-487,0,-49,-141,0
+[06:22:17.644] -472,-487,0,-49,-141,0
+[06:22:17.653] -472,-487,0,-49,-141,0
+[06:22:17.663] -472,-487,0,-49,-141,0
+[06:22:17.673] -472,-487,0,-49,-141,0
+[06:22:17.683] -472,-487,0,-49,-141,0
+[06:22:17.693] -472,-487,0,-49,-141,0
+[06:22:17.703] -472,-487,0,-49,-141,0
+[06:22:17.713] -472,-487,0,-49,-141,0
+[06:22:17.723] -472,-487,0,-49,-141,0
+[06:22:17.734] -472,-487,0,-49,-141,0
+[06:22:17.744] -472,-487,0,-49,-141,0
+[06:22:17.753] -472,-487,0,-49,-141,0
+[06:22:17.763] -472,-487,0,-49,-141,0
+[06:22:17.774] -472,-487,0,-49,-141,0
+[06:22:17.784] -472,-487,0,-49,-141,0
+[06:22:17.793] -472,-487,0,-49,-141,0
+[06:22:17.803] -472,-487,0,-49,-141,0
+[06:22:17.813] -472,-487,0,-49,-141,0
+[06:22:17.823] -539,-487,0,-49,-141,0
+[06:22:17.834] -539,-487,0,-49,-141,0
+[06:22:17.844] -539,-487,0,-49,-141,0
+[06:22:17.853] -539,-487,0,-49,-141,0
+[06:22:17.863] -539,-487,0,-49,-141,0
+[06:22:17.873] -539,-487,0,-49,-141,0
+[06:22:17.884] -539,-487,0,-49,-141,0
+[06:22:17.894] -539,-487,0,-49,-141,0
+[06:22:17.903] -539,-487,0,-49,-141,0
+[06:22:17.913] -539,-487,0,-49,-141,0
+[06:22:17.923] -539,-487,0,-49,-141,0
+[06:22:17.933] -539,-487,0,-49,-141,0
+[06:22:17.944] -539,-487,0,-49,-141,0
+[06:22:17.953] -539,-487,0,-49,-141,0
+[06:22:17.963] -539,-487,0,-49,-141,0
+[06:22:17.973] -539,-487,0,-49,-141,0
+[06:22:17.983] -539,-487,0,-49,-141,0
+[06:22:17.994] -539,-487,0,-49,-141,0
+[06:22:18.003] -596,-487,0,-49,-141,0
+[06:22:18.013] -596,-487,0,-49,-141,0
+[06:22:18.024] -596,-487,0,-49,-141,0
+[06:22:18.034] -596,-487,0,-49,-141,0
+[06:22:18.043] -596,-487,0,-49,-141,0
+[06:22:18.053] -596,-487,0,-49,-141,0
+[06:22:18.064] -596,-487,0,-49,-141,0
+[06:22:18.073] -596,-487,0,-49,-141,0
+[06:22:18.083] -596,-487,0,-49,-141,0
+[06:22:18.093] -596,-487,0,-49,-141,0
+[06:22:18.103] -596,-487,0,-49,-141,0
+[06:22:18.114] -596,-487,0,-49,-141,0
+[06:22:18.123] -596,-487,0,-49,-141,0
+[06:22:18.133] -596,-487,0,-49,-141,0
+[06:22:18.143] -596,-487,0,-49,-141,0
+[06:22:18.154] -596,-487,0,-49,-141,0
+[06:22:18.164] -596,-487,0,-49,-141,0
+[06:22:18.173] -596,-487,0,-49,-141,0
+[06:22:18.183] -596,-487,0,-49,-141,0
+[06:22:18.194] -596,-487,0,-49,-141,0
+[06:22:18.204] -596,-487,0,-49,-141,0
+[06:22:18.213] -596,-487,0,-49,-141,0
+[06:22:18.223] -596,-487,0,-49,-141,0
+[06:22:18.233] -596,-487,0,-49,-141,0
+[06:22:18.243] -596,-487,0,-49,-141,0
+[06:22:18.253] -596,-487,0,-49,-141,0
+[06:22:18.263] -596,-487,0,-49,-141,0
+[06:22:18.273] -596,-487,-503,-49,-141,0
+[06:22:18.284] -494,-496,-503,-43,-23,-105
+[06:22:18.294] -494,-496,0,-43,-23,-105
+[06:22:18.303] -393,-496,0,-43,-50,-78
+[06:22:18.313] -393,-496,0,-43,-50,-78
+[06:22:18.323] -292,-496,0,-43,-70,-59
+[06:22:18.333] -292,-496,0,-43,-70,-59
+[06:22:18.344] -191,-504,-511,0,70,-149
+[06:22:18.353] -191,-504,0,0,70,-149
+[06:22:18.363] -89,-504,0,0,32,-111
+[06:22:18.373] -89,-504,0,0,32,-111
+[06:22:18.383] 0,-504,0,0,4,-83
+[06:22:18.393] 0,-504,-500,0,4,-83
+[06:22:18.403] 89,-512,0,0,93,-167
+[06:22:18.413] 89,-512,0,0,93,-167
+[06:22:18.424] 157,-521,-498,0,162,-230
+[06:22:18.433] 157,-521,-498,0,162,-230
+[06:22:18.443] 101,-521,0,0,103,-173
+[06:22:18.453] 101,-521,-511,0,103,-173
+[06:22:18.464] 168,-529,-511,0,170,-234
+[06:22:18.474] 168,-529,-493,0,170,-234
+[06:22:18.483] 213,-538,-493,0,222,-281
+[06:22:18.493] 213,-538,0,0,222,-281
+[06:22:18.503] 146,-538,-509,0,150,-210
+[06:22:18.514] 146,-538,-509,0,150,-210
+[06:22:18.523] 202,-546,0,0,207,-263
+[06:22:18.533] 202,-546,0,0,207,-263
+[06:22:18.544] 247,-554,-491,0,252,-302
+[06:22:18.553] 247,-554,0,0,252,-302
+[06:22:18.563] 168,-554,0,0,174,-226
+[06:22:18.573] 168,-554,0,0,174,-226
+[06:22:18.583] 112,-554,0,0,117,-170
+[06:22:18.593] 112,-554,0,0,117,-170
+[06:22:18.603] 67,-554,0,0,73,-127
+[06:22:18.613] 67,-554,0,0,73,-127
+[06:22:18.624] 146,-563,-493,0,152,-200
+[06:22:18.633] 146,-563,-493,0,152,-200
+[06:22:18.643] 101,-563,0,0,101,-150
+[06:22:18.653] 101,-563,0,0,101,-150
+[06:22:18.663] 56,-563,0,0,62,-112
+[06:22:18.673] 56,-563,0,0,62,-112
+[06:22:18.683] 33,-563,0,0,34,-84
+[06:22:18.693] 33,-563,0,0,34,-84
+[06:22:18.702] 11,-563,0,0,12,-63
+[06:22:18.713] 11,-563,0,0,12,-63
+[06:22:18.723] 0,-563,0,0,-3,-47
+[06:22:18.733] 0,-563,0,0,-3,-47
+[06:22:18.743] -11,-563,0,0,-15,-35
+[06:22:18.753] -11,-563,0,0,-15,-35
+[06:22:18.763] -22,-563,0,0,-24,-26
+[06:22:18.773] -22,-563,0,0,-24,-26
+[06:22:18.783] -33,-563,0,0,-31,-20
+[06:22:18.793] -33,-563,0,0,-31,-20
+[06:22:18.803] -33,-563,0,0,-36,-15
+[06:22:18.814] -33,-563,0,0,-36,-15
+[06:22:18.823] -44,-563,0,0,-40,-11
+[06:22:18.833] -44,-563,0,0,-40,-11
+[06:22:18.843] -44,-563,0,0,-43,-8
+[06:22:18.854] -44,-563,494,0,-43,-8
+[06:22:18.862] -146,-554,494,0,-157,98
+[06:22:18.873] -146,-554,494,0,-157,98
+[06:22:18.883] -157,-554,494,0,-131,73
+[06:22:18.893] -157,-554,0,0,-131,73
+[06:22:18.903] -134,-554,0,0,-112,55
+[06:22:18.914] -134,-554,0,0,-112,55
+[06:22:18.923] -112,-554,0,0,-98,41
+[06:22:18.932] -112,-554,0,0,-98,41
+[06:22:18.943] -101,-554,0,0,-88,31
+[06:22:18.953] -101,-554,495,0,-88,31
+[06:22:18.964] -202,-546,495,0,-191,128
+[06:22:18.973] -202,-546,0,0,-191,128
+[06:22:18.983] -179,-546,0,0,-158,96
+[06:22:18.994] -179,-546,498,0,-158,96
+[06:22:19.003] -281,-538,0,0,-245,177
+[06:22:19.014] -281,-538,0,0,-245,177
+[06:22:19.023] -236,-538,0,0,-200,132
+[06:22:19.033] -236,-538,0,0,-200,132
+[06:22:19.043] -191,-538,0,0,-166,99
+[06:22:19.053] -191,-538,0,0,-166,99
+[06:22:19.063] -168,-538,0,0,-141,74
+[06:22:19.073] -168,-538,0,0,-141,74
+[06:22:19.083] -146,-538,0,0,-121,56
+[06:22:19.093] -146,-538,503,0,-121,56
+[06:22:19.104] -236,-529,503,0,-218,147
+
+为啥会在目标附近来回摆？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing motor and sensor log channels**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying motor angle command interpretations**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:58Z)**_
+
+我先把电机命令和保持区那段实现再对一下，确认你这组 VOFA 里每列对应的动态，避免只凭现象猜。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:59Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `motor_get_command_angle|motor_set_angle|target_hold_active|pidY\.out = 0\.0f|pidY_Speed`
+
+```text
+63:pid_t pidY_Speed;
+86:	pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+725:float motor_get_command_angle(void)
+730:void motor_set_angle(float target_deg)
+763:	static bool target_hold_active = false;
+782:			target_hold_active = false;
+794:			target_hold_active = false;
+817:		target_hold_active = false;
+836:		if(target_hold_active) {
+838:				target_hold_active = false;
+841:			target_hold_active = true;
+844:		target_hold_active = false;
+847:	if(target_hold_active) {
+870:	if(target_hold_active) {
+874:		pidY.out = 0.0f;
+894:	pidY_Speed.target = 0.0f;
+895:	pidY_Speed.now = pidY_filtered_velocity;
+896:	pidY_Speed.out = 0.0f;
+897:	pidY_Speed.pout = 0.0f;
+898:	pidY_Speed.iout = 0.0f;
+899:	pidY_Speed.dout = 0.0f;
+960:	pidY_Speed.target = pidY.out;
+961:	pidY_Speed.now = pidY_filtered_velocity;
+965:	float iout_frozen = pidY_Speed.iout;
+966:	pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+969:		pidY_Speed.iout = iout_frozen;
+970:		pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+971:		if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+972:			pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+973:		} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+974:			pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+978:	pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+1006:	motor_set_angle(cmd_angle);
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:23:59Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+620	//	
+621		Servo_SetAngleB_2(ServoB_Pid.now);
+622	//	
+623	//	
+624		redY_last = red_value[0];
+625	//	
+626	}
+627	*/
+628	
+629	
+630	void pid_cal(pid_t *pid)
+631	{
+632		// ���㵱ǰƫ��
+633		pid->error[0] = pid->target - pid->now;
+634	
+635		// �������
+636		if(pid->pid_mode == DELTA_PID)  // ����ʽ
+637		{
+638			pid->pout = pid->p * (pid->error[0] - pid->error[1]);
+639			pid->iout = pid->i * pid->error[0];
+640			pid->dout = pid->d * (pid->error[0] - 2 * pid->error[1] + pid->error[2]);
+641			pid->fout = pid->f * (pid->target - pid->target_last);
+642			pid->target_last = pid->target;
+643			pid->out += pid->pout + pid->iout + pid->dout + pid->fout;
+644		}
+645		else if(pid->pid_mode == POSITION_PID)  // λ��ʽ
+646		{
+647			pid->pout = pid->p * pid->error[0];
+648			pid->iout += pid->i * pid->error[0];
+649			pid->dout = pid->d * (pid->error[0] - pid->error[1]);
+650			pid->out = pid->pout + pid->iout + pid->dout;
+651		}
+652	
+653		// ��¼ǰ����ƫ��
+654		pid->error[2] = pid->error[1];
+655		pid->error[1] = pid->error[0];
+656	
+657	//	// ����޷�
+658	//	if(pid->out>=MAX_DUTY)	
+659	//		pid->out=MAX_DUTY;
+660	//	if(pid->out<=0)	
+661	//		pid->out=0;
+662		
+663	}
+664	
+665	void pidout_limit(pid_t *pid)
+666	{
+667		PIDOUT_CLAMP(pid, 0, MAX_DUTY);
+668	}
+669	
+670	/* 带条件积分与输出限幅的位置式 PID（串级环专用）
+671	 *
+672	 * 与 PIDOUT_CLAMP 的反算抗饱和相比，本函数从不把比例项的溢出量写进 iout：
+673	 *   1. 先试算积分增量，只有「输出未饱和」或「误差方向会让积分退出饱和」时才采纳；
+674	 *   2. iout 独立限幅到 ±i_limit（i_limit=0 即彻底禁用积分，等价纯 P/PD）；
+675	 *   3. 最后只截断 out，iout 保持干净。
+676	 *
+677	 * 这样比例项可以随意撞限幅，积分状态不会被污染，不存在 Ki=0 时留下永久偏置的问题。
+678	 */
+679	static void pid_cal_clamped(pid_t *pid, float lo, float hi, float i_limit)
+680	{
+681		pid->error[0] = pid->target - pid->now;
+682	
+683		pid->pout = pid->p * pid->error[0];
+684		pid->dout = pid->d * (pid->error[0] - pid->error[1]);
+685	
+686		/* 条件积分：先看不含新增量的输出是否已经饱和到同一侧。 */
+687		if(i_limit > 0.0f) {
+688			float out_wo_new_i = pid->pout + pid->iout + pid->dout;
+689			bool sat_hi = (out_wo_new_i >= hi) && (pid->error[0] > 0.0f);
+690			bool sat_lo = (out_wo_new_i <= lo) && (pid->error[0] < 0.0f);
+691			if(!sat_hi && !sat_lo) {
+692				pid->iout += pid->i * pid->error[0];
+693				if(pid->iout >  i_limit) pid->iout =  i_limit;
+694				if(pid->iout < -i_limit) pid->iout = -i_limit;
+695			}
+696		} else {
+697			pid->iout = 0.0f;  /* 显式禁用积分，杜绝历史残留偏置 */
+698		}
+699	
+700		pid->out = pid->pout + pid->iout + pid->dout;
+701	
+702		pid->error[2] = pid->error[1];
+703		pid->error[1] = pid->error[0];
+704	
+705		/* 只截断输出，不回写 iout。 */
+706		if(pid->out > hi) pid->out = hi;
+707		if(pid->out < lo) pid->out = lo;
+708	}
+709	
+710	void pidout_Servo_limit(pid_t *pid)
+711	{
+712		PIDOUT_CLAMP(pid, -40.0f, 40.0f);
+713	}
+714	
+715	
+716	
+717	
+718	
+719	/*
+720	void pidout_limit_Y(pid_t *pid)
+721	{
+722		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+723	}
+724	*/
+725	float motor_get_command_angle(void)
+726	{
+727		return (float)motor_command_pulses / PULSES_PER_DEG;
+728	}
+729	
+730	void motor_set_angle(float target_deg)
+731	{
+732		/* PID 输出是相对上电回零点的绝对目标倾角。 */
+733		if(target_deg > ANGLE_LIMIT_MAX) target_deg = ANGLE_LIMIT_MAX;
+734		if(target_deg < ANGLE_LIMIT_MIN) target_deg = ANGLE_LIMIT_MIN;
+735	
+736		/* 驱动器绝对位置模式：+θ 为零点上方，-θ 为零点下方。 */
+737		int32_t target_pulses = (int32_t)(target_deg * PULSES_PER_DEG);
+738		if(target_pulses == motor_command_pulses) {
+739			return;
+740		}
+741	
+742		if(target_pulses >= 0) {
+743			Emm_V5_Pos_Control(MOTOR_ADDR, 0, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)target_pulses, 1, 0);
+744		} else {
+745			Emm_V5_Pos_Control(MOTOR_ADDR, 1, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)(-target_pulses), 1, 0);
+746		}
+747	
+748		motor_command_pulses = target_pulses;
+749	}
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755	#if !POSITION_LOOP_DIRECT_DRIVE
+756		static float breakaway_start_error = 0.0f;
+757		static float breakaway_angle = 0.0f;
+758		static uint8_t stuck_ticks = 0u;
+759		static uint8_t breakaway_ramp_ticks = 0u;
+760		static bool breakaway_active = false;
+761	#endif
+762		static bool control_initialized = false;
+763		static bool target_hold_active = false;
+764	
+765		if(!g_pid_segment_initialized) {
+766			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+767			g_pid_segment = PID_SEGMENT_TO_POS_56;
+768			g_pid_segment_initialized = true;
+769		}
+770	
+771		Y = ball_error;  // 视觉小球绝对位置
+772	
+773		/* 分段状态机：
+774		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+775		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+776		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+777		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+778			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+779				pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+780				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+781				control_initialized = false;
+782				target_hold_active = false;
+783	#if !POSITION_LOOP_DIRECT_DRIVE
+784				stuck_ticks = 0u;
+785				breakaway_ramp_ticks = 0u;
+786				breakaway_active = false;
+787				breakaway_angle = 0.0f;
+788	#endif
+789			}
+790		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+791			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+792				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+793				control_initialized = false;
+794				target_hold_active = false;
+795	#if !POSITION_LOOP_DIRECT_DRIVE
+796				stuck_ticks = 0u;
+797				breakaway_ramp_ticks = 0u;
+798				breakaway_active = false;
+799				breakaway_angle = 0.0f;
+800	#endif
+801			}
+802		}
+803	
+804		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+805		float target_y = ball_target_get();
+806		float relative_y = Y - target_y;
+807		bool target_changed = !control_initialized || target_y != target_y_last;
+808	
+809		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+810		if(target_changed) {
+811	#if !POSITION_LOOP_DIRECT_DRIVE
+812			stuck_ticks = 0u;
+813			breakaway_ramp_ticks = 0u;
+814			breakaway_active = false;
+815			breakaway_angle = 0.0f;
+816	#endif
+817			target_hold_active = false;
+818			relative_y_last = relative_y;
+819			target_y_last = target_y;
+820			control_initialized = true;
+821		}
+822	
+823		float position_delta = relative_y - relative_y_last;
+824		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+825	
+826		/* 内环速度反馈改为本地位置差分速度。
+827		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+828		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+829		 */
+830		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+832	
+833		/* 最终保持只在第二段完成后生效。
+834		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。 */
+835		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+836			if(target_hold_active) {
+837				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+838					target_hold_active = false;
+839				}
+840			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+841				target_hold_active = true;
+842			}
+843		} else {
+844			target_hold_active = false;
+845		}
+846	
+847		if(target_hold_active) {
+848			/* 进入误差保持区后，只停止位置环继续推球：
+849			 *   1) 外环目标速度稍后压到 0；
+850			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+851			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+852	#if !POSITION_LOOP_DIRECT_DRIVE
+853			stuck_ticks = 0u;
+854			breakaway_ramp_ticks = 0u;
+855			breakaway_active = false;
+856			breakaway_angle = 0.0f;
+857	#endif
+858		}
+859	
+860		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+861		pidY.target = 0.0f;
+862		pidY.now = relative_y;
+863		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+864		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+865		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+866		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+867		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+868		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+869		                POS_LOOP_I_LIMIT);
+870		if(target_hold_active) {
+871			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+872			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+873			 */
+874			pidY.out = 0.0f;
+875		}
+876	
+877		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+878		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+879		 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:24:02Z)**_
+
+我已经把保持区和速度环那段对上了。你这组数据不像“目标点附近小抖动”，更像是第二段本身在目标左侧来回被视觉速度尖峰和静摩擦补偿反复触发。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:24:21Z)**_
+
+从这组 VOFA 看，**目标附近来回摆**的主因不是位置环 `P=0.8` 太大，而是这三件事叠在一起了：
+
+1. **你还没真正进最终保持区**
+   - 你第二段目标是 `-5.5cm`
+   - 日志里 `ch1` 基本在 `-4.54 ~ -5.96cm` 摆
+   - 只有进入 `|-5.5 - Y| <= 0.5` 才会进最终保持
+   - 你这里很多时候其实在门槛边上反复进出，不是“稳稳停住后又自己摆”
+
+2. **MaixCAM 原始速度 `ch2` 还有很强的尖峰**
+   - 你这组里一直出现 `+501 / -503 / -511 / 494` 这种跳值
+   - 虽然控制里真正用的是本地差分速度 `ch5`，不是 `ch2`
+   - 但这些尖峰说明视觉位置帧本身也有抖，位置一抖，差分出来的 `ch5` 就会被放大
+   - 你日志里 `ch5` 在 `+188` 到 `-302` 这种范围来回翻，说明**速度反馈仍然很躁**
+
+3. **第二段在目标附近仍有“推动力”，加上静摩擦补偿，容易过零反复**
+   - 你第二段参数是：
+     - 位置环 `P=0.8`
+     - 速度环 `P=1.05, I=0.01`
+   - 对 `0.4~0.6cm` 这种小误差，位置环仍会持续给一个非零目标速度
+   - 速度环再把它变成倾角
+   - 球一旦有点静摩擦、迟滞、图像抖动，就会出现：
+     - 推不动 -> 补偿加大
+     - 一动又过头
+     - 过头后方向反转
+     - 再推回来
+   - 这就是你现在看到的“在目标附近来回摆”
+
+结合你 6 通道定义，再看这段数据：
+
+- `ch0` 电机角度命令：在负角和接近 0 之间来回跳
+- `ch1` 位置：围绕 `-5.5cm` 左右摆
+- `ch3` 外环输出：很多时候已经很小，甚至到 `0`
+- `ch4` 速度环输出：仍然明显不小，说明**内环还在 actively 推**
+- `ch5` 本地速度：正负来回翻，说明球并没有稳定静止
+
+所以结论很明确：
+
+**你现在的来回摆，核心矛盾在第二段末端“速度环太积极 + 速度估计太躁 + breakaway/小误差驱动仍然存在”。**
+
+最该先调的是第二段这组参数，在 [Core/Src/pid.c:779](Core/Src/pid.c#L779)：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+```
+
+我建议你先按这个顺序试，不要同时乱改：
+
+1. **先降第二段速度环 P**
+   - `1.05 -> 0.90`
+   - 这是第一优先级
+   - 你现在更像是内环太冲，目标附近还在猛修正
+
+2. **再看是否把第二段速度环 I 降一点**
+   - `0.01 -> 0.005`，甚至先到 `0`
+   - 如果是“慢慢累积一个偏角，然后过头”，就是 I 在帮倒忙
+
+3. **如果还有小范围来回拉扯，再降第二段位置环 P**
+   - `0.8 -> 0.65` 或 `0.6`
+   - 让目标附近外环给的目标速度更柔和
+
+我不建议你先去改第一段，因为这段摆动问题明显发生在 **`+5.6 -> -5.5` 第二段末端**。
+
+你现在最值得先试的一组是：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.65f, 0.0f, 0.0f, 0.90f, 0.005f, 0.0f);
+```
+
+如果你想要的是“先稳住再说，不追求到位最快”，这组会比现在更靠谱。
+
+---
+
+_**User (2026-08-02 22:27:46Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+还是回来回抖
+[06:26:38.591] -416,-445,0,-83,29,-111
+[06:26:38.601] -416,-445,0,-83,0,-83
+[06:26:38.611] -416,-445,0,-83,0,-83
+[06:26:38.621] -416,-445,0,-83,-21,-62
+[06:26:38.631] -416,-445,0,-83,-21,-62
+[06:26:38.642] -416,-445,0,-83,-38,-47
+[06:26:38.651] -416,-445,-501,-83,-38,-47
+[06:26:38.661] -416,-454,0,-76,66,-140
+[06:26:38.671] -416,-454,0,-76,66,-140
+[06:26:38.681] -416,-454,0,-76,29,-105
+[06:26:38.691] -416,-454,0,-76,29,-105
+[06:26:38.701] -416,-454,0,-76,2,-78
+[06:26:38.711] -416,-454,0,-76,2,-78
+[06:26:38.722] -416,-454,0,-76,-18,-59
+[06:26:38.732] -416,-454,0,-76,-18,-59
+[06:26:38.741] -416,-454,0,-76,-34,-44
+[06:26:38.752] -416,-454,-508,-76,-34,-44
+[06:26:38.762] -416,-462,-501,-70,71,-138
+[06:26:38.772] -416,-462,-501,-70,71,-138
+[06:26:38.781] -416,-470,0,-63,152,-208
+[06:26:38.792] -416,-470,0,-63,152,-208
+[06:26:38.802] -416,-470,0,-63,97,-156
+[06:26:38.811] -416,-470,0,-63,97,-156
+[06:26:38.822] -416,-470,0,-63,56,-117
+[06:26:38.831] -416,-470,0,-63,56,-117
+[06:26:38.841] -416,-470,0,-63,25,-88
+[06:26:38.851] -416,-470,-502,-63,25,-88
+[06:26:38.861] -416,-479,0,-56,120,-171
+[06:26:38.871] -416,-479,0,-56,120,-171
+[06:26:38.882] -416,-479,0,-56,75,-128
+[06:26:38.891] -416,-479,0,-56,75,-128
+[06:26:38.901] -416,-479,0,-56,41,-96
+[06:26:38.912] -416,-479,0,-56,41,-96
+[06:26:38.922] -416,-479,0,-56,16,-72
+[06:26:38.932] -416,-479,0,-56,16,-72
+[06:26:38.941] -416,-479,0,-56,-2,-54
+[06:26:38.951] -416,-479,0,-56,-2,-54
+[06:26:38.962] -416,-479,0,-56,-16,-40
+[06:26:38.971] -416,-479,0,-56,-16,-40
+[06:26:38.981] -416,-479,0,-56,-27,-30
+[06:26:38.991] -416,-479,0,-56,-27,-30
+[06:26:39.001] -416,-487,-501,-49,81,-127
+[06:26:39.011] -416,-487,-501,-49,81,-127
+[06:26:39.021] -416,-487,0,-49,48,-95
+[06:26:39.031] -416,-487,0,-49,48,-95
+[06:26:39.041] -416,-487,0,-49,23,-71
+[06:26:39.051] -416,-487,0,-49,23,-71
+[06:26:39.061] -416,-487,0,-49,4,-53
+[06:26:39.071] -416,-487,0,-49,4,-53
+[06:26:39.081] -416,-487,0,-49,-9,-40
+[06:26:39.092] -416,-487,0,-49,-9,-40
+[06:26:39.102] -416,-487,0,-49,-20,-30
+[06:26:39.112] -416,-487,0,-49,-20,-30
+[06:26:39.121] -416,-487,0,-49,-28,-22
+[06:26:39.131] -416,-487,0,-49,-28,-22
+[06:26:39.141] -416,-487,0,-49,-34,-17
+[06:26:39.152] -416,-487,0,-49,-34,-17
+[06:26:39.161] -416,-487,0,-49,-38,-12
+[06:26:39.171] -416,-487,-501,-49,-38,-12
+[06:26:39.181] -314,-496,-501,-43,74,-114
+[06:26:39.192] -314,-496,0,-43,74,-114
+[06:26:39.201] -213,-496,0,-43,44,-85
+[06:26:39.211] -213,-496,0,-43,44,-85
+[06:26:39.221] -112,-496,0,-43,22,-64
+[06:26:39.232] -112,-496,0,-43,22,-64
+[06:26:39.241] -11,-496,0,-43,5,-48
+[06:26:39.251] -11,-496,0,-43,5,-48
+[06:26:39.261] 0,-496,0,-43,-7,-36
+[06:26:39.271] 0,-496,0,-43,-7,-36
+[06:26:39.281] -11,-496,0,-43,-16,-27
+[06:26:39.291] -11,-496,-466,-43,-16,-27
+[06:26:39.301] 11,-504,0,0,21,-20
+[06:26:39.311] 11,-504,0,0,21,-20
+[06:26:39.321] 11,-504,0,0,16,-15
+[06:26:39.331] 11,-504,0,0,16,-15
+[06:26:39.341] 11,-504,0,0,12,-11
+[06:26:39.351] 11,-504,0,0,12,-11
+[06:26:39.361] 0,-504,0,0,9,-8
+[06:26:39.371] 0,-504,0,0,9,-8
+[06:26:39.381] 0,-504,0,0,6,-6
+[06:26:39.391] 0,-504,0,0,6,-6
+[06:26:39.401] 0,-504,0,0,5,-4
+[06:26:39.411] 0,-504,0,0,5,-4
+[06:26:39.421] 0,-504,0,0,3,-3
+[06:26:39.430] 0,-504,0,0,3,-3
+[06:26:39.441] 0,-504,0,0,2,-2
+[06:26:39.451] 0,-504,0,0,2,-2
+[06:26:39.461] 0,-504,0,0,2,-2
+[06:26:39.471] 0,-504,0,0,2,-2
+[06:26:39.481] 0,-504,0,0,1,-1
+[06:26:39.491] 0,-504,0,0,1,-1
+[06:26:39.501] 0,-504,0,0,1,-1
+[06:26:39.511] 0,-504,0,0,1,-1
+[06:26:39.520] 0,-504,0,0,0,0
+[06:26:39.530] 0,-504,0,0,0,0
+[06:26:39.540] 0,-504,0,0,0,0
+[06:26:39.550] 0,-504,0,0,0,0
+[06:26:39.561] 0,-504,0,0,0,0
+[06:26:39.571] 0,-504,0,0,0,0
+[06:26:39.580] 0,-504,0,0,0,0
+[06:26:39.590] 0,-504,0,0,0,0
+[06:26:39.600] 0,-504,0,0,0,0
+[06:26:39.611] 0,-504,0,0,0,0
+[06:26:39.620] 0,-504,0,0,0,0
+[06:26:39.631] 0,-504,0,0,0,0
+[06:26:39.641] 0,-504,0,0,0,0
+[06:26:39.650] 0,-504,0,0,0,0
+[06:26:39.660] 0,-504,0,0,0,0
+[06:26:39.670] 0,-504,0,0,0,0
+[06:26:39.681] 0,-504,0,0,0,0
+[06:26:39.690] 0,-504,0,0,0,0
+[06:26:39.700] 0,-504,0,0,0,0
+[06:26:39.711] 0,-504,0,0,0,0
+[06:26:39.721] 0,-504,0,0,0,0
+[06:26:39.731] 0,-504,0,0,0,0
+[06:26:39.741] 0,-504,0,0,0,0
+[06:26:39.751] 0,-504,0,0,0,0
+[06:26:39.761] 0,-504,0,0,0,0
+[06:26:39.770] 0,-504,0,0,0,0
+[06:26:39.780] 0,-504,0,0,0,0
+[06:26:39.790] 0,-504,0,0,0,0
+[06:26:39.800] 0,-504,0,0,0,0
+[06:26:39.811] 0,-504,0,0,0,0
+[06:26:39.821] 0,-504,0,0,0,0
+[06:26:39.831] 0,-504,0,0,0,0
+[06:26:39.840] 0,-504,0,0,0,0
+[06:26:39.851] 0,-504,0,0,0,0
+[06:26:39.861] 0,-504,0,0,0,0
+[06:26:39.871] 0,-504,0,0,0,0
+[06:26:39.880] 0,-504,0,0,0,0
+[06:26:39.890] 0,-504,0,0,0,0
+[06:26:39.901] 0,-504,0,0,0,0
+[06:26:39.911] 0,-504,0,0,0,0
+[06:26:39.920] 0,-504,0,0,0,0
+[06:26:39.930] 0,-504,0,0,0,0
+[06:26:39.940] 0,-504,0,0,0,0
+[06:26:39.951] 0,-504,0,0,0,0
+[06:26:39.960] 0,-504,0,0,0,0
+[06:26:39.971] 0,-504,0,0,0,0
+[06:26:39.981] 0,-504,0,0,0,0
+[06:26:39.990] 0,-504,0,0,0,0
+[06:26:40.001] 0,-504,0,0,0,0
+[06:26:40.010] 0,-504,0,0,0,0
+[06:26:40.020] 0,-504,0,0,0,0
+[06:26:40.031] 0,-504,0,0,0,0
+[06:26:40.041] 0,-504,0,0,0,0
+[06:26:40.050] 0,-504,0,0,0,0
+[06:26:40.060] 0,-504,0,0,0,0
+[06:26:40.070] 0,-504,0,0,0,0
+[06:26:40.081] 0,-504,0,0,0,0
+[06:26:40.091] 0,-504,464,0,0,0
+[06:26:40.102] -89,-496,464,0,-110,104
+[06:26:40.111] -89,-496,0,0,-110,104
+[06:26:40.121] -89,-496,0,0,-82,78
+[06:26:40.130] -89,-496,0,0,-82,78
+[06:26:40.142] -67,-496,0,0,-62,59
+[06:26:40.151] -67,-496,0,0,-62,59
+[06:26:40.162] -168,-487,483,-49,-209,149
+[06:26:40.171] -168,-487,0,-49,-209,149
+[06:26:40.181] -202,-487,0,-49,-169,111
+[06:26:40.192] -202,-487,0,-49,-169,111
+[06:26:40.201] -157,-487,0,-49,-140,83
+[06:26:40.212] -157,-487,0,-49,-140,83
+[06:26:40.221] -134,-487,0,-49,-118,62
+[06:26:40.232] -134,-487,0,-49,-118,62
+[06:26:40.242] -112,-487,516,-49,-102,47
+[06:26:40.252] -112,-487,516,-49,-102,47
+[06:26:40.262] -213,-479,0,-56,-206,140
+[06:26:40.271] -213,-479,0,-56,-206,140
+[06:26:40.282] -202,-479,0,-56,-170,105
+[06:26:40.292] -202,-479,0,-56,-170,105
+[06:26:40.301] -168,-479,0,-56,-142,78
+[06:26:40.311] -168,-479,502,-56,-142,78
+[06:26:40.322] -269,-470,502,-63,-238,164
+[06:26:40.331] -269,-470,0,-63,-238,164
+[06:26:40.341] -224,-470,516,-63,-195,123
+[06:26:40.352] -224,-470,516,-63,-195,123
+[06:26:40.362] -326,-462,0,-70,-280,197
+[06:26:40.372] -326,-462,0,-70,-280,197
+[06:26:40.382] -404,-454,492,-76,-346,253
+[06:26:40.392] -404,-454,0,-76,-346,253
+[06:26:40.401] -326,-454,0,-76,-279,189
+[06:26:40.412] -326,-454,0,-76,-279,189
+[06:26:40.422] -269,-454,0,-76,-230,142
+[06:26:40.431] -269,-454,502,-76,-230,142
+[06:26:40.441] -371,-445,0,-83,-310,211
+[06:26:40.452] -371,-445,0,-83,-310,211
+[06:26:40.461] -303,-445,0,-83,-254,158
+[06:26:40.472] -303,-445,0,-83,-254,158
+[06:26:40.482] -393,-437,507,-90,-330,224
+[06:26:40.491] -393,-437,0,-90,-330,224
+[06:26:40.501] -314,-437,0,-90,-271,168
+[06:26:40.512] -314,-437,495,-90,-271,168
+[06:26:40.522] -404,-428,495,-96,-344,231
+[06:26:40.531] -404,-428,0,-96,-344,231
+[06:26:40.542] -337,-428,0,-96,-283,173
+[06:26:40.552] -337,-428,0,-96,-283,173
+[06:26:40.562] -281,-428,0,-96,-238,129
+[06:26:40.572] -281,-428,0,-96,-238,129
+[06:26:40.581] -236,-428,0,-96,-204,97
+[06:26:40.592] -236,-428,0,-96,-204,97
+[06:26:40.602] -213,-428,0,-96,-178,73
+[06:26:40.611] -213,-428,0,-96,-178,73
+[06:26:40.621] -191,-428,0,-96,-159,54
+[06:26:40.632] -191,-428,0,-96,-159,54
+[06:26:40.642] -168,-428,0,-96,-144,41
+[06:26:40.652] -168,-428,0,-96,-144,41
+[06:26:40.662] -269,-420,490,-103,-251,135
+[06:26:40.671] -269,-420,490,-103,-251,135
+
+甚至听错位置
+[06:26:58.753] -596,-412,0,-110,-115,0
+[06:26:58.762] -596,-412,0,-110,-115,0
+[06:26:58.773] -596,-412,0,-110,-115,0
+[06:26:58.782] -596,-412,0,-110,-115,0
+[06:26:58.793] -596,-412,0,-110,-115,0
+[06:26:58.802] -596,-412,0,-110,-115,0
+[06:26:58.813] -596,-412,0,-110,-115,0
+[06:26:58.823] -596,-412,0,-110,-115,0
+[06:26:58.833] -596,-412,0,-110,-115,0
+[06:26:58.843] -596,-412,0,-110,-115,0
+[06:26:58.852] -596,-412,0,-110,-115,0
+[06:26:58.862] -596,-412,0,-110,-115,0
+[06:26:58.872] -596,-412,0,-110,-115,0
+[06:26:58.883] -596,-412,0,-110,-115,0
+[06:26:58.893] -596,-412,0,-110,-115,0
+[06:26:58.902] -596,-412,0,-110,-115,0
+[06:26:58.913] -596,-412,0,-110,-115,0
+[06:26:58.923] -596,-412,0,-110,-115,0
+[06:26:58.933] -596,-412,0,-110,-115,0
+[06:26:58.943] -596,-412,0,-110,-115,0
+[06:26:58.953] -596,-412,0,-110,-115,0
+[06:26:58.963] -596,-412,0,-110,-115,0
+[06:26:58.972] -596,-412,0,-110,-115,0
+
+我现在把速度环的I项清零了
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:05Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing zero-speed loop issue**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:09Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Mapping log data to hold behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:11Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing hold exit and oscillation cause**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:11Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying hold threshold and velocity checks issue**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:12Z)**_
+
+我先核对一下保持区的进入条件是不是只看位置、没看速度，这会直接决定你现在这种“进了范围又弹出去、最后停在边缘”的现象。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:14Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `TARGET_HOLD_SPEED_LIMIT|target_hold_active|abs_relative_y <= TARGET_HOLD_POSITION_ENTER|abs_relative_y >= TARGET_HOLD_POSITION_EXIT`
+
+```text
+763:	static bool target_hold_active = false;
+782:			target_hold_active = false;
+794:			target_hold_active = false;
+817:		target_hold_active = false;
+836:		if(target_hold_active) {
+837:			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+838:				target_hold_active = false;
+840:		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+841:			target_hold_active = true;
+844:		target_hold_active = false;
+847:	if(target_hold_active) {
+870:	if(target_hold_active) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Diagnosing oscillation issue in pid.c**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing hold logic and velocity impact**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting speed loop and breakaway limits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:26Z)**_
+
+我把后半段控制也展开看看，重点看 breakaway 和最终给电机的角度怎么叠加。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:27Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+878		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+879		 */
+880		float control_velocity = estimated_velocity;
+881		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+882			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+883		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+884			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+885		}
+886		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+887		                         (control_velocity - pidY_filtered_velocity);
+888	
+889	#if POSITION_LOOP_DIRECT_DRIVE
+890		/* 单环调试模式：位置环直接输出平台倾角。
+891		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+892		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+893		pidY_velocity_damping = 0.0f;
+894		pidY_Speed.target = 0.0f;
+895		pidY_Speed.now = pidY_filtered_velocity;
+896		pidY_Speed.out = 0.0f;
+897		pidY_Speed.pout = 0.0f;
+898		pidY_Speed.iout = 0.0f;
+899		pidY_Speed.dout = 0.0f;
+900	
+901		float cmd_angle = pidY.out;
+902	#else
+903		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+904		 *
+905		 * breakaway 现改为“分级加力”：
+906		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+907		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+908		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+909		 *
+910		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+911		 */
+912		if(breakaway_active) {
+913			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+914			   (breakaway_start_error < 0.0f &&
+915			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+916			   (breakaway_start_error > 0.0f &&
+917			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+918				breakaway_active = false;
+919				breakaway_angle = 0.0f;
+920				breakaway_ramp_ticks = 0u;
+921			} else if(position_delta > -STUCK_POSITION_DELTA &&
+922			          position_delta < STUCK_POSITION_DELTA) {
+923				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+924					breakaway_ramp_ticks++;
+925				} else {
+926					breakaway_ramp_ticks = 0u;
+927					if(breakaway_start_error < 0.0f) {
+928						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+929						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+930							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+931						}
+932					} else {
+933						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+934						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+935							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+936						}
+937					}
+938				}
+939			} else {
+940				breakaway_ramp_ticks = 0u;
+941			}
+942			stuck_ticks = 0u;
+943		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+944		          position_delta > -STUCK_POSITION_DELTA &&
+945		          position_delta < STUCK_POSITION_DELTA) {
+946			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+947				stuck_ticks++;
+948			}
+949			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+950				breakaway_start_error = relative_y;
+951				breakaway_active = true;
+952				breakaway_ramp_ticks = 0u;
+953				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+954			}
+955		} else {
+956			stuck_ticks = 0u;
+957		}
+958	
+959		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+960		pidY_Speed.target = pidY.out;
+961		pidY_Speed.now = pidY_filtered_velocity;
+962	
+963		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+964		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+965		float iout_frozen = pidY_Speed.iout;
+966		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+967		                SPEED_LOOP_I_LIMIT);
+968		if(breakaway_active) {
+969			pidY_Speed.iout = iout_frozen;
+970			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+971			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+972				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+973			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+974				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+975			}
+976		}
+977	
+978		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+979	
+980		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+981		float cmd_angle = pidY_velocity_damping;
+982		if(breakaway_active) {
+983			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+984				cmd_angle = breakaway_angle;
+985			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+986				cmd_angle = breakaway_angle;
+987			}
+988		}
+989	#endif
+990	
+991		// 负方向（下降）机构补偿 ×1.2。
+992		if(cmd_angle < 0.0f) {
+993			cmd_angle *= 1.2f;
+994		}
+995	
+996		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+997		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+998		static float cmd_angle_last = 0.0f;
+999		{
+1000			float delta = cmd_angle - cmd_angle_last;
+1001			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+1002			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+1003			cmd_angle = cmd_angle_last + delta;
+1004			cmd_angle_last = cmd_angle;
+1005		}
+1006		motor_set_angle(cmd_angle);
+1007	
+1008		relative_y_last = relative_y;
+1009		Y_last = Y;
+1010	}
+1011	
+1012	void pidout_limit_Y(pid_t *pid)
+1013	{
+1014		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+1015	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:38Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing oscillation cause and hold gating effects**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:38Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming hold zone causes mispositioning**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:42Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying sensor glitch affecting velocity readings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:47Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing command angle and speed loop behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying hold condition hysteresis issue and recommending velocity-based fix**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:56Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Determining approach for code fix**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:28:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning precise hold condition enhancement**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:01Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preparing to edit pid.c and pid.h for stability**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:06Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning manual edits with commentary**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:07Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing stable hold logic with filtered velocity**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:07Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Verifying control variables usage**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:07Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting code segment around line 823**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:11Z)**_
+
+原因已经定位到了：你现在的最终保持区只看“位置进了 ±0.5cm”，**没看速度是不是已经很小**，所以会在 `-5.04cm` 这种还带着速度的位置提前锁定；随后球又滑出 `0.6cm` 回差，外环重新接管，就形成来回抖和“停错位置”。我直接把它改成“位置和速度都满足，并连续稳定几个周期才进入保持”。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:12Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+820			control_initialized = true;
+821		}
+822	
+823		float position_delta = relative_y - relative_y_last;
+824		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+825	
+826		/* 内环速度反馈改为本地位置差分速度。
+827		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+828		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+829		 */
+830		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+832	
+833		/* 最终保持只在第二段完成后生效。
+834		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。 */
+835		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+836			if(target_hold_active) {
+837				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+838					target_hold_active = false;
+839				}
+840			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER) {
+841				target_hold_active = true;
+842			}
+843		} else {
+844			target_hold_active = false;
+845		}
+846	
+847		if(target_hold_active) {
+848			/* 进入误差保持区后，只停止位置环继续推球：
+849			 *   1) 外环目标速度稍后压到 0；
+850			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+851			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+852	#if !POSITION_LOOP_DIRECT_DRIVE
+853			stuck_ticks = 0u;
+854			breakaway_ramp_ticks = 0u;
+855			breakaway_active = false;
+856			breakaway_angle = 0.0f;
+857	#endif
+858		}
+859	
+860		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+861		pidY.target = 0.0f;
+862		pidY.now = relative_y;
+863		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+864		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+865		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+866		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+867		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+868		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+869		                POS_LOOP_I_LIMIT);
+870		if(target_hold_active) {
+871			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+872			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+873			 */
+874			pidY.out = 0.0f;
+875		}
+876	
+877		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+878		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+879		 */
+880		float control_velocity = estimated_velocity;
+881		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+882			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+883		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+884			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+885		}
+886		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+887		                         (control_velocity - pidY_filtered_velocity);
+888	
+889	#if POSITION_LOOP_DIRECT_DRIVE
+890		/* 单环调试模式：位置环直接输出平台倾角。
+891		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+892		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+893		pidY_velocity_damping = 0.0f;
+894		pidY_Speed.target = 0.0f;
+895		pidY_Speed.now = pidY_filtered_velocity;
+896		pidY_Speed.out = 0.0f;
+897		pidY_Speed.pout = 0.0f;
+898		pidY_Speed.iout = 0.0f;
+899		pidY_Speed.dout = 0.0f;
+900	
+901		float cmd_angle = pidY.out;
+902	#else
+903		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+904		 *
+905		 * breakaway 现改为“分级加力”：
+906		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+907		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+908		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+909		 *
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:14Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+140	/* 接近目标后的稳态区。
+141	 *
+142	 * 需求改为：|位置误差| <= 0.5cm 时就停止 PID 调节。
+143	 * 为避免视觉噪声和轻微回弹导致反复进出保持区，退出门限留 0.1cm 回差，
+144	 * 即误差重新增大到 0.6cm 以上才恢复闭环。
+145	 */
+146	#define TARGET_HOLD_POSITION_ENTER  0.50f
+147	#define TARGET_HOLD_POSITION_EXIT   0.60f
+148	#define TARGET_HOLD_SPEED_LIMIT     0.25f
+149	
+150	/* 小球偏离目标且持续不动时，用起动倾角克服静摩擦。
+151	 *
+152	 * 不再使用固定单一的 breakaway 角。
+153	 * 现改为“分级加力”：先给一个较小起动角，若球仍不动，就每隔一段时间再加一点，
+154	 * 直到上限。这样既能在轻微卡滞时保持动作柔和，也能在重静摩擦时继续加力，避免
+155	 * 像之前那样一直卡死在固定的 -3.6° 上。
+156	 */
+157	#define STUCK_POSITION_THRESHOLD      0.6f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
+158	#define STUCK_POSITION_DELTA          0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
+159	#define STUCK_TICKS_REQUIRED          10u     /* 连续 10 × 20ms = 200ms 不动后进入 breakaway */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:24Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning stable counter implementation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing consecutive ticks hold entry logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Reordering hold logic after velocity filtering**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:28Z)**_
+
+问题点已经比较清楚了：`TARGET_HOLD_SPEED_LIMIT` 这个门限虽然定义了，但当前代码根本没用于“进入保持”的判定。我要把最终保持改成“位置进窗 + 速度够小 + 连续稳定若干周期”才锁定，这样不会在 `-5.04cm` 这种还带余速的位置提前停。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:34Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:40Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:47Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:53Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:29:59Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:30:15Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:30:21Z)**_
+
+保持区判定已经改完了。现在它不会再只因为“位置碰到 ±0.5cm”就立刻锁定，而是要位置和速度都够小，并且连续稳定 120ms 才进入最终保持。接着我编译确认没有引入错误。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:30:27Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build debug firmware
+
+`cmake --build build/Debug`
+
+```text
+[1/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[2/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[3/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/bt_tune.c.obj
+[4/4] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38464 B         1 MB      3.67%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:30:40Z)**_
+
+这次现象已经比较明确了，不是单纯“速度环 I 太大”。你把 `I` 清零以后还是会抖，而且还会“停错位置”，说明真正的问题在于：
+
+**原来的最终保持触发条件太松，只看位置进了 `±0.5cm`，没看球是不是已经基本停住。**
+
+所以会出现这条坏链路：
+
+1. 球带着速度冲进 `-5.5 ± 0.5cm`
+2. 代码立刻判定“到位”，把外环压成 0
+3. 但球其实还在滑
+4. 又滑出保持区
+5. 外环重新接管，再推回来
+6. 来回反复，看起来就是你说的“回抖”和“停错位置”
+
+你贴的这段里最典型的是：
+
+- `ch1 = -504`，也就是球其实停在 `-5.04cm`
+- 但后面长时间 `ch0/ch3/ch4/ch5` 全部接近 0
+- 这说明系统已经**提前进入保持**了，而不是继续把球拉到 `-5.5`
+
+我已经把代码改了，并编译通过 ✅
+
+改动在 [Core/Src/pid.c](Core/Src/pid.c) 和 [Core/Inc/pid.h](Core/Inc/pid.h)：
+
+1. 最终保持现在要求同时满足：
+   - `|位置误差| <= 0.5cm`
+   - `|本地估计速度| <= 0.25cm/s`
+
+2. 而且不是一满足就进保持，必须连续稳定：
+   - `6` 个控制周期
+   - 也就是 `120ms`
+
+3. 只要中间有一次位置或速度不满足，就重新计数，不会提前锁定
+
+新增的门限在 [Core/Inc/pid.h:148](Core/Inc/pid.h#L148) 附近：
+
+```c
+#define TARGET_HOLD_SPEED_LIMIT     0.25f
+#define TARGET_HOLD_SETTLE_TICKS    6u
+```
+
+构建也过了：
+
+- `RAM: 3504 B`
+- `FLASH: 38464 B`
+
+你现在重新烧录后，第二段末端的行为会变成：
+
+- 不是“碰到目标窗就停”
+- 而是“进入目标窗并且速度足够小，稳定一小段时间后再停”
+
+这一步是必须补的，否则你后面再怎么磨第二段 `P`，都会反复碰到“提前锁定”这个结构性问题。
+
+---
+
+_**User (2026-08-02 22:35:09Z)**_
+
+第一组
+78,-554,0,3,88,-80
+78,-554,0,3,88,-80
+56,-554,0,3,67,-60
+56,-554,0,3,67,-60
+44,-554,0,3,51,-45
+44,-554,0,3,51,-45
+33,-554,0,0,35,-33
+33,-554,0,0,35,-33
+-56,-546,492,0,-83,79
+-56,-546,492,0,-83,79
+-67,-546,0,0,-62,59
+-67,-546,0,0,-62,59
+-56,-546,0,0,-46,44
+-56,-546,0,0,-46,44
+-33,-546,0,0,-35,33
+-33,-546,501,0,-35,33
+-134,-538,512,0,-136,130
+-134,-538,512,0,-136,130
+-236,-529,0,0,-212,202
+-236,-529,0,0,-212,202
+-314,-521,501,0,-269,256
+-314,-521,0,0,-269,256
+-236,-521,0,0,-202,192
+-236,-521,499,0,-202,192
+-303,-512,499,0,-262,249
+-303,-512,0,0,-262,249
+-224,-512,0,0,-196,187
+-224,-512,0,0,-196,187
+-168,-512,0,0,-147,140
+-168,-512,0,0,-147,140
+-258,-504,502,0,-220,210
+-258,-504,0,0,-220,210
+-191,-504,0,0,-165,157
+-191,-504,0,0,-165,157
+-146,-504,0,0,-124,118
+-146,-504,0,0,-124,118
+-101,-504,0,0,-93,88
+-101,-504,0,0,-93,88
+-78,-504,0,0,-69,66
+-78,-504,0,0,-69,66
+-56,-504,0,0,-52,49
+-56,-504,0,0,-52,49
+-44,-504,0,0,-39,37
+-44,-504,0,0,-39,37
+-33,-504,0,0,-29,28
+-33,-504,0,0,-29,28
+-22,-504,0,0,-22,21
+-22,-504,0,0,-22,21
+-11,-504,0,0,-16,15
+-11,-504,0,0,-16,15
+-11,-504,0,0,-12,11
+-11,-504,0,0,-12,11
+0,-504,0,0,-9,8
+0,-504,0,0,-9,8
+0,-504,0,0,-6,6
+0,-504,0,0,-6,6
+0,-504,0,0,-5,4
+0,-504,0,0,-5,4
+-101,-496,503,0,-114,108
+-101,-496,503,0,-114,108
+-101,-496,0,0,-85,81
+-101,-496,0,0,-85,81
+-67,-496,0,0,-64,61
+-67,-496,0,0,-64,61
+-56,-496,0,0,-48,45
+-56,-496,0,0,-48,45
+-33,-496,0,0,-36,34
+-33,-496,0,0,-36,34
+-22,-496,0,0,-27,25
+-22,-496,0,0,-27,25
+-22,-496,0,0,-20,19
+-22,-496,0,0,-20,19
+-11,-496,0,0,-15,14
+-11,-496,503,0,-15,14
+-112,-487,503,-49,-174,115
+-112,-487,0,-49,-174,115
+-168,-487,0,-49,-143,86
+-168,-487,0,-49,-143,86
+-134,-487,0,-49,-120,65
+-134,-487,0,-49,-120,65
+-123,-487,0,-49,-103,48
+-123,-487,0,-49,-103,48
+-101,-487,0,-49,-90,36
+-101,-487,0,-49,-90,36
+-89,-487,0,-49,-81,27
+-89,-487,0,-49,-81,27
+-78,-487,0,-49,-74,20
+-78,-487,0,-49,-74,20
+-78,-487,0,-49,-68,15
+-78,-487,0,-49,-68,15
+-67,-487,0,-49,-64,11
+-67,-487,0,-49,-64,11
+-67,-487,0,-49,-61,8
+-67,-487,0,-49,-61,8
+-168,-487,0,-49,-59,6
+-168,-487,0,-49,-59,6
+-269,-487,0,-49,-57,4
+-269,-487,0,-49,-57,4
+-359,-487,0,-49,-56,3
+-359,-487,0,-49,-56,3
+-359,-479,495,-56,-172,107
+-359,-479,495,-56,-172,107
+-359,-479,0,-56,-144,80
+-359,-479,0,-56,-144,80
+-359,-479,0,-56,-123,60
+-359,-479,495,-56,-123,60
+-359,-470,495,-63,-224,150
+-359,-470,0,-63,-224,150
+-359,-470,502,-63,-185,112
+-359,-470,502,-63,-185,112
+-359,-462,0,-70,-272,189
+-359,-462,0,-70,-272,189
+-359,-462,0,-70,-222,142
+-359,-462,0,-70,-222,142
+-359,-462,0,-70,-185,106
+-359,-462,0,-70,-185,106
+-359,-462,0,-70,-157,80
+-359,-462,0,-70,-157,80
+-359,-462,0,-70,-136,60
+-359,-462,0,-70,-136,60
+-359,-462,0,-70,-120,45
+-359,-462,0,-70,-120,45
+-359,-462,0,-70,-109,33
+-359,-462,0,-70,-109,33
+-359,-462,0,-70,-100,25
+-359,-462,-510,-70,-100,25
+-359,-470,-510,-63,23,-86
+-359,-470,0,-63,23,-86
+-359,-470,0,-63,1,-64
+-359,-470,0,-63,1,-64
+-359,-470,0,-63,-15,-48
+-359,-470,0,-63,-15,-48
+-359,-470,0,-63,-28,-36
+-359,-470,0,-63,-28,-36
+-359,-470,0,-63,-37,-27
+-359,-470,0,-63,-37,-27
+-359,-470,0,-63,-45,-20
+-359,-470,0,-63,-45,-20
+-359,-470,0,-63,-50,-15
+-359,-470,-497,-63,-50,-15
+-359,-479,0,-56,62,-116
+-359,-479,0,-56,62,-116
+-359,-479,0,-56,32,-87
+-359,-479,0,-56,32,-87
+-359,-479,0,-56,9,-65
+-359,-479,0,-56,9,-65
+-359,-479,0,-56,-7,-49
+-359,-479,0,-56,-7,-49
+-359,-479,0,-56,-20,-36
+-359,-479,0,-56,-20,-36
+-359,-479,0,-56,-30,-27
+-359,-479,0,-56,-30,-27
+-359,-479,-498,-56,-37,-20
+-359,-479,-498,-56,-37,-20
+-359,-487,0,-49,74,-120
+-359,-487,0,-49,74,-120
+-359,-487,0,-49,42,-90
+-359,-487,0,-49,42,-90
+-359,-487,0,-49,18,-67
+-359,-487,0,-49,18,-67
+-359,-487,0,-49,0,-50
+-359,-487,0,-49,0,-50
+-359,-487,0,-49,-12,-38
+-359,-487,0,-49,-12,-38
+-359,-487,0,-49,-22,-28
+-359,-487,0,-49,-22,-28
+-258,-496,-519,-43,87,-126
+-258,-496,0,-43,87,-126
+-157,-496,0,-43,54,-94
+-157,-496,0,-43,54,-94
+-56,-496,0,-43,29,-71
+-56,-496,0,-43,29,-71
+0,-496,0,-43,10,-53
+0,-496,0,-43,10,-53
+0,-496,0,-43,-3,-40
+0,-496,0,-43,-3,-40
+89,-504,-544,-36,103,-135
+89,-504,0,-36,103,-135
+67,-504,0,-36,68,-101
+67,-504,0,-36,68,-101
+33,-504,0,-36,41,-75
+33,-504,-508,-36,41,-75
+134,-512,0,-29,138,-161
+134,-512,0,-29,138,-161
+89,-512,0,-29,96,-121
+89,-512,0,-29,96,-121
+179,-521,-538,-23,181,-196
+179,-521,0,-23,181,-196
+123,-521,0,-23,130,-147
+123,-521,-495,-23,130,-147
+202,-529,-495,-16,208,-215
+202,-529,0,-16,208,-215
+146,-529,-499,-16,152,-161
+146,-529,-499,-16,152,-161
+224,-538,0,-9,227,-226
+224,-538,0,-9,227,-226
+157,-538,0,-9,167,-169
+157,-538,0,-9,167,-169
+112,-538,0,-9,123,-127
+112,-538,0,-9,123,-127
+89,-538,0,-9,90,-95
+89,-538,0,-9,90,-95
+56,-538,0,-9,65,-71
+56,-538,0,-9,65,-71
+44,-538,0,-9,46,-53
+44,-538,0,-9,46,-53
+146,-546,-566,-2,149,-145
+146,-546,0,-2,149,-145
+101,-546,0,-2,111,-108
+101,-546,0,-2,111,-108
+78,-546,0,-2,82,-81
+78,-546,0,-2,82,-81
+56,-546,0,-2,61,-61
+56,-546,0,-2,61,-61
+44,-546,0,-2,45,-45
+44,-546,0,-2,45,-45
+22,-546,0,-2,33,-34
+22,-546,0,-2,33,-34
+22,-546,0,0,27,-25
+22,-546,0,0,27,-25
+11,-546,0,0,20,-19
+11,-546,0,0,20,-19
+11,-546,0,0,15,-14
+11,-546,0,0,15,-14
+11,-546,0,0,11,-10
+11,-546,0,0,11,-10
+0,-546,0,0,8,-8
+0,-546,0,0,8,-8
+0,-546,0,0,6,-6
+0,-546,0,0,6,-6
+0,-546,0,0,4,-4
+0,-546,0,0,4,-4
+0,-546,502,0,3,-3
+0,-546,502,0,3,-3
+-89,-538,0,0,-107,102
+-89,-538,0,0,-107,102
+-89,-538,0,0,-80,76
+-89,-538,0,0,-80,76
+-67,-538,0,0,-60,57
+-67,-538,0,0,-60,57
+-44,-538,0,0,-45,43
+-44,-538,0,0,-45,43
+-33,-538,0,0,-34,32
+-33,-538,557,0,-34,32
+-134,-529,0,0,-135,129
+-134,-529,0,0,-135,129
+-112,-529,491,0,-101,96
+-112,-529,491,0,-101,96
+-213,-521,0,0,-186,177
+-213,-521,0,0,-186,177
+-157,-521,0,0,-139,133
+-157,-521,0,0,-139,133
+-123,-521,0,0,-104,99
+-123,-521,0,0,-104,99
+-89,-521,500,0,-78,74
+-89,-521,500,0,-78,74
+-191,-512,0,0,-169,161
+-191,-512,0,0,-169,161
+-146,-512,0,0,-126,120
+-146,-512,0,0,-126,120
+-112,-512,0,0,-95,90
+-112,-512,0,0,-95,90
+-78,-512,0,0,-71,68
+-78,-512,0,0,-71,68
+-56,-512,0,0,-53,51
+-56,-512,0,0,-53,51
+-44,-512,0,0,-40,38
+-44,-512,0,0,-40,38
+-33,-512,0,0,-30,28
+-33,-512,0,0,-30,28
+-134,-504,504,0,-132,126
+-134,-504,0,0,-132,126
+-112,-504,0,0,-99,94
+-112,-504,0,0,-99,94
+-78,-504,0,0,-74,71
+-78,-504,0,0,-74,71
+-56,-504,0,0,-56,53
+-56,-504,0,0,-56,53
+-44,-504,0,0,-42,40
+-44,-504,0,0,-42,40
+-33,-504,0,0,-31,30
+-33,-504,0,0,-31,30
+-22,-504,0,0,-23,22
+-22,-504,0,0,-23,22
+-11,-504,0,0,-17,16
+-11,-504,0,0,-17,16
+-11,-504,0,0,-13,12
+-11,-504,0,0,-13,12
+-11,-504,0,0,-9,9
+-11,-504,0,0,-9,9
+0,-504,0,0,-7,7
+0,-504,0,0,-7,7
+0,-504,0,0,-5,5
+0,-504,0,0,-5,5
+0,-504,0,0,-4,4
+0,-504,0,0,-4,4
+0,-504,0,0,-3,3
+0,-504,0,0,-3,3
+0,-504,0,0,-2,2
+0,-504,0,0,-2,2
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,0,0
+0,-504,-509,0,0,0
+89,-512,0,0,109,-104
+89,-512,0,0,109,-104
+78,-512,0,0,82,-78
+78,-512,0,0,82,-78
+56,-512,0,0,61,-58
+56,-512,0,0,61,-58
+44,-512,0,0,46,-43
+44,-512,0,0,46,-43
+33,-512,0,0,34,-32
+33,-512,0,0,34,-32
+22,-512,0,0,25,-24
+22,-512,0,0,25,-24
+11,-512,0,0,19,-18
+11,-512,0,0,19,-18
+11,-512,0,0,14,-13
+11,-512,0,0,14,-13
+0,-512,0,0,10,-10
+0,-512,0,0,10,-10
+0,-512,0,0,8,-7
+0,-512,0,0,8,-7
+0,-512,0,0,6,-5
+0,-512,0,0,6,-5
+0,-512,0,0,4,-4
+0,-512,0,0,4,-4
+0,-512,0,0,3,-3
+0,-512,0,0,3,-3
+0,-512,0,0,2,-2
+0,-512,0,0,2,-2
+0,-512,0,0,1,-1
+0,-512,0,0,1,-1
+0,-512,0,0,1,-1
+0,-512,0,0,1,-1
+0,-512,0,0,1,-1
+0,-512,0,0,1,-1
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,0,0,0,0
+0,-512,491,0,0,0
+-89,-504,0,0,-110,104
+-89,-504,0,0,-110,104
+-89,-504,0,0,-82,78
+-89,-504,0,0,-82,78
+-67,-504,0,0,-62,59
+-67,-504,0,0,-62,59
+-44,-504,0,0,-46,44
+-44,-504,0,0,-46,44
+-33,-504,0,0,-34,33
+-33,-504,0,0,-34,33
+-22,-504,0,0,-26,24
+-22,-504,0,0,-26,24
+-22,-504,0,0,-19,18
+-22,-504,0,0,-19,18
+-11,-504,0,0,-14,14
+-11,-504,0,0,-14,14
+-11,-504,0,0,-11,10
+-11,-504,0,0,-11,10
+0,-504,0,0,-8,7
+0,-504,0,0,-8,7
+0,-504,0,0,-6,5
+0,-504,0,0,-6,5
+0,-504,0,0,-4,4
+0,-504,0,0,-4,4
+0,-504,0,0,-3,3
+0,-504,0,0,-3,3
+0,-504,0,0,-2,2
+0,-504,0,0,-2,2
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,-1,1
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+0,-504,0,0,0,0
+
+
+第二组
+179,-59,-504,-392,187,-571
+146,-67,-1487,-385,154,-533
+146,-67,-1487,-385,154,-533
+247,-101,-508,-359,252,-599
+247,-101,-2016,-359,252,-599
+326,-134,-2016,-332,333,-649
+326,-134,-501,-332,333,-649
+269,-143,-501,-325,280,-592
+269,-143,-504,-325,280,-592
+236,-151,-1508,-318,242,-549
+236,-151,-1508,-318,242,-549
+326,-176,-502,-298,329,-612
+326,-176,-502,-298,329,-612
+382,-193,-500,-285,392,-659
+382,-193,-500,-285,392,-659
+326,-202,-492,-278,336,-599
+326,-202,-504,-278,336,-599
+292,-210,-504,-271,296,-554
+292,-210,-2038,-271,296,-554
+382,-244,-2038,-244,389,-615
+382,-244,-492,-244,389,-615
+337,-252,-1528,-238,345,-566
+337,-252,-1528,-238,345,-566
+427,-277,0,-217,427,-625
+427,-277,0,-217,427,-625
+371,-286,-512,-211,380,-573
+371,-286,-1505,-211,380,-573
+461,-311,-1505,-191,461,-630
+461,-311,-503,-191,461,-630
+404,-319,-503,-184,413,-577
+404,-319,0,-184,413,-577
+303,-319,-2014,-184,261,-433
+303,-319,-2014,-184,261,-433
+382,-361,-503,-150,393,-525
+382,-361,-503,-150,393,-525
+292,-361,0,-150,255,-393
+292,-361,-501,-150,255,-393
+258,-370,-501,-144,269,-400
+258,-370,-502,-144,269,-400
+281,-378,-502,-137,281,-405
+281,-378,-1232,-137,281,-405
+371,-403,-650,-117,406,-503
+371,-403,-650,-117,406,-503
+382,-412,0,-110,391,-482
+382,-412,0,-110,391,-482
+281,-412,0,-110,264,-362
+281,-412,0,-110,264,-362
+281,-420,-680,-103,286,-376
+281,-420,-504,-103,286,-376
+303,-428,-504,-96,305,-387
+303,-428,0,-96,305,-387
+202,-428,0,-96,203,-290
+202,-428,-490,-96,203,-290
+236,-437,-513,-90,244,-322
+236,-437,-513,-90,244,-322
+337,-454,-499,-76,383,-442
+337,-454,-499,-76,383,-442
+258,-454,0,-76,267,-331
+258,-454,-541,-76,267,-331
+292,-462,-541,-70,297,-353
+292,-462,-503,-70,297,-353
+314,-470,-503,-63,322,-370
+314,-470,0,-63,322,-370
+224,-470,-488,-63,225,-277
+224,-470,-488,-63,225,-277
+258,-479,0,-56,269,-313
+258,-479,0,-56,269,-313
+303,-487,-473,-49,304,-339
+303,-487,0,-49,304,-339
+213,-487,0,-49,215,-254
+213,-487,-503,-49,215,-254
+258,-496,-503,-43,265,-296
+258,-496,0,-43,265,-296
+179,-496,0,-43,187,-222
+179,-496,0,-43,187,-222
+123,-496,0,-43,129,-166
+123,-496,0,-43,129,-166
+89,-504,-475,-36,92,-124
+89,-504,0,-36,92,-124
+56,-504,0,-36,60,-93
+56,-504,0,-36,60,-93
+33,-504,0,-36,35,-70
+33,-504,0,-36,35,-70
+11,-504,0,-36,17,-52
+11,-504,0,-36,17,-52
+0,-504,0,-36,3,-39
+0,-504,0,-36,3,-39
+22,-504,0,0,31,-29
+22,-504,0,0,31,-29
+22,-504,0,0,23,-22
+22,-504,0,0,23,-22
+11,-504,0,0,17,-16
+11,-504,0,0,17,-16
+11,-504,0,0,13,-12
+11,-504,0,0,13,-12
+0,-504,0,0,9,-9
+0,-504,0,0,9,-9
+0,-504,0,0,7,-7
+0,-504,543,0,7,-7
+-89,-496,543,0,-104,99
+-89,-496,0,0,-104,99
+-89,-496,0,0,-78,74
+-89,-496,0,0,-78,74
+-67,-496,505,0,-58,56
+-67,-496,505,0,-58,56
+-168,-487,0,-49,-206,147
+-168,-487,0,-49,-206,147
+-191,-487,0,-49,-168,110
+-191,-487,0,-49,-168,110
+-157,-487,0,-49,-139,82
+-157,-487,507,-49,-139,82
+-258,-479,507,-56,-234,167
+-258,-479,0,-56,-234,167
+-224,-479,0,-56,-191,125
+-224,-479,0,-56,-191,125
+-179,-479,502,-56,-158,93
+-179,-479,502,-56,-158,93
+-281,-470,0,-63,-250,175
+-281,-470,0,-63,-250,175
+-236,-470,0,-63,-204,131
+-236,-470,496,-63,-204,131
+-337,-462,496,-70,-287,203
+-337,-462,0,-70,-287,203
+-269,-462,0,-70,-234,152
+-269,-462,511,-70,-234,152
+-371,-454,0,-76,-311,219
+-371,-454,0,-76,-311,219
+-303,-454,0,-76,-253,164
+-303,-454,0,-76,-253,164
+-247,-454,0,-76,-210,123
+-247,-454,498,-76,-210,123
+-348,-445,498,-83,-295,197
+-348,-445,0,-83,-295,197
+-281,-445,0,-83,-243,148
+-281,-445,489,-83,-243,148
+-382,-437,0,-90,-321,216
+-382,-437,0,-90,-321,216
+-314,-437,0,-90,-264,162
+-314,-437,0,-90,-264,162
+-258,-437,0,-90,-222,121
+-258,-437,0,-90,-222,121
+-224,-437,0,-90,-190,91
+-224,-437,494,-90,-190,91
+-326,-428,494,-96,-283,173
+-326,-428,0,-96,-283,173
+-281,-428,0,-96,-238,130
+-281,-428,0,-96,-238,130
+-236,-428,0,-96,-204,97
+-236,-428,0,-96,-204,97
+-213,-428,0,-96,-178,73
+-213,-428,0,-96,-178,73
+-191,-428,0,-96,-159,54
+-191,-428,0,-96,-159,54
+-168,-428,0,-96,-145,41
+-168,-428,0,-96,-145,41
+-157,-428,0,-96,-134,30
+-157,-428,0,-96,-134,30
+-146,-428,0,-96,-126,23
+-146,-428,0,-96,-126,23
+-134,-428,0,-96,-120,17
+-134,-428,0,-96,-120,17
+-134,-428,0,-96,-115,13
+-134,-428,0,-96,-115,13
+-236,-428,0,-96,-112,9
+-236,-428,0,-96,-112,9
+-337,-428,0,-96,-109,7
+-337,-428,0,-96,-109,7
+-359,-428,0,-96,-107,5
+-359,-428,0,-96,-107,5
+-359,-428,0,-96,-106,4
+-359,-428,0,-96,-106,4
+-359,-437,-515,-90,12,-101
+-359,-437,0,-90,12,-101
+-359,-437,0,-90,-14,-76
+-359,-437,0,-90,-14,-76
+-359,-437,0,-90,-34,-57
+-359,-437,0,-90,-34,-57
+-359,-437,0,-90,-49,-42
+-359,-437,0,-90,-49,-42
+-359,-437,0,-90,-60,-32
+-359,-437,0,-90,-60,-32
+-359,-437,0,-90,-69,-24
+-359,-437,0,-90,-69,-24
+-359,-437,0,-90,-75,-18
+-359,-437,0,-90,-75,-18
+-359,-437,0,-90,-80,-13
+-359,-437,0,-90,-80,-13
+-359,-437,0,-90,-84,-10
+-359,-437,0,-90,-84,-10
+-416,-437,0,-90,-86,-7
+-416,-437,0,-90,-86,-7
+-416,-437,0,-90,-88,-5
+-416,-437,0,-90,-88,-5
+-416,-437,0,-90,-90,-4
+-416,-437,0,-90,-90,-4
+-416,-437,0,-90,-91,-3
+-416,-437,0,-90,-91,-3
+-416,-437,0,-90,-92,-2
+-416,-437,0,-90,-92,-2
+-416,-437,0,-90,-92,-1
+-416,-437,0,-90,-92,-1
+-416,-445,-520,-83,23,-106
+-416,-445,0,-83,23,-106
+-416,-445,0,-83,-3,-79
+-416,-445,0,-83,-3,-79
+-416,-445,0,-83,-24,-59
+-416,-445,0,-83,-24,-59
+-416,-445,0,-83,-40,-44
+-416,-445,0,-83,-40,-44
+-416,-445,0,-83,-52,-33
+-416,-445,0,-83,-52,-33
+-416,-445,0,-83,-61,-25
+-416,-445,0,-83,-61,-25
+-416,-445,0,-83,-67,-18
+-416,-445,0,-83,-67,-18
+-416,-445,0,-83,-72,-14
+-416,-445,0,-83,-72,-14
+-416,-445,0,-83,-76,-10
+-416,-445,0,-83,-76,-10
+-472,-445,0,-83,-79,-7
+-472,-445,0,-83,-79,-7
+-472,-445,0,-83,-81,-5
+-472,-445,0,-83,-81,-5
+-472,-445,0,-83,-82,-4
+-472,-445,0,-83,-82,-4
+-472,-445,0,-83,-84,-3
+-472,-445,0,-83,-84,-3
+-472,-445,0,-83,-85,-2
+-472,-445,0,-83,-85,-2
+-472,-445,0,-83,-85,-1
+-472,-445,0,-83,-85,-1
+-472,-445,0,-83,-86,-1
+-472,-445,0,-83,-86,-1
+-472,-445,0,-83,-86,-1
+-472,-445,0,-83,-86,-1
+-472,-445,0,-83,-86,0
+-472,-445,0,-83,-86,0
+-539,-445,0,-83,-87,0
+-539,-445,0,-83,-87,0
+-539,-445,494,-83,-87,0
+-539,-445,494,-83,-87,0
+-539,-437,0,-90,-204,104
+-539,-437,0,-90,-204,104
+-539,-437,0,-90,-177,78
+-539,-437,0,-90,-177,78
+-539,-437,0,-90,-156,58
+-539,-437,0,-90,-156,58
+-539,-437,0,-90,-141,44
+-539,-437,0,-90,-141,44
+-539,-437,0,-90,-129,33
+-539,-437,0,-90,-129,33
+-539,-437,0,-90,-120,24
+-539,-437,0,-90,-120,24
+-539,-437,0,-90,-114,18
+-539,-437,0,-90,-114,18
+-539,-437,0,-90,-109,13
+-539,-437,0,-90,-109,13
+-539,-437,0,-90,-105,10
+-539,-437,0,-90,-105,10
+-596,-437,0,-90,-103,7
+-596,-437,0,-90,-103,7
+-596,-437,0,-90,-100,5
+-596,-437,0,-90,-100,5
+-596,-437,0,-90,-99,4
+-596,-437,0,-90,-99,4
+-596,-437,0,-90,-98,3
+-596,-437,0,-90,-98,3
+-596,-437,0,-90,-97,2
+-596,-437,0,-90,-97,2
+-596,-437,0,-90,-96,1
+-596,-437,0,-90,-96,1
+-596,-437,0,-90,-96,1
+-596,-437,0,-90,-96,1
+-596,-437,0,-90,-95,1
+-596,-437,0,-90,-95,1
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-95,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,0,-90,-94,0
+-596,-437,-499,-90,-94,0
+-596,-445,-499,-83,22,-104
+-596,-445,0,-83,22,-104
+-596,-445,0,-83,-5,-78
+-596,-445,-503,-83,-5,-78
+-494,-454,0,-76,91,-164
+-494,-454,0,-76,91,-164
+-393,-454,0,-76,48,-123
+-393,-454,0,-76,48,-123
+-292,-454,0,-76,16,-92
+-292,-454,0,-76,16,-92
+-191,-454,0,-76,-7,-69
+-191,-454,0,-76,-7,-69
+-89,-454,0,-76,-26,-51
+-89,-454,0,-76,-26,-51
+-44,-454,0,-76,-39,-38
+-44,-454,-653,-76,-39,-38
+44,-462,0,-70,67,-134
+44,-462,0,-70,67,-134
+146,-470,-498,-63,149,-205
+146,-470,-498,-63,149,-205
+89,-470,0,-63,95,-154
+89,-470,-561,-63,95,-154
+168,-479,-561,-56,172,-220
+168,-479,0,-56,172,-220
+112,-479,0,-56,114,-165
+112,-479,-501,-56,114,-165
+179,-487,0,-49,188,-229
+179,-487,0,-49,188,-229
+123,-487,0,-49,128,-171
+123,-487,0,-49,128,-171
+191,-496,-468,-43,200,-233
+191,-496,0,-43,200,-233
+134,-496,0,-43,138,-175
+134,-496,0,-43,138,-175
+89,-496,0,-43,92,-131
+89,-496,0,-43,92,-131
+56,-496,0,-43,58,-98
+56,-496,0,-43,58,-98
+22,-496,0,-43,32,-74
+22,-496,0,-43,32,-74
+11,-496,0,-43,12,-55
+11,-496,-552,-43,12,-55
+112,-504,-552,-36,115,-146
+112,-504,0,-36,115,-146
+67,-504,0,-36,77,-109
+67,-504,0,-36,77,-109
+44,-504,0,-36,48,-82
+44,-504,0,-36,48,-82
+22,-504,0,-36,26,-61
+22,-504,0,-36,26,-61
+-67,-496,465,-43,-106,58
+-67,-496,0,-43,-106,58
+-101,-496,0,-43,-91,43
+-101,-496,0,-43,-91,43
+-89,-496,0,-43,-79,32
+-89,-496,0,-43,-79,32
+-78,-496,0,-43,-71,24
+-78,-496,0,-43,-71,24
+-67,-496,0,-43,-64,18
+-67,-496,0,-43,-64,18
+-67,-496,0,-43,-59,13
+-67,-496,0,-43,-59,13
+-67,-496,0,-43,-56,10
+-67,-496,502,-43,-56,10
+-157,-487,502,-49,-170,112
+-157,-487,0,-49,-170,112
+-168,-487,0,-49,-141,84
+-168,-487,0,-49,-141,84
+-134,-487,0,-49,-119,63
+-134,-487,0,-49,-119,63
+-112,-487,0,-49,-102,47
+-112,-487,542,-49,-102,47
+-213,-479,542,-56,-207,140
+-213,-479,0,-56,-207,140
+-202,-479,0,-56,-170,105
+-202,-479,0,-56,-170,105
+-168,-479,0,-56,-142,79
+-168,-479,0,-56,-142,79
+-134,-479,0,-56,-121,59
+-134,-479,0,-56,-121,59
+-123,-479,0,-56,-106,44
+-123,-479,0,-56,-106,44
+-224,-470,551,-63,-211,138
+-224,-470,0,-63,-211,138
+-202,-470,0,-63,-175,103
+-202,-470,505,-63,-175,103
+-303,-462,505,-70,-265,182
+-303,-462,0,-70,-265,182
+-258,-462,0,-70,-217,137
+-258,-462,0,-70,-217,137
+-213,-462,0,-70,-181,102
+-213,-462,0,-70,-181,102
+-179,-462,0,-70,-154,77
+-179,-462,0,-70,-154,77
+-157,-462,0,-70,-134,57
+-157,-462,0,-70,-134,57
+-134,-462,0,-70,-119,43
+-134,-462,514,-70,-119,43
+-236,-454,0,-76,-225,137
+-236,-454,0,-76,-225,137
+-337,-445,465,-83,-306,208
+-337,-445,465,-83,-306,208
+-292,-445,0,-83,-251,156
+-292,-445,0,-83,-251,156
+-247,-445,0,-83,-210,117
+-247,-445,0,-83,-210,117
+-213,-445,0,-83,-179,87
+-213,-445,0,-83,-179,87
+-179,-445,0,-83,-156,65
+-179,-445,0,-83,-156,65
+-157,-445,0,-83,-139,49
+-157,-445,0,-83,-139,49
+-258,-437,532,-90,-243,142
+-258,-437,0,-90,-243,142
+-247,-437,0,-90,-206,106
+-247,-437,0,-90,-206,106
+-213,-437,0,-90,-178,79
+-213,-437,0,-90,-178,79
+-179,-437,0,-90,-157,59
+-179,-437,0,-90,-157,59
+-168,-437,0,-90,-141,44
+-168,-437,0,-90,-141,44
+-146,-437,0,-90,-130,33
+-146,-437,0,-90,-130,33
+-134,-437,0,-90,-121,25
+-134,-437,0,-90,-121,25
+-134,-437,0,-90,-114,18
+-134,-437,0,-90,-114,18
+-123,-437,0,-90,-109,14
+-123,-437,0,-90,-109,14
+-123,-437,0,-90,-105,10
+-123,-437,0,-90,-105,10
+-224,-437,0,-90,-103,7
+-224,-437,0,-90,-103,7
+-326,-437,0,-90,-101,5
+-326,-437,0,-90,-101,5
+-359,-437,0,-90,-99,4
+-359,-437,0,-90,-99,4
+-359,-437,0,-90,-98,3
+-359,-437,0,-90,-98,3
+-359,-437,0,-90,-97,2
+-359,-437,0,-90,-97,2
+-359,-428,506,-96,-214,106
+-359,-428,506,-96,-214,106
+-359,-428,0,-96,-185,80
+-359,-428,0,-96,-185,80
+-359,-428,0,-96,-164,60
+-359,-428,0,-96,-164,60
+-359,-428,0,-96,-149,45
+-359,-428,0,-96,-149,45
+-359,-428,0,-96,-137,33
+-359,-428,0,-96,-137,33
+-359,-428,0,-96,-128,25
+-359,-428,0,-96,-128,25
+-359,-428,0,-96,-121,19
+-359,-428,0,-96,-121,19
+-359,-428,0,-96,-116,14
+-359,-428,0,-96,-116,14
+-359,-428,0,-96,-113,10
+-359,-428,0,-96,-113,10
+-416,-428,0,-96,-110,8
+-416,-428,0,-96,-110,8
+-416,-428,0,-96,-108,6
+-416,-428,0,-96,-108,6
+-416,-428,0,-96,-106,4
+-416,-428,0,-96,-106,4
+-416,-428,0,-96,-105,3
+-416,-428,0,-96,-105,3
+-416,-428,0,-96,-104,2
+-416,-428,0,-96,-104,2
+-416,-428,0,-96,-103,1
+-416,-428,0,-96,-103,1
+-416,-437,-516,-90,13,-103
+-416,-437,-516,-90,13,-103
+-416,-437,0,-90,-13,-77
+-416,-437,-500,-90,-13,-77
+-416,-445,-500,-83,83,-163
+-416,-445,0,-83,83,-163
+-416,-445,0,-83,40,-122
+-416,-445,0,-83,40,-122
+-416,-445,0,-83,8,-91
+-416,-445,0,-83,8,-91
+-416,-445,0,-83,-15,-68
+-416,-445,0,-83,-15,-68
+-416,-445,0,-83,-33,-51
+-416,-445,0,-83,-33,-51
+-416,-445,0,-83,-47,-38
+-416,-445,0,-83,-47,-38
+-416,-445,0,-83,-57,-29
+-416,-445,0,-83,-57,-29
+-416,-445,0,-83,-64,-21
+-416,-445,0,-83,-64,-21
+-416,-445,0,-83,-70,-16
+-416,-445,0,-83,-70,-16
+-472,-445,0,-83,-74,-12
+-472,-445,0,-83,-74,-12
+-472,-445,0,-83,-78,-9
+-472,-445,0,-83,-78,-9
+-472,-445,0,-83,-80,-6
+-472,-445,0,-83,-80,-6
+-472,-445,0,-83,-82,-5
+-472,-445,0,-83,-82,-5
+-472,-445,-504,-83,-83,-3
+-472,-445,-504,-83,-83,-3
+-472,-454,0,-76,32,-107
+-472,-454,0,-76,32,-107
+-472,-454,0,-76,4,-80
+-472,-454,0,-76,4,-80
+-472,-454,0,-76,-16,-60
+-472,-454,0,-76,-16,-60
+-472,-454,0,-76,-32,-45
+-472,-454,0,-76,-32,-45
+-472,-454,0,-76,-44,-34
+-472,-454,0,-76,-44,-34
+-472,-454,0,-76,-53,-25
+-472,-454,0,-76,-53,-25
+-472,-454,0,-76,-60,-19
+-472,-454,0,-76,-60,-19
+-472,-454,0,-76,-65,-14
+-472,-454,0,-76,-65,-14
+-472,-454,0,-76,-69,-10
+-472,-454,0,-76,-69,-10
+-539,-454,0,-76,-72,-8
+-539,-454,0,-76,-72,-8
+-438,-462,-505,-70,43,-111
+-438,-462,-505,-70,43,-111
+-337,-462,0,-70,13,-83
+-337,-462,0,-70,13,-83
+-236,-462,0,-70,-7,-62
+-236,-462,-504,-70,-7,-62
+-134,-470,-504,-63,92,-151
+-134,-470,0,-63,92,-151
+-33,-470,0,-63,53,-113
+-33,-470,0,-63,53,-113
+22,-470,0,-63,23,-85
+22,-470,0,-63,23,-85
+112,-479,-503,-56,118,-169
+112,-479,0,-56,118,-169
+67,-479,0,-56,73,-126
+67,-479,0,-56,73,-126
+33,-479,0,-56,40,-95
+33,-479,-489,-56,40,-95
+123,-487,0,-49,132,-176
+123,-487,0,-49,132,-176
+78,-487,0,-49,86,-132
+78,-487,0,-49,86,-132
+44,-487,0,-49,51,-99
+44,-487,0,-49,51,-99
+22,-487,0,-49,25,-74
+22,-487,-500,-49,25,-74
+112,-496,-500,-43,123,-160
+112,-496,0,-43,123,-160
+78,-496,0,-43,81,-120
+78,-496,0,-43,81,-120
+44,-496,0,-43,49,-90
+44,-496,0,-43,49,-90
+22,-496,0,-43,25,-67
+22,-496,0,-43,25,-67
+0,-496,0,-43,8,-50
+0,-496,0,-43,8,-50
+0,-496,0,-43,-5,-38
+0,-496,0,-43,-5,-38
+-11,-496,0,-43,-15,-28
+-11,-496,0,-43,-15,-28
+-22,-496,0,-43,-22,-21
+-22,-496,0,-43,-22,-21
+-33,-496,0,-43,-28,-16
+-33,-496,0,-43,-28,-16
+-33,-496,0,-43,-32,-12
+-33,-496,499,-43,-32,-12
+-134,-487,499,-49,-153,95
+-134,-487,0,-49,-153,95
+-146,-487,0,-49,-127,71
+-146,-487,0,-49,-127,71
+-123,-487,0,-49,-109,53
+-123,-487,0,-49,-109,53
+-112,-487,0,-49,-94,40
+-112,-487,0,-49,-94,40
+-89,-487,0,-49,-84,30
+-89,-487,0,-49,-84,30
+-89,-487,0,-49,-76,22
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing and comparing first and second log groups**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying stability and hold performance in first group**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Interpreting second group position and movement dynamics**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:32Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Decoding motor angle and velocity channels**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:32Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying breakaway mode causing steady-state error**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:35Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming breakaway holding at max angle**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing ball position control discrepancy**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:45Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Comparing control group performance and tuning recommendations**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Tuning breakaway and target_hold settings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:51Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing breakaway threshold trade-offs**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:54Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Comparing parameter sets for optimization**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:35:59Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing second group movement anomalies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:36:05Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Proposing second-stage PID adjustments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:36:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Assessing velocity loop tuning and position accuracy**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:36:13Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Recommending hold window adjustment for centering**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:36:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining hold position stopping behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:36:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Recommending PID tuning adjustments and ignoring ch2 spikes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:36:40Z)**_
+
+这两组里，**第一组明显更好，第二组不要用**。
+
+**先说结论**
+
+第一组已经满足你现在这版逻辑的目标了：它最后能稳定停在 `-5.04 ~ -5.12cm` 一带，误差大概 `0.38 ~ 0.46cm`，已经落在你定义的 `±0.5cm` 保持窗里。后面长时间 `ch3/ch4/ch5 -> 0`，说明“位置和速度都稳定后再进入保持”这套逻辑是生效的。
+
+第二组的问题不是 `I` 项，而是**整段太猛，末端还会被负向 breakaway 顶住**。你看它中后段反复出现：
+
+- `ch1 ≈ -4.37 ~ -4.45cm`，离 `-5.5cm` 还差 `0.9 ~ 1.1cm`
+- `ch3 ≈ -0.90 ~ -0.96`，外环还在持续要求往负方向走
+- `ch5 ≈ 0`，球实际又基本不动
+- `ch0 ≈ -5.39 / -5.96` 一直压着
+
+这不是正常收敛，是系统在“**认为还没到目标，但球又推不动，于是一直挂在 breakaway/负向补偿上**”。
+
+**第一组为什么会停在 `-5.04` 或 `-5.12`，而不是更接近 `-5.5`？**
+
+这个不是 PID 没拉过去，而是你当前的“到位定义”就是这样。
+
+现在代码里保持判定在 [Core/Inc/pid.h:146](Core/Inc/pid.h#L146)：
+
+```c
+#define TARGET_HOLD_POSITION_ENTER  0.50f
+#define TARGET_HOLD_POSITION_EXIT   0.60f
+```
+
+也就是说，只要球进入 `-5.5 ± 0.5cm`，并且速度也够小，它就允许进入最终保持。  
+所以 `-5.04cm` 相当于误差 `0.46cm`，**完全合法**，系统没有义务再继续把它推到 `-5.50`。
+
+这说明第一组现在的表现更像是：
+
+- 控制结构没问题
+- 参数也基本能用
+- 剩下是“保持窗定义偏宽”，不是“环路调不住”
+
+**第二组为什么差这么多**
+
+第二组一开始就能看出来更冲：
+
+- `ch3` 上来就是 `-392`
+- `ch5` 上来就是 `-571`
+- `ch2` 还夹着 `-1487 / -2016 / -2038`
+
+这里 `ch2` 是 MaixCAM 原始速度，本来就很脏，不要拿它判断控制品质。真正该看的是：
+
+- `ch1`：位置
+- `ch3`：位置环给的目标速度
+- `ch4`：速度环输出
+- `ch5`：本地差分速度
+
+第二组的问题是：**推进太急，到了末端又容易触发“推不动 -> breakaway 加力 -> 一动就过 -> 再拉回”的链路**。  
+尤其负向 breakaway 在 [Core/Inc/pid.h:161-165](Core/Inc/pid.h#L161) 这一组配置本来就偏猛：
+
+```c
+#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f
+#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f
+#define BREAKAWAY_ANGLE_STEP          0.5f
+#define BREAKAWAY_RAMP_TICKS          8u
+```
+
+再叠加你代码里的负方向 `×1.2` 补偿，实际能顶到接近 `-6°`，这就是你日志里反复看到 `ch0 ≈ -596` 的原因。
+
+**所以现在该怎么判断**
+
+就这两组日志看：
+
+- **第一组可用，作为当前基准**
+- **第二组不合适，太冲，也更容易卡在 breakaway 上**
+
+**下一步最值得做的不是再动速度环 I，而是二选一：**
+
+1. **如果你的目标是“稳”**
+   - 保留第一组
+   - 不要用第二组这套更猛的参数
+
+2. **如果你的目标是“停得更接近 -5.5，而不是 -5.04 / -5.12”**
+   - 不是去加 P
+   - 而是把保持窗收紧一点，比如把 [Core/Inc/pid.h:146-147](Core/Inc/pid.h#L146-L147) 改成：
+   ```c
+   #define TARGET_HOLD_POSITION_ENTER  0.35f
+   #define TARGET_HOLD_POSITION_EXIT   0.45f
+   ```
+   这样它不会那么早宣布“到位”
+
+3. **如果后面仍然会出现卡住后猛顶**
+   - 再去降负向 breakaway 的激进程度，而不是先继续动 PID：
+   ```c
+   #define BREAKAWAY_NEG_ANGLE_BASE   -2.5f
+   #define BREAKAWAY_NEG_ANGLE_MAX    -4.0f
+   #define STUCK_TICKS_REQUIRED       15u
+   ```
+
+这批数据已经说明一件很关键的事：  
+**你现在的主要矛盾，已经从“速度环 I 导致振荡”转成“最终保持窗怎么定义，以及负向 breakaway 是否太猛”。**
+
+---
+
+_**User (2026-08-02 22:39:06Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+我的意思是现在PID调节的很不稳定
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning instability explanation and tuning suggestions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Diagnosing PID instability from quantized position data**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Suggesting velocity filter and deadband tuning**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Proposing PID stability patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting PID threshold constants**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:33Z)**_
+
+我先把当前 `pid.h` 里这几个直接影响稳定性的门限再核对一下：速度滤波、卡滞补偿、保持窗、负向补偿。然后我直接给你一套该改的点。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:33Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+94	/* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
+95	#define ANGLE_LIMIT_MAX   12.0f    /* 正向最终机械保护角度 (°) */
+96	#define ANGLE_LIMIT_MIN  -12.0f    /* 反向最终机械保护角度 (°) */
+97	
+98	/* 串级控制的正常工作范围；最终机械限幅仅作为最后一级保护。 */
+99	#define POSITION_LOOP_DIRECT_DRIVE    0       /* 1: 位置环直接输出电机角度，便于单独调位置环；0: 恢复串级 PID */
+100	#define BALL_VELOCITY_CONTROL_LIMIT  8.0f  /* 进入速度环前的速度反馈限幅 (cm/s) */
+101	
+102	/* 外位置环输出的目标速度限幅 (cm/s)。
+103	 * 必须满足 限幅 ≈ 外环P × 位置半量程（0.40 × 12.5 ≈ 5.0），否则误差一超过
+104	 * 限幅/P 的距离，外环就恒定饱和，位置信息丢失，串级退化成纯调速器。
+105	 * 曾用 1.5f：外环在 |error| > 3.75cm 即饱和，球从远处滚来时目标速度恒为
+106	 * 1.5cm/s，而实际下滑速度可达 6cm/s，内环立刻输出满量程负角提前刹车，
+107	 * 球在离目标还有 10cm 处就被摁住甚至被推回，无法抵达目标。不要再调回该值。
+108	 */
+109	#define BALL_TARGET_SPEED_LIMIT       10.0f
+110	#define SPEED_LOOP_ANGLE_LIMIT        10.0f  /* 内速度环输出的正常倾角限幅 (°) */
+111	
+112	/* 内速度环积分限幅 (°)：积分项唯一职责是补偿"命令 0° 并非真正水平"的机械零点
+113	 * 偏差与滚动摩擦，因此上限取略小于正常倾角限幅，避免积分独自吃满整个工作范围。
+114	 */
+115	#define SPEED_LOOP_I_LIMIT            2.5f
+116	
+117	/* 外位置环积分限幅 (cm/s)：外环目前 Ki=0，故取 0 —— 配合 pid_cal_clamped()
+118	 * 可保证 iout 恒为 0，任何饱和都不会在 Ki=0 的环上留下永久偏置。
+119	 * 若将来给外环加积分，把这里改成非零上限即可。
+120	 */
+121	#define POS_LOOP_I_LIMIT              0.0f
+122	
+123	/* 倾角变化率限制：限制每个控制周期(20ms)命令角度的最大变化量，
+124	 * 仅用于避免相邻周期从 +限幅 直接跳到 -限幅 的机械冲击，不应成为主要滞后来源。
+125	 * 1.0°/20ms = 50°/s：全量程 ±4° 换向约需 160ms，仍远快于小球动力学。
+126	 * 注意：0.15°/tick(7.5°/s) 会让 4° 命令需要 540ms 才到位，
+127	 * 相位滞后远超小球响应时间，会直接导致越过目标后无法收敛，不要再调回该值。
+128	 */
+129	#define ANGLE_SLEW_PER_TICK          1.0f
+130	
+131	/* 控制周期与本地速度估计。
+132	 * 主循环实际每 20ms 调一次控制，因此直接用位置差分 / 0.02s 估计球速。
+133	 * 位置量测比 MaixCAM 直接给出的速度更连续稳定，适合作为内环反馈。
+134	 */
+135	#define PID_CONTROL_PERIOD_S        0.02f
+136	
+137	/* 本地估计速度低通：滤波后的速度作为串级速度环的当前值。 */
+138	#define BALL_VELOCITY_FILTER_ALPHA  0.25f
+139	
+140	/* 接近目标后的稳态区。
+141	 *
+142	 * 需求改为：|位置误差| <= 0.5cm 时就停止 PID 调节。
+143	 * 为避免视觉噪声和轻微回弹导致反复进出保持区，退出门限留 0.1cm 回差，
+144	 * 即误差重新增大到 0.6cm 以上才恢复闭环。
+145	 */
+146	#define TARGET_HOLD_POSITION_ENTER  0.50f
+147	#define TARGET_HOLD_POSITION_EXIT   0.60f
+148	#define TARGET_HOLD_SPEED_LIMIT     0.25f
+149	#define TARGET_HOLD_SETTLE_TICKS    6u    /* 进入最终保持前，位置与速度需连续稳定 6 × 20ms = 120ms */
+150	
+151	/* 小球偏离目标且持续不动时，用起动倾角克服静摩擦。
+152	 *
+153	 * 不再使用固定单一的 breakaway 角。
+154	 * 现改为“分级加力”：先给一个较小起动角，若球仍不动，就每隔一段时间再加一点，
+155	 * 直到上限。这样既能在轻微卡滞时保持动作柔和，也能在重静摩擦时继续加力，避免
+156	 * 像之前那样一直卡死在固定的 -3.6° 上。
+157	 */
+158	#define STUCK_POSITION_THRESHOLD      1.0f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
+159	#define STUCK_POSITION_DELTA          0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
+160	#define STUCK_TICKS_REQUIRED          10u     /* 连续 10 × 20ms = 200ms 不动后进入 breakaway */
+161	#define BREAKAWAY_POS_ANGLE_BASE      2.0f    /* 正向起动角初值 (°) */
+162	#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
+163	#define BREAKAWAY_POS_ANGLE_MAX       4.0f    /* 正向起动角上限 (°) */
+164	#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
+165	#define BREAKAWAY_ANGLE_STEP          0.5f    /* 每次加力的步长 (°) */
+166	#define BREAKAWAY_RAMP_TICKS          8u      /* 每 8 × 20ms = 160ms 仍不动则再加一级 */
+167	#define BREAKAWAY_RELEASE_DISTANCE    0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
+168	
+169	extern float Y;
+170	extern float Y_last;
+171	
+172	/* 小球目标位置，单位 cm，坐标系与 Y 保持一致；可在运行中随时更新。 */
+173	extern volatile float ball_target_y;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:39:33Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Inc\pid.h` pattern `BALL_VELOCITY_FILTER_ALPHA|STUCK_POSITION_THRESHOLD|BREAKAWAY_NEG_ANGLE_BASE|BREAKAWAY_NEG_ANGLE_MAX|ANGLE_SLEW_PER_TICK|TARGET_HOLD_POSITION_ENTER|TARGET_HOLD_SPEED_LIMIT`
+
+```text
+129:#define ANGLE_SLEW_PER_TICK          1.0f
+138:#define BALL_VELOCITY_FILTER_ALPHA  0.25f
+146:#define TARGET_HOLD_POSITION_ENTER  0.50f
+148:#define TARGET_HOLD_SPEED_LIMIT     0.25f
+158:#define STUCK_POSITION_THRESHOLD      1.0f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
+162:#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
+164:#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
+```
+</details></tool-use>
+
+---
+
+_**User (2026-08-02 22:39:42Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-02 22:40:14Z)**_
+
+<ide_selection>The user selected the lines 158 to 168 from d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h:
+#define STUCK_POSITION_THRESHOLD      1.0f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
+#define STUCK_POSITION_DELTA          0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
+#define STUCK_TICKS_REQUIRED          10u     /* 连续 10 × 20ms = 200ms 不动后进入 breakaway */
+#define BREAKAWAY_POS_ANGLE_BASE      2.0f    /* 正向起动角初值 (°) */
+#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
+#define BREAKAWAY_POS_ANGLE_MAX       4.0f    /* 正向起动角上限 (°) */
+#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
+#define BREAKAWAY_ANGLE_STEP          0.5f    /* 每次加力的步长 (°) */
+#define BREAKAWAY_RAMP_TICKS          8u      /* 每 8 × 20ms = 160ms 仍不动则再加一级 */
+#define BREAKAWAY_RELEASE_DISTANCE    0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
+
+
+This may or may not be related to the current task.</ide_selection>
+
+我觉得没必要写这些
+#define STUCK_POSITION_THRESHOLD      1.0f    /* 仅在距目标 |error| > 0.6 cm 时检测卡滞并启用起动倾角，避免 0.6~1.0cm 区间卡死 */
+#define STUCK_POSITION_DELTA          0.03f   /* 单控制周期内、相对目标的位置变化阈值 (cm) */
+#define STUCK_TICKS_REQUIRED          10u     /* 连续 10 × 20ms = 200ms 不动后进入 breakaway */
+#define BREAKAWAY_POS_ANGLE_BASE      2.0f    /* 正向起动角初值 (°) */
+#define BREAKAWAY_NEG_ANGLE_BASE     -3.0f    /* 负向起动角初值 (°)，后续再 ×1.2 */
+#define BREAKAWAY_POS_ANGLE_MAX       4.0f    /* 正向起动角上限 (°) */
+#define BREAKAWAY_NEG_ANGLE_MAX      -5.0f    /* 负向起动角上限 (°)，后续再 ×1.2 */
+#define BREAKAWAY_ANGLE_STEP          0.5f    /* 每次加力的步长 (°) */
+#define BREAKAWAY_RAMP_TICKS          8u      /* 每 8 × 20ms = 160ms 仍不动则再加一级 */
+#define BREAKAWAY_RELEASE_DISTANCE    0.25f   /* 向目标累计移动该距离后退出起动补偿 (cm) */
+
+你把他们删了看一下·
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning removal of breakaway code**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning breakaway logic removal in pid.c**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:30Z)**_
+
+我直接把这套 `breakaway / stuck` 补偿从控制链里拿掉，保留最基本的串级 PID，再编译验证。这样能把“额外的强制加力”影响先彻底排除掉。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:30Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `breakaway|stuck_ticks|STUCK_|BREAKAWAY_`
+
+```text
+756:	static float breakaway_start_error = 0.0f;
+757:	static float breakaway_angle = 0.0f;
+758:	static uint8_t stuck_ticks = 0u;
+759:	static uint8_t breakaway_ramp_ticks = 0u;
+760:	static bool breakaway_active = false;
+786:			stuck_ticks = 0u;
+787:			breakaway_ramp_ticks = 0u;
+788:			breakaway_active = false;
+789:			breakaway_angle = 0.0f;
+799:			stuck_ticks = 0u;
+800:			breakaway_ramp_ticks = 0u;
+801:			breakaway_active = false;
+802:			breakaway_angle = 0.0f;
+815:		stuck_ticks = 0u;
+816:		breakaway_ramp_ticks = 0u;
+817:		breakaway_active = false;
+818:		breakaway_angle = 0.0f;
+869:		 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+871:		stuck_ticks = 0u;
+872:		breakaway_ramp_ticks = 0u;
+873:		breakaway_active = false;
+874:		breakaway_angle = 0.0f;
+923:	 * breakaway 现改为“分级加力”：
+924:	 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+925:	 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+926:	 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+930:	if(breakaway_active) {
+931:		if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+932:		   (breakaway_start_error < 0.0f &&
+933:		    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+934:		   (breakaway_start_error > 0.0f &&
+935:		    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+936:			breakaway_active = false;
+937:			breakaway_angle = 0.0f;
+938:			breakaway_ramp_ticks = 0u;
+939:		} else if(position_delta > -STUCK_POSITION_DELTA &&
+940:		          position_delta < STUCK_POSITION_DELTA) {
+941:			if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+942:				breakaway_ramp_ticks++;
+944:				breakaway_ramp_ticks = 0u;
+945:				if(breakaway_start_error < 0.0f) {
+946:					breakaway_angle += BREAKAWAY_ANGLE_STEP;
+947:					if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+948:						breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+951:					breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+952:					if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+953:						breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+958:			breakaway_ramp_ticks = 0u;
+960:		stuck_ticks = 0u;
+961:	} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+962:	          position_delta > -STUCK_POSITION_DELTA &&
+963:	          position_delta < STUCK_POSITION_DELTA) {
+964:		if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+965:			stuck_ticks++;
+967:		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+968:			breakaway_start_error = relative_y;
+969:			breakaway_active = true;
+970:			breakaway_ramp_ticks = 0u;
+971:			breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+974:		stuck_ticks = 0u;
+981:	/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+986:	if(breakaway_active) {
+998:	// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+1000:	if(breakaway_active) {
+1001:		if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+1002:			cmd_angle = breakaway_angle;
+1003:		} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+1004:			cmd_angle = breakaway_angle;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:30Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+748		motor_command_pulses = target_pulses;
+749	}
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755	#if !POSITION_LOOP_DIRECT_DRIVE
+756		static float breakaway_start_error = 0.0f;
+757		static float breakaway_angle = 0.0f;
+758		static uint8_t stuck_ticks = 0u;
+759		static uint8_t breakaway_ramp_ticks = 0u;
+760		static bool breakaway_active = false;
+761	#endif
+762		static bool control_initialized = false;
+763		static bool target_hold_active = false;
+764		static uint8_t target_hold_settle_ticks = 0u;
+765	
+766		if(!g_pid_segment_initialized) {
+767			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+768			g_pid_segment = PID_SEGMENT_TO_POS_56;
+769			g_pid_segment_initialized = true;
+770		}
+771	
+772		Y = ball_error;  // 视觉小球绝对位置
+773	
+774		/* 分段状态机：
+775		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+776		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+777		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+778		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+779			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+780				pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+781				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+782				control_initialized = false;
+783				target_hold_active = false;
+784				target_hold_settle_ticks = 0u;
+785	#if !POSITION_LOOP_DIRECT_DRIVE
+786				stuck_ticks = 0u;
+787				breakaway_ramp_ticks = 0u;
+788				breakaway_active = false;
+789				breakaway_angle = 0.0f;
+790	#endif
+791			}
+792		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+793			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+794				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+795				control_initialized = false;
+796				target_hold_active = false;
+797				target_hold_settle_ticks = 0u;
+798	#if !POSITION_LOOP_DIRECT_DRIVE
+799				stuck_ticks = 0u;
+800				breakaway_ramp_ticks = 0u;
+801				breakaway_active = false;
+802				breakaway_angle = 0.0f;
+803	#endif
+804			}
+805		}
+806	
+807		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+808		float target_y = ball_target_get();
+809		float relative_y = Y - target_y;
+810		bool target_changed = !control_initialized || target_y != target_y_last;
+811	
+812		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+813		if(target_changed) {
+814	#if !POSITION_LOOP_DIRECT_DRIVE
+815			stuck_ticks = 0u;
+816			breakaway_ramp_ticks = 0u;
+817			breakaway_active = false;
+818			breakaway_angle = 0.0f;
+819	#endif
+820			target_hold_active = false;
+821			target_hold_settle_ticks = 0u;
+822			relative_y_last = relative_y;
+823			target_y_last = target_y;
+824			control_initialized = true;
+825		}
+826	
+827		float position_delta = relative_y - relative_y_last;
+828		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+829	
+830		/* 内环速度反馈改为本地位置差分速度。
+831		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+832		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+833		 */
+834		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+835		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+836		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+837	
+838		/* 最终保持只在第二段完成后生效。
+839		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+840		 *
+841		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+842		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+843		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+844			if(target_hold_active) {
+845				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+846					target_hold_active = false;
+847					target_hold_settle_ticks = 0u;
+848				}
+849			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+850			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+851				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+852					target_hold_settle_ticks++;
+853				}
+854				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+855					target_hold_active = true;
+856				}
+857			} else {
+858				target_hold_settle_ticks = 0u;
+859			}
+860		} else {
+861			target_hold_active = false;
+862			target_hold_settle_ticks = 0u;
+863		}
+864	
+865		if(target_hold_active) {
+866			/* 进入误差保持区后，只停止位置环继续推球：
+867			 *   1) 外环目标速度稍后压到 0；
+868			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+869			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+870	#if !POSITION_LOOP_DIRECT_DRIVE
+871			stuck_ticks = 0u;
+872			breakaway_ramp_ticks = 0u;
+873			breakaway_active = false;
+874			breakaway_angle = 0.0f;
+875	#endif
+876		}
+877	
+878		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+879		pidY.target = 0.0f;
+880		pidY.now = relative_y;
+881		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+882		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+883		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+884		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+885		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+886		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+887		                POS_LOOP_I_LIMIT);
+888		if(target_hold_active) {
+889			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+890			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+891			 */
+892			pidY.out = 0.0f;
+893		}
+894	
+895		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+896		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+897		 */
+898		float control_velocity = estimated_velocity;
+899		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+900			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+901		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+902			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+903		}
+904		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+905		                         (control_velocity - pidY_filtered_velocity);
+906	
+907	#if POSITION_LOOP_DIRECT_DRIVE
+908		/* 单环调试模式：位置环直接输出平台倾角。
+909		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+910		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+911		pidY_velocity_damping = 0.0f;
+912		pidY_Speed.target = 0.0f;
+913		pidY_Speed.now = pidY_filtered_velocity;
+914		pidY_Speed.out = 0.0f;
+915		pidY_Speed.pout = 0.0f;
+916		pidY_Speed.iout = 0.0f;
+917		pidY_Speed.dout = 0.0f;
+918	
+919		float cmd_angle = pidY.out;
+920	#else
+921		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+922		 *
+923		 * breakaway 现改为“分级加力”：
+924		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+925		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+926		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+927		 *
+928		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+929		 */
+930		if(breakaway_active) {
+931			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+932			   (breakaway_start_error < 0.0f &&
+933			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+934			   (breakaway_start_error > 0.0f &&
+935			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+936				breakaway_active = false;
+937				breakaway_angle = 0.0f;
+938				breakaway_ramp_ticks = 0u;
+939			} else if(position_delta > -STUCK_POSITION_DELTA &&
+940			          position_delta < STUCK_POSITION_DELTA) {
+941				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+942					breakaway_ramp_ticks++;
+943				} else {
+944					breakaway_ramp_ticks = 0u;
+945					if(breakaway_start_error < 0.0f) {
+946						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+947						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+948							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+949						}
+950					} else {
+951						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+952						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+953							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+954						}
+955					}
+956				}
+957			} else {
+958				breakaway_ramp_ticks = 0u;
+959			}
+960			stuck_ticks = 0u;
+961		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+962		          position_delta > -STUCK_POSITION_DELTA &&
+963		          position_delta < STUCK_POSITION_DELTA) {
+964			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+965				stuck_ticks++;
+966			}
+967			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+968				breakaway_start_error = relative_y;
+969				breakaway_active = true;
+970				breakaway_ramp_ticks = 0u;
+971				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+972			}
+973		} else {
+974			stuck_ticks = 0u;
+975		}
+976	
+977		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+978		pidY_Speed.target = pidY.out;
+979		pidY_Speed.now = pidY_filtered_velocity;
+980	
+981		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+982		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+983		float iout_frozen = pidY_Speed.iout;
+984		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+985		                SPEED_LOOP_I_LIMIT);
+986		if(breakaway_active) {
+987			pidY_Speed.iout = iout_frozen;
+988			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+989			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+990				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+991			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+992				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+993			}
+994		}
+995	
+996		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+997	
+998		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+999		float cmd_angle = pidY_velocity_damping;
+1000		if(breakaway_active) {
+1001			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+1002				cmd_angle = breakaway_angle;
+1003			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+1004				cmd_angle = breakaway_angle;
+1005			}
+1006		}
+1007	#endif
+1008	
+1009		// 负方向（下降）机构补偿 ×1.2。
+1010		if(cmd_angle < 0.0f) {
+1011			cmd_angle *= 1.2f;
+1012		}
+1013	
+1014		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+1015		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+1016		static float cmd_angle_last = 0.0f;
+1017		{
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:49Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning removal of breakaway logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:49Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning targeted removal of breakaway code**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:40:50Z)**_
+
+我把 `breakaway / stuck` 这整套从控制里彻底拿掉，不做保留分支，直接回到“外环位置 -> 内环速度 -> 电机角度”的最基本串级链。这样这次测试能明确看到，不稳定到底是不是这套额外补偿造成的。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:41:00Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Inc\pid.h has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:41:15Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:41:28Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated. All occurrences were successfully replaced. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:41:43Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 	if(target_hold_active) {
+		/* 进入误差保持区后，只停止位置环继续推球：
+		 *   1) 外环目标速度稍后压到 0；
+		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+		 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+#if !POSITION_LOOP_DIRECT_DRIVE
+			stuck_ticks = 0u;
+			breakaway_ramp_ticks = 0u;
+			breakaway_active = false;
+			breakaway_angle = 0.0f;
+#endif
+	}
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:41:53Z)**_
+
+有一处因为前面已经删掉了 reset 分支，精确替换没命中。我把那一小段重新读出来，按当前文件状态继续清理。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:41:53Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+840			}
+841		} else {
+842			target_hold_active = false;
+843			target_hold_settle_ticks = 0u;
+844		}
+845	
+846		if(target_hold_active) {
+847			/* 进入误差保持区后，只停止位置环继续推球：
+848			 *   1) 外环目标速度稍后压到 0；
+849			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+850			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+851	#if !POSITION_LOOP_DIRECT_DRIVE
+852			stuck_ticks = 0u;
+853			breakaway_ramp_ticks = 0u;
+854			breakaway_active = false;
+855			breakaway_angle = 0.0f;
+856	#endif
+857		}
+858	
+859		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+860		pidY.target = 0.0f;
+861		pidY.now = relative_y;
+862		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+863		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+864		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+865		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+866		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+867		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+868		                POS_LOOP_I_LIMIT);
+869		if(target_hold_active) {
+870			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+871			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+872			 */
+873			pidY.out = 0.0f;
+874		}
+875	
+876		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+877		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+878		 */
+879		float control_velocity = estimated_velocity;
+880		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+881			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+882		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+883			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+884		}
+885		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+886		                         (control_velocity - pidY_filtered_velocity);
+887	
+888	#if POSITION_LOOP_DIRECT_DRIVE
+889		/* 单环调试模式：位置环直接输出平台倾角。
+890		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+891		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+892		pidY_velocity_damping = 0.0f;
+893		pidY_Speed.target = 0.0f;
+894		pidY_Speed.now = pidY_filtered_velocity;
+895		pidY_Speed.out = 0.0f;
+896		pidY_Speed.pout = 0.0f;
+897		pidY_Speed.iout = 0.0f;
+898		pidY_Speed.dout = 0.0f;
+899	
+900		float cmd_angle = pidY.out;
+901	#else
+902		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+903		 *
+904		 * breakaway 现改为“分级加力”：
+905		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+906		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+907		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+908		 *
+909		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+910		 */
+911		if(breakaway_active) {
+912			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+913			   (breakaway_start_error < 0.0f &&
+914			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+915			   (breakaway_start_error > 0.0f &&
+916			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+917				breakaway_active = false;
+918				breakaway_angle = 0.0f;
+919				breakaway_ramp_ticks = 0u;
+920			} else if(position_delta > -STUCK_POSITION_DELTA &&
+921			          position_delta < STUCK_POSITION_DELTA) {
+922				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+923					breakaway_ramp_ticks++;
+924				} else {
+925					breakaway_ramp_ticks = 0u;
+926					if(breakaway_start_error < 0.0f) {
+927						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+928						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+929							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+930						}
+931					} else {
+932						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+933						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+934							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+935						}
+936					}
+937				}
+938			} else {
+939				breakaway_ramp_ticks = 0u;
+940			}
+941			stuck_ticks = 0u;
+942		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+943		          position_delta > -STUCK_POSITION_DELTA &&
+944		          position_delta < STUCK_POSITION_DELTA) {
+945			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+946				stuck_ticks++;
+947			}
+948			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+949				breakaway_start_error = relative_y;
+950				breakaway_active = true;
+951				breakaway_ramp_ticks = 0u;
+952				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+953			}
+954		} else {
+955			stuck_ticks = 0u;
+956		}
+957	
+958		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+959		pidY_Speed.target = pidY.out;
+960		pidY_Speed.now = pidY_filtered_velocity;
+961	
+962		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+963		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+964		float iout_frozen = pidY_Speed.iout;
+965		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+966		                SPEED_LOOP_I_LIMIT);
+967		if(breakaway_active) {
+968			pidY_Speed.iout = iout_frozen;
+969			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+970			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+971				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+972			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+973				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+974			}
+975		}
+976	
+977		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+978	
+979		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+980		float cmd_angle = pidY_velocity_damping;
+981		if(breakaway_active) {
+982			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+983				cmd_angle = breakaway_angle;
+984			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+985				cmd_angle = breakaway_angle;
+986			}
+987		}
+988	#endif
+989	
+990		// 负方向（下降）机构补偿 ×1.2。
+991		if(cmd_angle < 0.0f) {
+992			cmd_angle *= 1.2f;
+993		}
+994	
+995		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+996		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+997		static float cmd_angle_last = 0.0f;
+998		{
+999			float delta = cmd_angle - cmd_angle_last;
+1000			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+1001			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+1002			cmd_angle = cmd_angle_last + delta;
+1003			cmd_angle_last = cmd_angle;
+1004		}
+1005		motor_set_angle(cmd_angle);
+1006	
+1007		relative_y_last = relative_y;
+1008		Y_last = Y;
+1009	}
+1010	
+1011	void pidout_limit_Y(pid_t *pid)
+1012	{
+1013		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+1014	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:05Z)**_
+
+现在我把这段彻底换成纯串级版本：去掉整块 breakaway 逻辑、去掉相关注释和冻结积分，只保留速度环正常输出到角度。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:10Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 	if(target_hold_active) {
+		/* 进入误差保持区后，只停止位置环继续推球：
+		 *   1) 外环目标速度稍后压到 0；
+		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+		 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+	#if !POSITION_LOOP_DIRECT_DRIVE
+			stuck_ticks = 0u;
+			breakaway_ramp_ticks = 0u;
+			breakaway_active = false;
+			breakaway_angle = 0.0f;
+	#endif
+	}
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating indentation consistency**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:22Z)**_
+
+替换没命中是缩进细节问题。我直接按刚读出来的原文继续改，不会影响别的逻辑。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:27Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 		if(target_hold_active) {
+			/* 进入误差保持区后，只停止位置环继续推球：
+			 *   1) 外环目标速度稍后压到 0；
+			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+	#if !POSITION_LOOP_DIRECT_DRIVE
+			stuck_ticks = 0u;
+			breakaway_ramp_ticks = 0u;
+			breakaway_active = false;
+			breakaway_angle = 0.0f;
+	#endif
+		}
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:48Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating file editing strategies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Considering Perl-based patch approach**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning whole-file read and rewrite**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:50Z)**_
+
+我把 `pid.c` 整体再读一遍，直接按完整文件重写这一小段，省得在局部替换上浪费时间。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:42:52Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+1	#include "pid.h"
+2	#include "Emm_V5.h"              /* ball_error、Emm_V5_Pos_Control */
+3	
+4	extern volatile float ball_velocity;  /* 视觉小球速度，定义在 main.c，中断写主循环读 */
+5	
+6	#define PULSES_PER_DEG  8.89f  /* 3200脉冲/圈，1°=8.89脉冲 */
+7	
+8	/* 上一次下发的绝对目标脉冲，仅用于 VOFA 显示和避免重复发同一目标。 */
+9	static int32_t motor_command_pulses = 0;
+10	
+11	/* 由 pid.h 的角度限幅换算成脉冲阈值（仅 pid.c 内部使用） */
+12	#define PULSE_LIMIT_MAX  (ANGLE_LIMIT_MAX * PULSES_PER_DEG)            /* 正向限幅脉冲 */
+13	#define PULSE_LIMIT_MIN  (ANGLE_LIMIT_MIN * PULSES_PER_DEG)            /* 反向限幅脉冲 */
+14	#define PULSE_DEAD_MAX   ((ANGLE_LIMIT_MAX - 2.0f) * PULSES_PER_DEG)  /* 正向死区起点（限位前2°） */
+15	#define PULSE_DEAD_MIN   ((ANGLE_LIMIT_MIN + 2.0f) * PULSES_PER_DEG)  /* 反向死区起点（限位前2°） */
+16	
+17	#define MAX_DUTY  7200    /* 旧代码需要，PWM最大占空比 */
+18	#define MOTOR_ADDR 1      /* 旧代码需要，电机地址 */
+19	#define MOTOR_POSITION_SPEED_RPM  100u   /* 串口绝对位置命令速度 */
+20	
+21	/*pid_t motorA;
+22	pid_t motorB;
+23	pid_t motorC;
+24	pid_t motorD;
+25	
+26	pid_t weizhiA;
+27	pid_t weizhiB;
+28	pid_t weizhiC;
+29	pid_t weizhiD;
+30	
+31	pid_t ServoA;
+32	pid_t ServoB;
+33	
+34	pid_t ServoA_Speed;
+35	pid_t ServoB_Speed;
+36	
+37	pid_t ServoA_Pid;
+38	pid_t ServoB_Pid;
+39	
+40	int redX_last;
+41	int redY_last;*/
+42	
+43	int redXSpeed;
+44	int redYSpeed;
+45	
+46	float Y;
+47	float Y_last;
+48	
+49	/* 目标坐标与视觉 Y 使用同一坐标系，默认回到画面中心。 */
+50	volatile float ball_target_y = 0.0f;
+51	
+52	void ball_target_set(float target_y)
+53	{
+54		ball_target_y = target_y;
+55	}
+56	
+57	float ball_target_get(void)
+58	{
+59		return ball_target_y;
+60	}
+61	
+62	pid_t pidY;
+63	pid_t pidY_Speed;
+64	float pidY_velocity_damping;
+65	float pidY_filtered_velocity = 0.0f;  /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+66	
+67	typedef enum {
+68		PID_SEGMENT_TO_POS_56 = 0,
+69		PID_SEGMENT_TO_NEG_55,
+70		PID_SEGMENT_HOLD_NEG_55,
+71	} pid_segment_t;
+72	
+73	static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+74	static bool g_pid_segment_initialized = false;
+75	
+76	static float pid_absf(float value)
+77	{
+78		return (value >= 0.0f) ? value : -value;
+79	}
+80	
+81	static void pid_apply_segment_profile(float target_y,
+82		                                  float pos_p, float pos_i, float pos_d,
+83		                                  float spd_p, float spd_i, float spd_d)
+84	{
+85		pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+86		pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+87		ball_target_set(target_y);
+88	}
+89	
+90	void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
+91	{
+92		pid->pid_mode = mode;
+93		pid->p = p;
+94		pid->i = i;
+95		pid->d = d;
+96		pid->f = f;
+97		pid->target = 0;
+98		pid->now = 0;
+99		pid->out = 0;
+100		pid->iout = 0;
+101		pid->error[0] = pid->error[1] = pid->error[2] = 0;
+102		pid->target_last = 0;
+103	}
+104	
+105	/*void motor_target_set(int spe1, int spe2)
+106	{
+107		if(spe1 >= 0)
+108		{
+109			motorA_dir = 1;
+110			motorA.target = spe1;
+111		}
+112		else
+113		{
+114			motorA_dir = 0;
+115			motorA.target = -spe1;
+116		}
+117		
+118		if(spe2 >= 0)
+119		{
+120			motorB_dir = 1;
+121			motorB.target = spe2;
+122		}
+123		else
+124		{
+125			motorB_dir = 0;
+126			motorB.target = -spe2;
+127		}
+128	}
+129	
+130	void motor_target_set_CD(int spe1, int spe2)
+131	{
+132		if(spe1 >= 0)
+133		{
+134			motorC_dir = 1;
+135			motorC.target = spe1;
+136		}
+137		else
+138		{
+139			motorC_dir = 0;
+140			motorC.target = -spe1;
+141		}
+142		
+143		if(spe2 >= 0)
+144		{
+145			motorD_dir = 1;
+146			motorD.target = spe2;
+147		}
+148		else
+149		{
+150			motorD_dir = 0;
+151			motorD.target = -spe2;
+152		}
+153	}
+154	
+155	//void Servo_target_set(int spe1, int spe2)
+156	//{
+157	//	ServoA.target = spe1;
+158	//	ServoB.target = spe2;
+159	//	
+160	//	
+161	//}
+162	
+163	void pid_control(void)
+164	{
+165		// 1.�趨Ŀ���ٶ�
+166	//	motorA.target = 50;
+167		motor_target_set(30,30);
+168		// 2.��ȡ��ǰ�Ƕ�
+169		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedA;}
+170		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+171		Encoder_count1 = 0;
+172		Encoder_count2 = 0;
+173		// 3.PID�������������
+174		pid_cal(&motorA);
+175		pid_cal(&motorB);
+176		// �������޷�
+177		pidout_limit(&motorA);
+178		pidout_limit(&motorB);
+179		// 4.PID�����ֵ ��������
+180		motorA_duty(motorA.out);
+181		motorB_duty(motorB.out);
+182	}
+183	
+184	void pid_control_speed(void)
+185	{
+186		// 1.�趨Ŀ���ٶ�
+187	//	motorA.target = 50;
+188		motor_target_set(30,30);
+189		// 2.��ȡ��ǰ�Ƕ�
+190		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedA;}
+191		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+192		Encoder_count1 = 0;
+193		Encoder_count2 = 0;
+194		// 3.PID�������������
+195		pid_cal(&motorA);
+196		pid_cal(&motorB);
+197		// �������޷�
+198		pidout_limit(&motorA);
+199		pidout_limit(&motorB);
+200		// 4.PID�����ֵ ��������
+201		motorA_duty(motorA.out);
+202		motorB_duty(motorB.out);
+203	}
+204	
+205	void pid_control_speed_CD(void)
+206	{
+207		// 1.�趨Ŀ���ٶ�
+208	//	motorA.target = 50;
+209		motor_target_set_CD(200,200);
+210		// 2.��ȡ��ǰ�Ƕ�
+211		if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+212		if(motorD_dir){motorD.now = speedD;}else{motorD.now = -speedD;}
+213	//	if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+214	//	if(motorD_dir){PositionD = (((Encoder_Timer_Overflow_D-1)*65535)+(TIM_GetCounter(TIM5)));}
+215	//	else{PositionD = -(-(Encoder_Timer_Overflow_D*65535)+(65535-TIM_GetCounter(TIM5)));}
+216		Encoder_count3	= 0;
+217		Encoder_count4 = 0;
+218		// 3.PID�������������
+219		pid_cal(&motorC);
+220		pid_cal(&motorD);
+221		// �������޷�
+222		pidout_limit(&motorC);
+223		pidout_limit(&motorD);
+224		// 4.PID�����ֵ ��������
+225		motorC_duty(motorC.out);
+226		motorD_duty(motorD.out);
+227	}
+228	
+229	void pid_control_Position_CD(int C,int D)
+230	{
+231		// 1.�趨Ŀ��λ��
+232		weizhiC.target = C;
+233		weizhiD.target = D;
+234		//2��ȡ��ǰλ��
+235		weizhiC.now = PositionC;
+236		weizhiD.now = PositionD;
+237		//pid����
+238		pid_cal(&weizhiC);
+239		pid_cal(&weizhiD);
+240		//���뵽���
+241		motorC_duty(weizhiC.out);
+242		motorD_duty(weizhiD.out);
+243		
+244	}
+245	
+246	void pid_control_Speed_Position_CD(int C,int D,int SC,int SD)
+247	{
+248		// 1.�趨Ŀ��λ��
+249		weizhiC.target = C;
+250		weizhiD.target = D;
+251		//2��ȡ��ǰλ��
+252		weizhiC.now = PositionC;
+253		weizhiD.now = PositionD;
+254		//pid����
+255		pid_cal(&weizhiC);
+256		pid_cal(&weizhiD);
+257		//�����ٶȻ�
+258		// 1.�趨Ŀ���ٶ�	
+259		if(weizhiC.out >= SC)weizhiC.out = SC;
+260		if(weizhiD.out >= SD)weizhiD.out = SD;	
+261		motor_target_set_CD(weizhiC.out,weizhiD.out);
+262		
+263		
+264		// 2.��ȡ��ǰ�ٶ�
+265		if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+266		if(motorD_dir){motorD.now = speedD;}else{motorD.now = -speedD;}
+267		// 3.PID�������������
+268		pid_cal(&motorC);
+269		pid_cal(&motorD);
+270		// �������޷�
+271		pidout_limit(&motorC);
+272		pidout_limit(&motorD);
+273		// 4.PID�����ֵ ��������
+274		if((weizhiC.target - weizhiC.now)<=10 && (weizhiC.target - weizhiC.now) >=0)
+275			motorC_duty(0);
+276		else if((weizhiC.target - weizhiC.now)>=-10 && (weizhiC.target - weizhiC.now) <= 0)
+277			motorC_duty(0);
+278		else
+279			motorC_duty(motorC.out);
+280		
+281		if((weizhiD.target - weizhiD.now)<=10 && (weizhiD.target - weizhiD.now) >=0)
+282			motorD_duty(0);
+283		else if((weizhiD.target - weizhiD.now)>=-10 && (weizhiD.target - weizhiD.now) <= 0)
+284			motorD_duty(0);
+285		else
+286			motorD_duty(motorD.out);
+287	//	else
+288	//		motorC_duty(motorC.out);
+289	//	if((weizhiD.target - weizhiC.now)>=-10 || (weizhiC.target - weizhiC.now) <= 0)
+290	//		motorD_duty(0);
+291	//	else
+292	//		motorD_duty(motorD.out);	
+293		
+294	}
+295	
+296	void pid_control_Speed_Position_AB(int A,int B,int SA,int SB)
+297	{
+298		// 1.�趨Ŀ��λ��
+299		weizhiA.target = A;
+300		weizhiB.target = B;
+301		//2��ȡ��ǰλ��
+302		weizhiA.now = PositionA;
+303		weizhiB.now = PositionB;
+304		//pid����
+305		pid_cal(&weizhiA);
+306		pid_cal(&weizhiB);
+307		//�����ٶȻ�
+308		// 1.�趨Ŀ���ٶ�	
+309		if(weizhiA.out >= SA)weizhiA.out = SA;
+310		if(weizhiB.out >= SB)weizhiB.out = SB;	
+311		motor_target_set(weizhiA.out,weizhiB.out);
+312		
+313		
+314		// 2.��ȡ��ǰ�ٶ�
+315		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedC;}
+316		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+317		// 3.PID�������������
+318		pid_cal(&motorA);
+319		pid_cal(&motorB);
+320		// �������޷�
+321		pidout_limit(&motorA);
+322		pidout_limit(&motorB);
+323		// 4.PID�����ֵ ��������
+324		if((weizhiA.target - weizhiA.now)<=10 && (weizhiA.target - weizhiA.now) >=0)
+325			motorA_duty(0);
+326		 else if((weizhiA.target - weizhiA.now)>=-10 && (weizhiA.target - weizhiA.now) <= 0)
+327			motorA_duty(0);
+328		else
+329			motorA_duty(motorA.out);
+330		
+331		if((weizhiB.target - weizhiB.now)<=10 && (weizhiB.target - weizhiB.now) >=0)
+332			motorB_duty(0);
+333		else if((weizhiB.target - weizhiB.now)>=-10 && (weizhiB.target - weizhiB.now) <= 0)
+334			motorB_duty(0);
+335		else
+336			motorB_duty(motorB.out);
+337	//	else
+338	//		motorC_duty(motorC.out);
+339	//	1if((weizhiD.target - weizhiC.now)>=-10 || (weizhiC.target - weizhiC.now) <= 0)
+340	//		motorD_duty(0);
+341	//	else
+342	//		motorD_duty(motorD.out);	
+343		
+344	}
+345	
+346	
+347	//void pid_control_X(void)
+348	//{
+349	//	redXSpeed = red_value[0] - redX_last;
+350	//	
+351	//	// 1.�趨Ŀ��λ��
+352	//	ServoA.target =  70;//rect_value[0]
+353	//	// 2.��ȡ��ǰλ��
+354	//	ServoA.now = red_value[0];
+355	////	if(ServoA.target - ServoA.now <= 1 && ServoA.target - ServoA.now >=0)
+356	////	{
+357	////		ServoA.target = ServoA.now;
+358	////	}
+359	////	if(ServoA.now - ServoA.target >= -1 && ServoA.now - ServoA.target <=0)
+360	////	{
+361	////		ServoA.target = ServoA.now;
+362	////	}
+363	//	
+364	//	// 3.PID�������������
+365	//	pid_cal(&ServoA);
+366	////	if(ServoA.out < 0)ServoA.out = -ServoA.out;
+367	//	
+368	//	// �������޷�
+369	//	pidout_Servo_limit(&ServoA);
+370	//	
+371	//	// 4.PID�����ֵ ��������
+372	//	
+373	//	ServoA_Speed.target = ServoA.out;
+374	//	
+375	//	ServoA_Speed.now = redXSpeed;
+376	
+377	//	pid_cal(&ServoA_Speed);
+378	//	pidout_Servo_limit(&ServoA_Speed);
+379	//	
+380	//	if(ServoA_Speed.out < 0)ServoA_Speed.out = -ServoA_Speed.out;	
+381	//	
+382	//	//�������pid
+383	////	Servo_SetAngleA_2(ServoA_Speed.out);
+384	//	ServoA_Pid.target = ServoA_Speed.out;
+385	//	
+386	//	ServoA_Pid.now =ServoA_Pid.now;
+387	//	
+388	//	if(ServoA_Pid.now>=ServoA_Pid.target && ServoA_Pid.target - ServoA_Pid.now > 0)ServoA_Pid.now=ServoA_Pid.target;
+389	//	if(ServoA_Pid.now<=0)ServoA_Pid.now=0;
+390	//	
+391	//	pid_cal(&ServoA_Pid);
+392	//	
+393	//	if(ServoA_Pid.out>0.1f)ServoA_Pid.out=0.1f;
+394	//	else if(ServoA_Pid.out<-0.1f)ServoA_Pid.out=-0.1f;
+395	//	
+396	//	Servo_SetAngleA_2(ServoA_Pid.now);
+397	//	
+398	//	redX_last = red_value[0];
+399	//	
+400	//}
+401	
+402	//void pid_control_X(void)
+403	//{
+404	//	redXSpeed = red_value[1] - redX_last;
+405	//	
+406	//	// 1.�趨Ŀ��λ��
+407	//	ServoA.target =  86;//rect_value[0]
+408	//	// 2.��ȡ��ǰλ��
+409	//	ServoA.now = red_value[1];
+410	////	if(ServoA.target - ServoA.now <= 1 && ServoA.target - ServoA.now >=0)
+411	////	{
+412	////		ServoA.target = ServoA.now;
+413	////	}
+414	////	if(ServoA.now - ServoA.target >= -1 && ServoA.now - ServoA.target <=0)
+415	////	{
+416	////		ServoA.target = ServoA.now;
+417	////	}
+418	//	
+419	//	// 3.PID�������������
+420	//	pid_cal(&ServoA);
+421	////	if(ServoA.out < 0)ServoA.out = -ServoA.out;
+422	//	
+423	//	// �������޷�
+424	//	pidout_Servo_limit(&ServoA);
+425	//	
+426	//	// 4.PID�����ֵ ��������
+427	////	if(ServoA.target - ServoA.now <= 10 && ServoA.target - ServoA.now >= 0)ServoA.out =0;
+428	////	if(ServoA.target - ServoA.now >= -10 && ServoA.target - ServoA.now <= 0)ServoA.out =0;
+429	//	
+430	//	
+431	////	Servo_SetAngleA_2(ServoA.out);
+432	//	
+433	//	ServoA_Speed.target = 0;
+434	//	
+435	//	ServoA_Speed.now = redXSpeed;
+436	
+437	//	pid_cal(&ServoA_Speed);
+438	//	pidout_Servo_limit(&ServoA_Speed);
+439	////	
+440	////	if(ServoA_Speed.out < 0)ServoA_Speed.out = -ServoA_Speed.out;	
+441	////	
+442	////	//�������pid
+443	//	Servo_SetAngleA_2(ServoA_Speed.out);
+444	////	ServoA_Pid.target = ServoA_Speed.out;
+445	////	
+446	////	ServoA_Pid.now =ServoA_Pid.now;
+447	////	
+448	////	if(ServoA_Pid.now>=ServoA_Pid.target && ServoA_Pid.target - ServoA_Pid.now > 0)ServoA_Pid.now=ServoA_Pid.target;
+449	////	if(ServoA_Pid.now<=0)ServoA_Pid.now=0;
+450	////	
+451	////	pid_cal(&ServoA_Pid);
+452	////	
+453	////	if(ServoA_Pid.out>0.1f)ServoA_Pid.out=0.1f;
+454	////	else if(ServoA_Pid.out<-0.1f)ServoA_Pid.out=-0.1f;
+455	////	
+456	////	Servo_SetAngleA_2(ServoA_Pid.now);
+457	////	
+458	//	redX_last = red_value[1];
+459	//	
+460	//}
+461	
+462	void pid_control_X(void)
+463	{
+464		redXSpeed = red_value[1] - redX_last;
+465		
+466		// 1.�趨Ŀ��λ��
+467		ServoA.target =  45;//rect_value[0]
+468		// 2.��ȡ��ǰλ��
+469		ServoA.now = red_value[1];
+470	//	if(ServoA.target - ServoA.now <= 1 && ServoA.target - ServoA.now >=0)
+471	//	{
+472	//		ServoA.target = ServoA.now;
+473	//	}
+474	//	if(ServoA.now - ServoA.target >= -1 && ServoA.now - ServoA.target <=0)
+475	//	{
+476	//		ServoA.target = ServoA.now;
+477	//	}
+478		
+479		// 3.PID�������������
+480		pid_cal(&ServoA);
+481	//	if(ServoA.out < 0)ServoA.out = -ServoA.out;
+482		
+483		// �������޷�
+484		pidout_Servo_limit(&ServoA);
+485		
+486		// 4.PID�����ֵ ��������
+487	//	if(ServoA.target - ServoA.now <= 3 && ServoA.target - ServoA.now >= 0)ServoA.out =0;
+488	//	if(ServoA.target - ServoA.now >= -3 && ServoA.target - ServoA.now <= 0)ServoA.out =0;
+489		
+490		
+491	//	Servo_SetAngleA_2(ServoA.out);
+492		
+493		ServoA_Speed.target = 0;//ServoA.out
+494		
+495		ServoA_Speed.now = redXSpeed;
+496	
+497		pid_cal(&ServoA_Speed);
+498		pidout_Servo_limit(&ServoA_Speed);
+499	//	
+500	//	if(ServoA.target - ServoA.now <= 3 && ServoA.target - ServoA.now >= 0)ServoA_Speed.out =0;
+501	//	if(ServoA.target - ServoA.now >= -3 && ServoA.target - ServoA.now <= 0)ServoA_Speed.out =0;
+502	//	
+503	//	//�������pid
+504		Servo_SetAngleA_2(ServoA_Speed.out);
+505	//	ServoA_Pid.target = ServoA_Speed.out;
+506	//	
+507	//	ServoA_Pid.now =ServoA_Pid.now;
+508	//	
+509	//	if(ServoA_Pid.now>=ServoA_Pid.target && ServoA_Pid.target - ServoA_Pid.now > 0)ServoA_Pid.now=ServoA_Pid.target;
+510	//	if(ServoA_Pid.now<=0)ServoA_Pid.now=0;
+511	//	
+512	//	pid_cal(&ServoA_Pid);
+513	//	
+514	//	if(ServoA_Pid.out>0.1f)ServoA_Pid.out=0.1f;
+515	//	else if(ServoA_Pid.out<-0.1f)ServoA_Pid.out=-0.1f;
+516	//	
+517	//	Servo_SetAngleA_2(ServoA_Pid.now);
+518	//	
+519		redX_last = red_value[1];
+520		
+521	}
+522	
+523	//void pid_control_Y(void)
+524	//{
+525	//	redYSpeed = red_value[1] - redY_last;
+526	//	
+527	//	// 1.�趨Ŀ��λ��
+528	//	ServoB.target =   106;//rect_value[1]
+529	//	// 2.��ȡ��ǰλ��
+530	//	ServoB.now = red_value[1];
+531	//	
+532	//	// 3.PID�������������
+533	//	pid_cal(&ServoB);
+534	////	if(ServoA.out < 0)ServoA.out = -ServoA.out;
+535	//	
+536	//	// �������޷�
+537	//	pidout_Servo_limit(&ServoB);
+538	//	
+539	//	// 4.PID�����ֵ ��������
+540	//	
+541	//	ServoB_Speed.target = ServoB.out;
+542	//	
+543	//	ServoB_Speed.now = redYSpeed;
+544	
+545	//	pid_cal(&ServoB_Speed);
+546	//	pidout_Servo_limit(&ServoB_Speed);
+547	//	
+548	//	if(ServoB_Speed.out < 0)ServoB_Speed.out = -ServoB_Speed.out;	
+549	////	Servo_SetAngleB_2(ServoB_Speed.out);
+550	
+551	//	//�������pid
+552	////	Servo_SetAngleA_2(ServoA_Speed.out);
+553	//	ServoB_Pid.target = ServoB_Speed.out;
+554	//	
+555	//	ServoB_Pid.now =ServoB_Pid.now;
+556	//	
+557	//	if(ServoB_Pid.now>=ServoB_Pid.target && ServoB_Pid.target - ServoB_Pid.now > 0)ServoB_Pid.now=ServoB_Pid.target;
+558	//	if(ServoB_Pid.now<=0)ServoB_Pid.now=0;
+559	//	
+560	//	pid_cal(&ServoB_Pid);
+561	//	
+562	//	if(ServoB_Pid.out>0.1f)ServoB_Pid.out=0.1f;
+563	//	else if(ServoB_Pid.out<-0.1f)ServoB_Pid.out=-0.1f;
+564	//	
+565	//	Servo_SetAngleB_2(ServoB_Pid.now);
+566	//	
+567	//	
+568	//	redY_last = red_value[1];
+569	//	
+570	//}
+571	
+572	void pid_control_Y(void)
+573	{
+574		redYSpeed = red_value[0] - redY_last;
+575		
+576		// 1.�趨Ŀ��λ��
+577		ServoB.target =   116;//rect_value[1]
+578		// 2.��ȡ��ǰλ��
+579		ServoB.now = red_value[0];
+580		
+581		// 3.PID�������������
+582		pid_cal(&ServoB);
+583	//	if(ServoA.out < 0)ServoA.out = -ServoA.out;
+584		
+585		// �������޷�
+586		pidout_Servo_limit(&ServoB);
+587		
+588		// 4.PID�����ֵ ��������
+589	//	if(ServoB.target - ServoB.now <= 3 && ServoB.target - ServoB.now >= 0)ServoB.out =0;
+590	//	if(ServoB.target - ServoB.now >= -3 && ServoB.target - ServoB.now <= 0)ServoB.out =0;
+591		
+592	//	Servo_SetAngleB_2(ServoB.out);
+593		
+594		ServoB_Speed.target = ServoB.out;
+595		
+596		ServoB_Speed.now = redYSpeed;
+597	
+598		pid_cal(&ServoB_Speed);
+599		pidout_Servo_limit(&ServoB_Speed);
+600	//	
+601	
+602	//	Servo_SetAngleB_2(ServoB_Speed.out);
+603	
+604	//	if(ServoB_Speed.out < 0)ServoB_Speed.out = -ServoB_Speed.out;	
+605	////	Servo_SetAngleB_2(ServoB_Speed.out);
+606	
+607	//	//�������pid
+608	////	Servo_SetAngleA_2(ServoA_Speed.out);
+609		ServoB_Pid.target = ServoB_Speed.out;
+610	//	
+611		ServoB_Pid.now =ServoB_Pid.now;
+612	//	
+613		if(ServoB_Pid.now>=ServoB_Pid.target && ServoB_Speed.out >= 0)ServoB_Pid.now=ServoB_Pid.target;
+614		if(ServoB_Pid.now<=ServoB_Pid.target && ServoB_Speed.out < 0)ServoB_Pid.now=ServoB_Pid.target;
+615	//	
+616		pid_cal(&ServoB_Pid);
+617	//	
+618		if(ServoB_Pid.out>3)ServoB_Pid.out=3;
+619		else if(ServoB_Pid.out<-3)ServoB_Pid.out=-3;
+620	//	
+621		Servo_SetAngleB_2(ServoB_Pid.now);
+622	//	
+623	//	
+624		redY_last = red_value[0];
+625	//	
+626	}
+627	*/
+628	
+629	
+630	void pid_cal(pid_t *pid)
+631	{
+632		// ���㵱ǰƫ��
+633		pid->error[0] = pid->target - pid->now;
+634	
+635		// �������
+636		if(pid->pid_mode == DELTA_PID)  // ����ʽ
+637		{
+638			pid->pout = pid->p * (pid->error[0] - pid->error[1]);
+639			pid->iout = pid->i * pid->error[0];
+640			pid->dout = pid->d * (pid->error[0] - 2 * pid->error[1] + pid->error[2]);
+641			pid->fout = pid->f * (pid->target - pid->target_last);
+642			pid->target_last = pid->target;
+643			pid->out += pid->pout + pid->iout + pid->dout + pid->fout;
+644		}
+645		else if(pid->pid_mode == POSITION_PID)  // λ��ʽ
+646		{
+647			pid->pout = pid->p * pid->error[0];
+648			pid->iout += pid->i * pid->error[0];
+649			pid->dout = pid->d * (pid->error[0] - pid->error[1]);
+650			pid->out = pid->pout + pid->iout + pid->dout;
+651		}
+652	
+653		// ��¼ǰ����ƫ��
+654		pid->error[2] = pid->error[1];
+655		pid->error[1] = pid->error[0];
+656	
+657	//	// ����޷�
+658	//	if(pid->out>=MAX_DUTY)	
+659	//		pid->out=MAX_DUTY;
+660	//	if(pid->out<=0)	
+661	//		pid->out=0;
+662		
+663	}
+664	
+665	void pidout_limit(pid_t *pid)
+666	{
+667		PIDOUT_CLAMP(pid, 0, MAX_DUTY);
+668	}
+669	
+670	/* 带条件积分与输出限幅的位置式 PID（串级环专用）
+671	 *
+672	 * 与 PIDOUT_CLAMP 的反算抗饱和相比，本函数从不把比例项的溢出量写进 iout：
+673	 *   1. 先试算积分增量，只有「输出未饱和」或「误差方向会让积分退出饱和」时才采纳；
+674	 *   2. iout 独立限幅到 ±i_limit（i_limit=0 即彻底禁用积分，等价纯 P/PD）；
+675	 *   3. 最后只截断 out，iout 保持干净。
+676	 *
+677	 * 这样比例项可以随意撞限幅，积分状态不会被污染，不存在 Ki=0 时留下永久偏置的问题。
+678	 */
+679	static void pid_cal_clamped(pid_t *pid, float lo, float hi, float i_limit)
+680	{
+681		pid->error[0] = pid->target - pid->now;
+682	
+683		pid->pout = pid->p * pid->error[0];
+684		pid->dout = pid->d * (pid->error[0] - pid->error[1]);
+685	
+686		/* 条件积分：先看不含新增量的输出是否已经饱和到同一侧。 */
+687		if(i_limit > 0.0f) {
+688			float out_wo_new_i = pid->pout + pid->iout + pid->dout;
+689			bool sat_hi = (out_wo_new_i >= hi) && (pid->error[0] > 0.0f);
+690			bool sat_lo = (out_wo_new_i <= lo) && (pid->error[0] < 0.0f);
+691			if(!sat_hi && !sat_lo) {
+692				pid->iout += pid->i * pid->error[0];
+693				if(pid->iout >  i_limit) pid->iout =  i_limit;
+694				if(pid->iout < -i_limit) pid->iout = -i_limit;
+695			}
+696		} else {
+697			pid->iout = 0.0f;  /* 显式禁用积分，杜绝历史残留偏置 */
+698		}
+699	
+700		pid->out = pid->pout + pid->iout + pid->dout;
+701	
+702		pid->error[2] = pid->error[1];
+703		pid->error[1] = pid->error[0];
+704	
+705		/* 只截断输出，不回写 iout。 */
+706		if(pid->out > hi) pid->out = hi;
+707		if(pid->out < lo) pid->out = lo;
+708	}
+709	
+710	void pidout_Servo_limit(pid_t *pid)
+711	{
+712		PIDOUT_CLAMP(pid, -40.0f, 40.0f);
+713	}
+714	
+715	
+716	
+717	
+718	
+719	/*
+720	void pidout_limit_Y(pid_t *pid)
+721	{
+722		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+723	}
+724	*/
+725	float motor_get_command_angle(void)
+726	{
+727		return (float)motor_command_pulses / PULSES_PER_DEG;
+728	}
+729	
+730	void motor_set_angle(float target_deg)
+731	{
+732		/* PID 输出是相对上电回零点的绝对目标倾角。 */
+733		if(target_deg > ANGLE_LIMIT_MAX) target_deg = ANGLE_LIMIT_MAX;
+734		if(target_deg < ANGLE_LIMIT_MIN) target_deg = ANGLE_LIMIT_MIN;
+735	
+736		/* 驱动器绝对位置模式：+θ 为零点上方，-θ 为零点下方。 */
+737		int32_t target_pulses = (int32_t)(target_deg * PULSES_PER_DEG);
+738		if(target_pulses == motor_command_pulses) {
+739			return;
+740		}
+741	
+742		if(target_pulses >= 0) {
+743			Emm_V5_Pos_Control(MOTOR_ADDR, 0, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)target_pulses, 1, 0);
+744		} else {
+745			Emm_V5_Pos_Control(MOTOR_ADDR, 1, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)(-target_pulses), 1, 0);
+746		}
+747	
+748		motor_command_pulses = target_pulses;
+749	}
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758	
+759		if(!g_pid_segment_initialized) {
+760			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+761			g_pid_segment = PID_SEGMENT_TO_POS_56;
+762			g_pid_segment_initialized = true;
+763		}
+764	
+765		Y = ball_error;  // 视觉小球绝对位置
+766	
+767		/* 分段状态机：
+768		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+769		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+770		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+771		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+772			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+773				pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+774				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+775				control_initialized = false;
+776				target_hold_active = false;
+777				target_hold_settle_ticks = 0u;
+778			}
+779		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+780			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+781				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+782				control_initialized = false;
+783				target_hold_active = false;
+784				target_hold_settle_ticks = 0u;
+785			}
+786		}
+787	
+788		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+789		float target_y = ball_target_get();
+790		float relative_y = Y - target_y;
+791		bool target_changed = !control_initialized || target_y != target_y_last;
+792	
+793		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+794		if(target_changed) {
+795	#if !POSITION_LOOP_DIRECT_DRIVE
+796			stuck_ticks = 0u;
+797			breakaway_ramp_ticks = 0u;
+798			breakaway_active = false;
+799			breakaway_angle = 0.0f;
+800	#endif
+801			target_hold_active = false;
+802			target_hold_settle_ticks = 0u;
+803			relative_y_last = relative_y;
+804			target_y_last = target_y;
+805			control_initialized = true;
+806		}
+807	
+808		float position_delta = relative_y - relative_y_last;
+809		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+810	
+811		/* 内环速度反馈改为本地位置差分速度。
+812		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+813		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+814		 */
+815		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+816		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+817		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+818	
+819		/* 最终保持只在第二段完成后生效。
+820		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+821		 *
+822		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+823		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+824		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+825			if(target_hold_active) {
+826				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+827					target_hold_active = false;
+828					target_hold_settle_ticks = 0u;
+829				}
+830			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+831			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+832				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+833					target_hold_settle_ticks++;
+834				}
+835				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+836					target_hold_active = true;
+837				}
+838			} else {
+839				target_hold_settle_ticks = 0u;
+840			}
+841		} else {
+842			target_hold_active = false;
+843			target_hold_settle_ticks = 0u;
+844		}
+845	
+846		if(target_hold_active) {
+847			/* 进入误差保持区后，只停止位置环继续推球：
+848			 *   1) 外环目标速度稍后压到 0；
+849			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动；
+850			 *   3) 清掉 breakaway，避免近目标区还在用起动补偿。 */
+851	#if !POSITION_LOOP_DIRECT_DRIVE
+852			stuck_ticks = 0u;
+853			breakaway_ramp_ticks = 0u;
+854			breakaway_active = false;
+855			breakaway_angle = 0.0f;
+856	#endif
+857		}
+858	
+859		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+860		pidY.target = 0.0f;
+861		pidY.now = relative_y;
+862		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+863		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+864		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+865		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+866		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+867		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+868		                POS_LOOP_I_LIMIT);
+869		if(target_hold_active) {
+870			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+871			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+872			 */
+873			pidY.out = 0.0f;
+874		}
+875	
+876		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+877		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+878		 */
+879		float control_velocity = estimated_velocity;
+880		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+881			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+882		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+883			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+884		}
+885		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+886		                         (control_velocity - pidY_filtered_velocity);
+887	
+888	#if POSITION_LOOP_DIRECT_DRIVE
+889		/* 单环调试模式：位置环直接输出平台倾角。
+890		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+891		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+892		pidY_velocity_damping = 0.0f;
+893		pidY_Speed.target = 0.0f;
+894		pidY_Speed.now = pidY_filtered_velocity;
+895		pidY_Speed.out = 0.0f;
+896		pidY_Speed.pout = 0.0f;
+897		pidY_Speed.iout = 0.0f;
+898		pidY_Speed.dout = 0.0f;
+899	
+900		float cmd_angle = pidY.out;
+901	#else
+902		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+903		 *
+904		 * breakaway 现改为“分级加力”：
+905		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+906		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+907		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+908		 *
+909		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+910		 */
+911		if(breakaway_active) {
+912			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+913			   (breakaway_start_error < 0.0f &&
+914			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+915			   (breakaway_start_error > 0.0f &&
+916			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+917				breakaway_active = false;
+918				breakaway_angle = 0.0f;
+919				breakaway_ramp_ticks = 0u;
+920			} else if(position_delta > -STUCK_POSITION_DELTA &&
+921			          position_delta < STUCK_POSITION_DELTA) {
+922				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+923					breakaway_ramp_ticks++;
+924				} else {
+925					breakaway_ramp_ticks = 0u;
+926					if(breakaway_start_error < 0.0f) {
+927						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+928						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+929							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+930						}
+931					} else {
+932						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+933						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+934							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+935						}
+936					}
+937				}
+938			} else {
+939				breakaway_ramp_ticks = 0u;
+940			}
+941			stuck_ticks = 0u;
+942		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+943		          position_delta > -STUCK_POSITION_DELTA &&
+944		          position_delta < STUCK_POSITION_DELTA) {
+945			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+946				stuck_ticks++;
+947			}
+948			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+949				breakaway_start_error = relative_y;
+950				breakaway_active = true;
+951				breakaway_ramp_ticks = 0u;
+952				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+953			}
+954		} else {
+955			stuck_ticks = 0u;
+956		}
+957	
+958		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+959		pidY_Speed.target = pidY.out;
+960		pidY_Speed.now = pidY_filtered_velocity;
+961	
+962		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+963		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+964		float iout_frozen = pidY_Speed.iout;
+965		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+966		                SPEED_LOOP_I_LIMIT);
+967		if(breakaway_active) {
+968			pidY_Speed.iout = iout_frozen;
+969			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+970			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+971				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+972			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+973				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+974			}
+975		}
+976	
+977		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+978	
+979		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+980		float cmd_angle = pidY_velocity_damping;
+981		if(breakaway_active) {
+982			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+983				cmd_angle = breakaway_angle;
+984			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+985				cmd_angle = breakaway_angle;
+986			}
+987		}
+988	#endif
+989	
+990		// 负方向（下降）机构补偿 ×1.2。
+991		if(cmd_angle < 0.0f) {
+992			cmd_angle *= 1.2f;
+993		}
+994	
+995		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+996		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+997		static float cmd_angle_last = 0.0f;
+998		{
+999			float delta = cmd_angle - cmd_angle_last;
+1000			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+1001			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+1002			cmd_angle = cmd_angle_last + delta;
+1003			cmd_angle_last = cmd_angle;
+1004		}
+1005		motor_set_angle(cmd_angle);
+1006	
+1007		relative_y_last = relative_y;
+1008		Y_last = Y;
+1009	}
+1010	
+1011	void pidout_limit_Y(pid_t *pid)
+1012	{
+1013		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+1014	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:07Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning targeted code segment edits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:07Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming removal of breakaway variables**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:07Z)**_
+
+我正在把 `pid.c` 里残留的 `breakaway` 引用一并清干净，保证这次就是最纯的串级 PID。然后我直接编译。
+
+---
+
+_**User (2026-08-02 22:43:07Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-02 22:43:29Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+那你在原文件清理吧
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:40Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning code cleanup in pid.c**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:40Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Removing breakaway logic and simplifying pid.c blocks**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:41Z)**_
+
+我就在原文件里清理，不额外新建逻辑分支。目标很明确：把 `breakaway / stuck` 的残留全部删掉，只保留最基本的串级 PID 路径。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:48Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:43:57Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:44:29Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: #else
+		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+		 *
+		 * breakaway 现改为“分级加力”：
+		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+		 *
+		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+		 */
+		if(breakaway_active) {
+			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+			   (breakaway_start_error < 0.0f &&
+			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+			   (breakaway_start_error > 0.0f &&
+			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+				breakaway_active = false;
+				breakaway_angle = 0.0f;
+				breakaway_ramp_ticks = 0u;
+			} else if(position_delta > -STUCK_POSITION_DELTA &&
+			          position_delta < STUCK_POSITION_DELTA) {
+				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+					breakaway_ramp_ticks++;
+				} else {
+					breakaway_ramp_ticks = 0u;
+					if(breakaway_start_error < 0.0f) {
+						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+						}
+					} else {
+						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+						}
+					}
+				}
+			} else {
+				breakaway_ramp_ticks = 0u;
+			}
+			stuck_ticks = 0u;
+		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+		          position_delta > -STUCK_POSITION_DELTA &&
+		          position_delta < STUCK_POSITION_DELTA) {
+			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+				stuck_ticks++;
+			}
+			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+				breakaway_start_error = relative_y;
+				breakaway_active = true;
+				breakaway_ramp_ticks = 0u;
+				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+			}
+		} else {
+			stuck_ticks = 0u;
+		}
+	
+		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+		pidY_Speed.target = pidY.out;
+		pidY_Speed.now = pidY_filtered_velocity;
+	
+		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+		float iout_frozen = pidY_Speed.iout;
+		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+		                SPEED_LOOP_I_LIMIT);
+		if(breakaway_active) {
+			pidY_Speed.iout = iout_frozen;
+			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+			}
+		}
+	
+		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+	
+		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+		float cmd_angle = pidY_velocity_damping;
+		if(breakaway_active) {
+			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+				cmd_angle = breakaway_angle;
+			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+				cmd_angle = breakaway_angle;
+			}
+		}
+#endif
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:44:34Z)**_
+
+局部替换再次没命中，说明前面几次删除已经让块内容偏移了。我改用一次性重写 `pid_control__26Y()`，这比继续打补丁更干净，也更符合你要的“在原文件清理”。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:44:34Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758	
+759		if(!g_pid_segment_initialized) {
+760			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+761			g_pid_segment = PID_SEGMENT_TO_POS_56;
+762			g_pid_segment_initialized = true;
+763		}
+764	
+765		Y = ball_error;  // 视觉小球绝对位置
+766	
+767		/* 分段状态机：
+768		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+769		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+770		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+771		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+772			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+773				pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+774				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+775				control_initialized = false;
+776				target_hold_active = false;
+777				target_hold_settle_ticks = 0u;
+778			}
+779		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+780			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+781				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+782				control_initialized = false;
+783				target_hold_active = false;
+784				target_hold_settle_ticks = 0u;
+785			}
+786		}
+787	
+788		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+789		float target_y = ball_target_get();
+790		float relative_y = Y - target_y;
+791		bool target_changed = !control_initialized || target_y != target_y_last;
+792	
+793		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+794		if(target_changed) {
+795			target_hold_active = false;
+796			target_hold_settle_ticks = 0u;
+797			relative_y_last = relative_y;
+798			target_y_last = target_y;
+799			control_initialized = true;
+800		}
+801	
+802		float position_delta = relative_y - relative_y_last;
+803		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+804	
+805		/* 内环速度反馈改为本地位置差分速度。
+806		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+807		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+808		 */
+809		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+810		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+811		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+812	
+813		/* 最终保持只在第二段完成后生效。
+814		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+815		 *
+816		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+817		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+818		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+819			if(target_hold_active) {
+820				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+821					target_hold_active = false;
+822					target_hold_settle_ticks = 0u;
+823				}
+824			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+825			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+826				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+827					target_hold_settle_ticks++;
+828				}
+829				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+830					target_hold_active = true;
+831				}
+832			} else {
+833				target_hold_settle_ticks = 0u;
+834			}
+835		} else {
+836			target_hold_active = false;
+837			target_hold_settle_ticks = 0u;
+838		}
+839	
+840		if(target_hold_active) {
+841			/* 进入误差保持区后，只停止位置环继续推球：
+842			 *   1) 外环目标速度稍后压到 0；
+843			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+844		}
+845	
+846		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+847		pidY.target = 0.0f;
+848		pidY.now = relative_y;
+849		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+850		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+851		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+852		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+853		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+854		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+855		                POS_LOOP_I_LIMIT);
+856		if(target_hold_active) {
+857			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+858			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+859			 */
+860			pidY.out = 0.0f;
+861		}
+862	
+863		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+864		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+865		 */
+866		float control_velocity = estimated_velocity;
+867		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+868			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+869		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+870			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+871		}
+872		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+873		                         (control_velocity - pidY_filtered_velocity);
+874	
+875	#if POSITION_LOOP_DIRECT_DRIVE
+876		/* 单环调试模式：位置环直接输出平台倾角。
+877		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+878		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+879		pidY_velocity_damping = 0.0f;
+880		pidY_Speed.target = 0.0f;
+881		pidY_Speed.now = pidY_filtered_velocity;
+882		pidY_Speed.out = 0.0f;
+883		pidY_Speed.pout = 0.0f;
+884		pidY_Speed.iout = 0.0f;
+885		pidY_Speed.dout = 0.0f;
+886	
+887		float cmd_angle = pidY.out;
+888	#else
+889		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+890		 *
+891		 * breakaway 现改为“分级加力”：
+892		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+893		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+894		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+895		 *
+896		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+897		 */
+898		if(breakaway_active) {
+899			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+900			   (breakaway_start_error < 0.0f &&
+901			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+902			   (breakaway_start_error > 0.0f &&
+903			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+904				breakaway_active = false;
+905				breakaway_angle = 0.0f;
+906				breakaway_ramp_ticks = 0u;
+907			} else if(position_delta > -STUCK_POSITION_DELTA &&
+908			          position_delta < STUCK_POSITION_DELTA) {
+909				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+910					breakaway_ramp_ticks++;
+911				} else {
+912					breakaway_ramp_ticks = 0u;
+913					if(breakaway_start_error < 0.0f) {
+914						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+915						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+916							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+917						}
+918					} else {
+919						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+920						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+921							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+922						}
+923					}
+924				}
+925			} else {
+926				breakaway_ramp_ticks = 0u;
+927			}
+928			stuck_ticks = 0u;
+929		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+930		          position_delta > -STUCK_POSITION_DELTA &&
+931		          position_delta < STUCK_POSITION_DELTA) {
+932			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+933				stuck_ticks++;
+934			}
+935			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+936				breakaway_start_error = relative_y;
+937				breakaway_active = true;
+938				breakaway_ramp_ticks = 0u;
+939				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+940			}
+941		} else {
+942			stuck_ticks = 0u;
+943		}
+944	
+945		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+946		pidY_Speed.target = pidY.out;
+947		pidY_Speed.now = pidY_filtered_velocity;
+948	
+949		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+950		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+951		float iout_frozen = pidY_Speed.iout;
+952		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+953		                SPEED_LOOP_I_LIMIT);
+954		if(breakaway_active) {
+955			pidY_Speed.iout = iout_frozen;
+956			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+957			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+958				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+959			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+960				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+961			}
+962		}
+963	
+964		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+965	
+966		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+967		float cmd_angle = pidY_velocity_damping;
+968		if(breakaway_active) {
+969			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+970				cmd_angle = breakaway_angle;
+971			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+972				cmd_angle = breakaway_angle;
+973			}
+974		}
+975	#endif
+976	
+977		// 负方向（下降）机构补偿 ×1.2。
+978		if(cmd_angle < 0.0f) {
+979			cmd_angle *= 1.2f;
+980		}
+981	
+982		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+983		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+984		static float cmd_angle_last = 0.0f;
+985		{
+986			float delta = cmd_angle - cmd_angle_last;
+987			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+988			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+989			cmd_angle = cmd_angle_last + delta;
+990			cmd_angle_last = cmd_angle;
+991		}
+992		motor_set_angle(cmd_angle);
+993	
+994		relative_y_last = relative_y;
+995		Y_last = Y;
+996	}
+997	
+998	void pidout_limit_Y(pid_t *pid)
+999	{
+1000		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+1001	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:44:38Z)**_
+
+我现在直接整段重写 `pid_control__26Y()`，这会把原文件里的 breakaway 残留一次性清掉，同时保留你已经确认过的分段切换和最终保持逻辑。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:46:04Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: void pid_control__26Y(void)
+{
+	static float relative_y_last = 0.0f;
+	static float target_y_last = 0.0f;
+	static bool control_initialized = false;
+	static bool target_hold_active = false;
+	static uint8_t target_hold_settle_ticks = 0u;
+
+	if(!g_pid_segment_initialized) {
+		pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+		g_pid_segment = PID_SEGMENT_TO_POS_56;
+		g_pid_segment_initialized = true;
+	}
+
+	Y = ball_error;  // 视觉小球绝对位置
+
+	/* 分段状态机：
+	 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+	 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+	 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+	if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+		if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+			pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+			g_pid_segment = PID_SEGMENT_TO_NEG_55;
+			control_initialized = false;
+			target_hold_active = false;
+			target_hold_settle_ticks = 0u;
+		}
+	} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+		if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+			g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+			control_initialized = false;
+			target_hold_active = false;
+			target_hold_settle_ticks = 0u;
+		}
+	}
+
+	/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+	float target_y = ball_target_get();
+	float relative_y = Y - target_y;
+	bool target_changed = !control_initialized || target_y != target_y_last;
+
+	/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+	if(target_changed) {
+		target_hold_active = false;
+		target_hold_settle_ticks = 0u;
+		relative_y_last = relative_y;
+		target_y_last = target_y;
+		control_initialized = true;
+	}
+
+	float position_delta = relative_y - relative_y_last;
+	redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+
+	/* 内环速度反馈改为本地位置差分速度。
+	 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+	 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+	 */
+	float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+	float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+	float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+
+	/* 最终保持只在第二段完成后生效。
+	 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+	 *
+	 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+	 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+		if(target_hold_active) {
+			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+				target_hold_active = false;
+				target_hold_settle_ticks = 0u;
+			}
+		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+		          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+			if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+				target_hold_settle_ticks++;
+			}
+			if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+				target_hold_active = true;
+			}
+		} else {
+			target_hold_settle_ticks = 0u;
+		}
+	} else {
+		target_hold_active = false;
+		target_hold_settle_ticks = 0u;
+	}
+
+	if(target_hold_active) {
+		/* 进入误差保持区后，只停止位置环继续推球：
+		 *   1) 外环目标速度稍后压到 0；
+		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+	}
+
+	/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+	pidY.target = 0.0f;
+	pidY.now = relative_y;
+	/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+	 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+	 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+	 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+	 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+	pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+	                POS_LOOP_I_LIMIT);
+	if(target_hold_active) {
+		/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+		 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+		 */
+		pidY.out = 0.0f;
+	}
+
+	/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+	 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+	 */
+	float control_velocity = estimated_velocity;
+	if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+		control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+	} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+		control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+	}
+	pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+	                         (control_velocity - pidY_filtered_velocity);
+
+#if POSITION_LOOP_DIRECT_DRIVE
+	/* 单环调试模式：位置环直接输出平台倾角。
+	 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+	 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+	pidY_velocity_damping = 0.0f;
+	pidY_Speed.target = 0.0f;
+	pidY_Speed.now = pidY_filtered_velocity;
+	pidY_Speed.out = 0.0f;
+	pidY_Speed.pout = 0.0f;
+	pidY_Speed.iout = 0.0f;
+	pidY_Speed.dout = 0.0f;
+
+	float cmd_angle = pidY.out;
+#else
+	/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+	pidY_Speed.target = pidY.out;
+	pidY_Speed.now = pidY_filtered_velocity;
+	pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+	                SPEED_LOOP_I_LIMIT);
+	pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+	float cmd_angle = pidY_velocity_damping;
+#endif
+
+	// 负方向（下降）机构补偿 ×1.2。
+	if(cmd_angle < 0.0f) {
+		cmd_angle *= 1.2f;
+	}
+
+	/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+	 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+	static float cmd_angle_last = 0.0f;
+	{
+		float delta = cmd_angle - cmd_angle_last;
+		if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+		else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+		cmd_angle = cmd_angle_last + delta;
+		cmd_angle_last = cmd_angle;
+	}
+	motor_set_angle(cmd_angle);
+
+	relative_y_last = relative_y;
+	Y_last = Y;
+}
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:46:15Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Deciding on full-file overwrite strategy**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:46:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning Perl-based function replacement**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:46:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining Perl substitution approach**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:46:18Z)**_
+
+`Edit` 对这段大块替换一直在跟精确文本较劲。我改用一次性原地替换整个 `pid_control__26Y()` 函数，直接把残留的 `breakaway / stuck` 清干净，然后马上编译看结果。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:47:11Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Replace pid_control__26Y with cleaned pure cascade version
+
+`perl -0pi -e 's@void pid_control__26Y\(void\)\n\{.*?\n\}\n\nvoid pidout_limit_Y@void pid_control__26Y(void)\n{\n\tstatic float relative_y_last = 0.0f;\n\tstatic float target_y_last = 0.0f;\n\tstatic bool control_initialized = false;\n\tstatic bool target_hold_active = false;\n\tstatic uint8_t target_hold_settle_ticks = 0u;\n\n\tif(!g_pid_segment_initialized) {\n\t\tpid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);\n\t\tg_pid_segment = PID_SEGMENT_TO_POS_56;\n\t\tg_pid_segment_initialized = true;\n\t}\n\n\tY = ball_error;  // 视觉小球绝对位置\n\n\t/* 分段状态机：\n\t *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；\n\t *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；\n\t *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */\n\tif(g_pid_segment == PID_SEGMENT_TO_POS_56) {\n\t\tif(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {\n\t\t\tpid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);\n\t\t\tg_pid_segment = PID_SEGMENT_TO_NEG_55;\n\t\t\tcontrol_initialized = false;\n\t\t\ttarget_hold_active = false;\n\t\t\ttarget_hold_settle_ticks = 0u;\n\t\t}\n\t} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {\n\t\tif(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {\n\t\t\tg_pid_segment = PID_SEGMENT_HOLD_NEG_55;\n\t\t\tcontrol_initialized = false;\n\t\t\ttarget_hold_active = false;\n\t\t\ttarget_hold_settle_ticks = 0u;\n\t\t}\n\t}\n\n\t/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */\n\tfloat target_y = ball_target_get();\n\tfloat relative_y = Y - target_y;\n\tbool target_changed = !control_initialized || target_y != target_y_last;\n\n\t/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */\n\tif(target_changed) {\n\t\ttarget_hold_active = false;\n\t\ttarget_hold_settle_ticks = 0u;\n\t\trelative_y_last = relative_y;\n\t\ttarget_y_last = target_y;\n\t\tcontrol_initialized = true;\n\t}\n\n\tfloat position_delta = relative_y - relative_y_last;\n\tredYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm\n\n\t/* 内环速度反馈改为本地位置差分速度。\n\t * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，\n\t * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。\n\t */\n\tfloat estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;\n\tfloat abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;\n\tfloat abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;\n\n\t/* 最终保持只在第二段完成后生效。\n\t * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。\n\t *\n\t * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过\n\t * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */\n\tif(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {\n\t\tif(target_hold_active) {\n\t\t\tif(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {\n\t\t\t\ttarget_hold_active = false;\n\t\t\t\ttarget_hold_settle_ticks = 0u;\n\t\t\t}\n\t\t} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&\n\t\t          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {\n\t\t\tif(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {\n\t\t\t\ttarget_hold_settle_ticks++;\n\t\t\t}\n\t\t\tif(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {\n\t\t\t\ttarget_hold_active = true;\n\t\t\t}\n\t\t} else {\n\t\t\ttarget_hold_settle_ticks = 0u;\n\t\t}\n\t} else {\n\t\ttarget_hold_active = false;\n\t\ttarget_hold_settle_ticks = 0u;\n\t}\n\n\t/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */\n\tpidY.target = 0.0f;\n\tpidY.now = relative_y;\n\t/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），\n\t * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。\n\t * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，\n\t * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，\n\t * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */\n\tpid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,\n\t                POS_LOOP_I_LIMIT);\n\tif(target_hold_active) {\n\t\t/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。\n\t\t * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。\n\t\t */\n\t\tpidY.out = 0.0f;\n\t}\n\n\t/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。\n\t * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。\n\t */\n\tfloat control_velocity = estimated_velocity;\n\tif(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {\n\t\tcontrol_velocity = BALL_VELOCITY_CONTROL_LIMIT;\n\t} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {\n\t\tcontrol_velocity = -BALL_VELOCITY_CONTROL_LIMIT;\n\t}\n\tpidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *\n\t                         (control_velocity - pidY_filtered_velocity);\n\n#if POSITION_LOOP_DIRECT_DRIVE\n\t/* 单环调试模式：位置环直接输出平台倾角。\n\t * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。\n\t * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */\n\tpidY_velocity_damping = 0.0f;\n\tpidY_Speed.target = 0.0f;\n\tpidY_Speed.now = pidY_filtered_velocity;\n\tpidY_Speed.out = 0.0f;\n\tpidY_Speed.pout = 0.0f;\n\tpidY_Speed.iout = 0.0f;\n\tpidY_Speed.dout = 0.0f;\n\n\tfloat cmd_angle = pidY.out;\n#else\n\t/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */\n\tpidY_Speed.target = pidY.out;\n\tpidY_Speed.now = pidY_filtered_velocity;\n\tpid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,\n\t                SPEED_LOOP_I_LIMIT);\n\tpidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出\n\tfloat cmd_angle = pidY_velocity_damping;\n#endif\n\n\t// 负方向（下降）机构补偿 ×1.2。\n\tif(cmd_angle < 0.0f) {\n\t\tcmd_angle *= 1.2f;\n\t}\n\n\t/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，\n\t * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */\n\tstatic float cmd_angle_last = 0.0f;\n\t{\n\t\tfloat delta = cmd_angle - cmd_angle_last;\n\t\tif(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;\n\t\telse if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;\n\t\tcmd_angle = cmd_angle_last + delta;\n\t\tcmd_angle_last = cmd_angle;\n\t}\n\tmotor_set_angle(cmd_angle);\n\n\trelative_y_last = relative_y;\n\tY_last = Y;\n}\n\nvoid pidout_limit_Y@s' Core/Src/pid.c`
+
+```text
+(Bash completed with no output)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:47:17Z)**_
+
+函数已经在原文件里整段清理掉了。现在我先做一次搜索确认 `breakaway / stuck` 残留是否还在，再编译。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:47:17Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `breakaway|stuck_ticks|STUCK_|BREAKAWAY_`
+
+```text
+891:	 * breakaway 现改为“分级加力”：
+892:	 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+893:	 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+894:	 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+898:	if(breakaway_active) {
+899:		if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+900:		   (breakaway_start_error < 0.0f &&
+901:		    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+902:		   (breakaway_start_error > 0.0f &&
+903:		    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+904:			breakaway_active = false;
+905:			breakaway_angle = 0.0f;
+906:			breakaway_ramp_ticks = 0u;
+907:		} else if(position_delta > -STUCK_POSITION_DELTA &&
+908:		          position_delta < STUCK_POSITION_DELTA) {
+909:			if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+910:				breakaway_ramp_ticks++;
+912:				breakaway_ramp_ticks = 0u;
+913:				if(breakaway_start_error < 0.0f) {
+914:					breakaway_angle += BREAKAWAY_ANGLE_STEP;
+915:					if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+916:						breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+919:					breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+920:					if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+921:						breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+926:			breakaway_ramp_ticks = 0u;
+928:		stuck_ticks = 0u;
+929:	} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+930:	          position_delta > -STUCK_POSITION_DELTA &&
+931:	          position_delta < STUCK_POSITION_DELTA) {
+932:		if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+933:			stuck_ticks++;
+935:		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+936:			breakaway_start_error = relative_y;
+937:			breakaway_active = true;
+938:			breakaway_ramp_ticks = 0u;
+939:			breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+942:		stuck_ticks = 0u;
+949:	/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+954:	if(breakaway_active) {
+966:	// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+968:	if(breakaway_active) {
+969:		if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+970:			cmd_angle = breakaway_angle;
+971:		} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+972:			cmd_angle = breakaway_angle;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:47:22Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build debug firmware
+
+`cmake --build build/Debug`
+
+```text
+Exit code 1
+[1/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[2/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/bt_tune.c.obj
+[3/4] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+FAILED: CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj 
+D:\STM32CubeCLT\STM32CubeCLT_1.19.0\GNU-tools-for-STM32\bin\arm-none-eabi-gcc.exe -DDEBUG -DSTM32F407xx -DUSE_HAL_DRIVER -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Core/Inc -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/STM32F4xx_HAL_Driver/Inc -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/CMSIS/Device/ST/STM32F4xx/Include -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/CMSIS/Include -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard  -Wall -fdata-sections -ffunction-sections -fstack-usage -O0 -g3 -std=gnu11 -fdiagnostics-color=always -MD -MT CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj -MF CMakeFiles\Code_of_ZDT.dir\Core\Src\pid.c.obj.d -o CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj -c D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c: In function 'pid_control__26Y':
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:898:12: error: 'breakaway_active' undeclared (first use in this function)
+  898 |         if(breakaway_active) {
+      |            ^~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:898:12: note: each undeclared identifier is reported only once for each function it appears in
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:899:35: error: 'STUCK_POSITION_THRESHOLD' undeclared (first use in this function)
+  899 |                 if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+      |                                   ^~~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:900:21: error: 'breakaway_start_error' undeclared (first use in this function)
+  900 |                    (breakaway_start_error < 0.0f &&
+      |                     ^~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:901:59: error: 'BREAKAWAY_RELEASE_DISTANCE' undeclared (first use in this function)
+  901 |                     relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+      |                                                           ^~~~~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:905:25: error: 'breakaway_angle' undeclared (first use in this function)
+  905 |                         breakaway_angle = 0.0f;
+      |                         ^~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:906:25: error: 'breakaway_ramp_ticks' undeclared (first use in this function)
+  906 |                         breakaway_ramp_ticks = 0u;
+      |                         ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:907:45: error: 'STUCK_POSITION_DELTA' undeclared (first use in this function)
+  907 |                 } else if(position_delta > -STUCK_POSITION_DELTA &&
+      |                                             ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:909:51: error: 'BREAKAWAY_RAMP_TICKS' undeclared (first use in this function)
+  909 |                         if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+      |                                                   ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:914:60: error: 'BREAKAWAY_ANGLE_STEP' undeclared (first use in this function)
+  914 |                                         breakaway_angle += BREAKAWAY_ANGLE_STEP;
+      |                                                            ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:915:62: error: 'BREAKAWAY_POS_ANGLE_MAX' undeclared (first use in this function)
+  915 |                                         if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:920:62: error: 'BREAKAWAY_NEG_ANGLE_MAX' undeclared (first use in this function)
+  920 |                                         if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:928:17: error: 'stuck_ticks' undeclared (first use in this function)
+  928 |                 stuck_ticks = 0u;
+      |                 ^~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:932:34: error: 'STUCK_TICKS_REQUIRED' undeclared (first use in this function)
+  932 |                 if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+      |                                  ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:939:65: error: 'BREAKAWAY_POS_ANGLE_BASE' undeclared (first use in this function)
+  939 |                         breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+      |                                                                 ^~~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:939:92: error: 'BREAKAWAY_NEG_ANGLE_BASE' undeclared (first use in this function)
+  939 |                         breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+      |                                                                                            ^~~~~~~~~~~~~~~~~~~~~~~~
+ninja: build stopped: subcommand failed.
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:47:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Replacing old conditional block from lines 888-975**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:47:32Z)**_
+
+编译报错说明还剩下一整段旧的 `breakaway` 逻辑挂在 `#else` 下面。这个位置已经定位到了，我现在把那一整块替换成纯速度环分支，再重新编译。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:00Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:04Z)**_
+
+文件刚被我用命令改过，按规则需要先重新读一遍再继续写。我把 `#else` 那段重新读出来，然后立刻替换掉。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:05Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+875	#if POSITION_LOOP_DIRECT_DRIVE
+876		/* 单环调试模式：位置环直接输出平台倾角。
+877		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+878		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+879		pidY_velocity_damping = 0.0f;
+880		pidY_Speed.target = 0.0f;
+881		pidY_Speed.now = pidY_filtered_velocity;
+882		pidY_Speed.out = 0.0f;
+883		pidY_Speed.pout = 0.0f;
+884		pidY_Speed.iout = 0.0f;
+885		pidY_Speed.dout = 0.0f;
+886	
+887		float cmd_angle = pidY.out;
+888	#else
+889		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+890		 *
+891		 * breakaway 现改为“分级加力”：
+892		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+893		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+894		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+895		 *
+896		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+897		 */
+898		if(breakaway_active) {
+899			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+900			   (breakaway_start_error < 0.0f &&
+901			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+902			   (breakaway_start_error > 0.0f &&
+903			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+904				breakaway_active = false;
+905				breakaway_angle = 0.0f;
+906				breakaway_ramp_ticks = 0u;
+907			} else if(position_delta > -STUCK_POSITION_DELTA &&
+908			          position_delta < STUCK_POSITION_DELTA) {
+909				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+910					breakaway_ramp_ticks++;
+911				} else {
+912					breakaway_ramp_ticks = 0u;
+913					if(breakaway_start_error < 0.0f) {
+914						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+915						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+916							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+917						}
+918					} else {
+919						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+920						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+921							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+922						}
+923					}
+924				}
+925			} else {
+926				breakaway_ramp_ticks = 0u;
+927			}
+928			stuck_ticks = 0u;
+929		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+930		          position_delta > -STUCK_POSITION_DELTA &&
+931		          position_delta < STUCK_POSITION_DELTA) {
+932			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+933				stuck_ticks++;
+934			}
+935			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+936				breakaway_start_error = relative_y;
+937				breakaway_active = true;
+938				breakaway_ramp_ticks = 0u;
+939				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+940			}
+941		} else {
+942			stuck_ticks = 0u;
+943		}
+944	
+945		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+946		pidY_Speed.target = pidY.out;
+947		pidY_Speed.now = pidY_filtered_velocity;
+948	
+949		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+950		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+951		float iout_frozen = pidY_Speed.iout;
+952		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+953		                SPEED_LOOP_I_LIMIT);
+954		if(breakaway_active) {
+955			pidY_Speed.iout = iout_frozen;
+956			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+957			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+958				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+959			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+960				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+961			}
+962		}
+963	
+964		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+965	
+966		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+967		float cmd_angle = pidY_velocity_damping;
+968		if(breakaway_active) {
+969			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+970				cmd_angle = breakaway_angle;
+971			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+972				cmd_angle = breakaway_angle;
+973			}
+974		}
+975	#endif
+976	
+977		// 负方向（下降）机构补偿 ×1.2。
+978		if(cmd_angle < 0.0f) {
+979			cmd_angle *= 1.2f;
+980		}
+981	
+982		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+983		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+984		static float cmd_angle_last = 0.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:08Z)**_
+
+定位到了，剩的就是这 888-975 这整块。我现在把它换成纯速度环分支，然后重新编译。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:36Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: #else
+		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+		 *
+		 * breakaway 现改为“分级加力”：
+		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+		 *
+		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+		 */
+		if(breakaway_active) {
+			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+			   (breakaway_start_error < 0.0f &&
+			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+			   (breakaway_start_error > 0.0f &&
+			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+				breakaway_active = false;
+				breakaway_angle = 0.0f;
+				breakaway_ramp_ticks = 0u;
+			} else if(position_delta > -STUCK_POSITION_DELTA &&
+			          position_delta < STUCK_POSITION_DELTA) {
+				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+					breakaway_ramp_ticks++;
+				} else {
+					breakaway_ramp_ticks = 0u;
+					if(breakaway_start_error < 0.0f) {
+						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+						}
+					} else {
+						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+						}
+					}
+				}
+			} else {
+				breakaway_ramp_ticks = 0u;
+			}
+			stuck_ticks = 0u;
+		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+		          position_delta > -STUCK_POSITION_DELTA &&
+		          position_delta < STUCK_POSITION_DELTA) {
+			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+				stuck_ticks++;
+			}
+			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+				breakaway_start_error = relative_y;
+				breakaway_active = true;
+				breakaway_ramp_ticks = 0u;
+				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+			}
+		} else {
+			stuck_ticks = 0u;
+		}
+	
+		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+		pidY_Speed.target = pidY.out;
+		pidY_Speed.now = pidY_filtered_velocity;
+	
+		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+		float iout_frozen = pidY_Speed.iout;
+		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+		                SPEED_LOOP_I_LIMIT);
+		if(breakaway_active) {
+			pidY_Speed.iout = iout_frozen;
+			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+			}
+		}
+	
+		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+	
+		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+		float cmd_angle = pidY_velocity_damping;
+		if(breakaway_active) {
+			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+				cmd_angle = breakaway_angle;
+			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+				cmd_angle = breakaway_angle;
+			}
+		}
+#endif
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:47Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning full file overwrite**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:49Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning targeted multiline edit**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Considering line-range removal via perl script**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning safer multi-line regex replacement**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Implementing targeted multi-line Perl replacement**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:48:54Z)**_
+
+`Edit` 一直卡在大段精确匹配上，我改用一次正则替换把 `#else` 下面那整块旧逻辑剃掉。目标不变：`pid.c` 原文件里只剩纯串级路径。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:04Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Remove breakaway branch from pid control function
+
+`perl -0pi -e 's@#else\n\t\t/\* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。\n.*?\n#endif@#else\n\t\t/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */\n\t\tpidY_Speed.target = pidY.out;\n\t\tpidY_Speed.now = pidY_filtered_velocity;\n\t\tpid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,\n\t\t                SPEED_LOOP_I_LIMIT);\n\t\tpidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */\n\t\tfloat cmd_angle = pidY_velocity_damping;\n#endif@s' /d/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c`
+
+```text
+(Bash completed with no output)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:09Z)**_
+
+我先确认残留是否清干净，再编译。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:10Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `breakaway|stuck_ticks|STUCK_|BREAKAWAY_`
+
+```text
+891:	 * breakaway 现改为“分级加力”：
+892:	 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+893:	 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+894:	 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+898:	if(breakaway_active) {
+899:		if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+900:		   (breakaway_start_error < 0.0f &&
+901:		    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+902:		   (breakaway_start_error > 0.0f &&
+903:		    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+904:			breakaway_active = false;
+905:			breakaway_angle = 0.0f;
+906:			breakaway_ramp_ticks = 0u;
+907:		} else if(position_delta > -STUCK_POSITION_DELTA &&
+908:		          position_delta < STUCK_POSITION_DELTA) {
+909:			if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+910:				breakaway_ramp_ticks++;
+912:				breakaway_ramp_ticks = 0u;
+913:				if(breakaway_start_error < 0.0f) {
+914:					breakaway_angle += BREAKAWAY_ANGLE_STEP;
+915:					if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+916:						breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+919:					breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+920:					if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+921:						breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+926:			breakaway_ramp_ticks = 0u;
+928:		stuck_ticks = 0u;
+929:	} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+930:	          position_delta > -STUCK_POSITION_DELTA &&
+931:	          position_delta < STUCK_POSITION_DELTA) {
+932:		if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+933:			stuck_ticks++;
+935:		if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+936:			breakaway_start_error = relative_y;
+937:			breakaway_active = true;
+938:			breakaway_ramp_ticks = 0u;
+939:			breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+942:		stuck_ticks = 0u;
+949:	/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+954:	if(breakaway_active) {
+966:	// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+968:	if(breakaway_active) {
+969:		if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+970:			cmd_angle = breakaway_angle;
+971:		} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+972:			cmd_angle = breakaway_angle;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:14Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build debug firmware
+
+`cmake --build build/Debug`
+
+```text
+Exit code 1
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+FAILED: CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj 
+D:\STM32CubeCLT\STM32CubeCLT_1.19.0\GNU-tools-for-STM32\bin\arm-none-eabi-gcc.exe -DDEBUG -DSTM32F407xx -DUSE_HAL_DRIVER -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Core/Inc -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/STM32F4xx_HAL_Driver/Inc -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/CMSIS/Device/ST/STM32F4xx/Include -ID:/File/2026diansaiH/Code_of_ZDT/cmake/stm32cubemx/../../Drivers/CMSIS/Include -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard  -Wall -fdata-sections -ffunction-sections -fstack-usage -O0 -g3 -std=gnu11 -fdiagnostics-color=always -MD -MT CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj -MF CMakeFiles\Code_of_ZDT.dir\Core\Src\pid.c.obj.d -o CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj -c D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c: In function 'pid_control__26Y':
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:898:12: error: 'breakaway_active' undeclared (first use in this function)
+  898 |         if(breakaway_active) {
+      |            ^~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:898:12: note: each undeclared identifier is reported only once for each function it appears in
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:899:35: error: 'STUCK_POSITION_THRESHOLD' undeclared (first use in this function)
+  899 |                 if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+      |                                   ^~~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:900:21: error: 'breakaway_start_error' undeclared (first use in this function)
+  900 |                    (breakaway_start_error < 0.0f &&
+      |                     ^~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:901:59: error: 'BREAKAWAY_RELEASE_DISTANCE' undeclared (first use in this function)
+  901 |                     relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+      |                                                           ^~~~~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:905:25: error: 'breakaway_angle' undeclared (first use in this function)
+  905 |                         breakaway_angle = 0.0f;
+      |                         ^~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:906:25: error: 'breakaway_ramp_ticks' undeclared (first use in this function)
+  906 |                         breakaway_ramp_ticks = 0u;
+      |                         ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:907:45: error: 'STUCK_POSITION_DELTA' undeclared (first use in this function)
+  907 |                 } else if(position_delta > -STUCK_POSITION_DELTA &&
+      |                                             ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:909:51: error: 'BREAKAWAY_RAMP_TICKS' undeclared (first use in this function)
+  909 |                         if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+      |                                                   ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:914:60: error: 'BREAKAWAY_ANGLE_STEP' undeclared (first use in this function)
+  914 |                                         breakaway_angle += BREAKAWAY_ANGLE_STEP;
+      |                                                            ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:915:62: error: 'BREAKAWAY_POS_ANGLE_MAX' undeclared (first use in this function)
+  915 |                                         if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:920:62: error: 'BREAKAWAY_NEG_ANGLE_MAX' undeclared (first use in this function)
+  920 |                                         if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+      |                                                              ^~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:928:17: error: 'stuck_ticks' undeclared (first use in this function)
+  928 |                 stuck_ticks = 0u;
+      |                 ^~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:932:34: error: 'STUCK_TICKS_REQUIRED' undeclared (first use in this function)
+  932 |                 if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+      |                                  ^~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:939:65: error: 'BREAKAWAY_POS_ANGLE_BASE' undeclared (first use in this function)
+  939 |                         breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+      |                                                                 ^~~~~~~~~~~~~~~~~~~~~~~~
+D:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c:939:92: error: 'BREAKAWAY_NEG_ANGLE_BASE' undeclared (first use in this function)
+  939 |                         breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+      |                                                                                            ^~~~~~~~~~~~~~~~~~~~~~~~
+ninja: build stopped: subcommand failed.
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:24Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning file cleaning strategy**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating precise file edits around lines 875-975**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining exact edit boundaries using leading tabs**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:28Z)**_
+
+我已经把问题点缩到 `pid.c` 里 `#else` 下面那一整块旧的 `breakaway` 分支。现在不再绕，直接按当前文件内容精确替掉这块，然后再编译。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:49:55Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:00Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning file reread and edit**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:00Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Testing partial file reread**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:01Z)**_
+
+文件刚被前面的替换命令改过一次，按工具规则我先重新读取当前片段，再做最后这次精确删除。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:02Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+875	#if POSITION_LOOP_DIRECT_DRIVE
+876		/* 单环调试模式：位置环直接输出平台倾角。
+877		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+878		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+879		pidY_velocity_damping = 0.0f;
+880		pidY_Speed.target = 0.0f;
+881		pidY_Speed.now = pidY_filtered_velocity;
+882		pidY_Speed.out = 0.0f;
+883		pidY_Speed.pout = 0.0f;
+884		pidY_Speed.iout = 0.0f;
+885		pidY_Speed.dout = 0.0f;
+886	
+887		float cmd_angle = pidY.out;
+888	#else
+889		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+890		 *
+891		 * breakaway 现改为“分级加力”：
+892		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+893		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+894		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+895		 *
+896		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+897		 */
+898		if(breakaway_active) {
+899			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+900			   (breakaway_start_error < 0.0f &&
+901			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+902			   (breakaway_start_error > 0.0f &&
+903			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+904				breakaway_active = false;
+905				breakaway_angle = 0.0f;
+906				breakaway_ramp_ticks = 0u;
+907			} else if(position_delta > -STUCK_POSITION_DELTA &&
+908			          position_delta < STUCK_POSITION_DELTA) {
+909				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+910					breakaway_ramp_ticks++;
+911				} else {
+912					breakaway_ramp_ticks = 0u;
+913					if(breakaway_start_error < 0.0f) {
+914						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+915						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+916							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+917						}
+918					} else {
+919						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+920						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+921							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+922						}
+923					}
+924				}
+925			} else {
+926				breakaway_ramp_ticks = 0u;
+927			}
+928			stuck_ticks = 0u;
+929		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+930		          position_delta > -STUCK_POSITION_DELTA &&
+931		          position_delta < STUCK_POSITION_DELTA) {
+932			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+933				stuck_ticks++;
+934			}
+935			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+936				breakaway_start_error = relative_y;
+937				breakaway_active = true;
+938				breakaway_ramp_ticks = 0u;
+939				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+940			}
+941		} else {
+942			stuck_ticks = 0u;
+943		}
+944	
+945		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+946		pidY_Speed.target = pidY.out;
+947		pidY_Speed.now = pidY_filtered_velocity;
+948	
+949		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+950		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+951		float iout_frozen = pidY_Speed.iout;
+952		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+953		                SPEED_LOOP_I_LIMIT);
+954		if(breakaway_active) {
+955			pidY_Speed.iout = iout_frozen;
+956			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+957			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+958				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+959			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+960				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+961			}
+962		}
+963	
+964		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+965	
+966		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+967		float cmd_angle = pidY_velocity_damping;
+968		if(breakaway_active) {
+969			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+970				cmd_angle = breakaway_angle;
+971			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+972				cmd_angle = breakaway_angle;
+973			}
+974		}
+975	#endif
+976	
+977		// 负方向（下降）机构补偿 ×1.2。
+978		if(cmd_angle < 0.0f) {
+979			cmd_angle *= 1.2f;
+980		}
+981	
+982		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+983		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+984		static float cmd_angle_last = 0.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:05Z)**_
+
+现在是最新文件状态，直接替掉这块。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:32Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 	#else
+		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+		 *
+		 * breakaway 现改为“分级加力”：
+		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+		 *
+		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+		 */
+		if(breakaway_active) {
+			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+			   (breakaway_start_error < 0.0f &&
+			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+			   (breakaway_start_error > 0.0f &&
+			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+				breakaway_active = false;
+				breakaway_angle = 0.0f;
+				breakaway_ramp_ticks = 0u;
+			} else if(position_delta > -STUCK_POSITION_DELTA &&
+			          position_delta < STUCK_POSITION_DELTA) {
+				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+					breakaway_ramp_ticks++;
+				} else {
+					breakaway_ramp_ticks = 0u;
+					if(breakaway_start_error < 0.0f) {
+						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+						}
+					} else {
+						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+						}
+					}
+				}
+			} else {
+				breakaway_ramp_ticks = 0u;
+			}
+			stuck_ticks = 0u;
+		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+		          position_delta > -STUCK_POSITION_DELTA &&
+		          position_delta < STUCK_POSITION_DELTA) {
+			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+				stuck_ticks++;
+			}
+			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+				breakaway_start_error = relative_y;
+				breakaway_active = true;
+				breakaway_ramp_ticks = 0u;
+				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+			}
+		} else {
+			stuck_ticks = 0u;
+		}
+	
+		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+		pidY_Speed.target = pidY.out;
+		pidY_Speed.now = pidY_filtered_velocity;
+	
+		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+		float iout_frozen = pidY_Speed.iout;
+		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+		                SPEED_LOOP_I_LIMIT);
+		if(breakaway_active) {
+			pidY_Speed.iout = iout_frozen;
+			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+			}
+		}
+	
+		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+	
+		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+		float cmd_angle = pidY_velocity_damping;
+		if(breakaway_active) {
+			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+				cmd_angle = breakaway_angle;
+			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+				cmd_angle = breakaway_angle;
+			}
+		}
+	#endif
+
+(note: Edit also tried swapping \uXXXX escapes and their characters; neither form matched, so the mismatch is likely elsewhere in old_string. Re-read the file and copy the exact surrounding text.)</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:37Z)**_
+
+`Edit` 这块还是因为缩进细节不肯吃。我直接在原文件上用更窄的脚本删除 888-975 对应的旧块，删完就编译，不再折腾局部匹配。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:48Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Delete remaining breakaway block from pid.c
+
+```bash
+python - <<'PY'
+from pathlib import Path
+p = Path('/d/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c')
+text = p.read_text(encoding='utf-8')
+start = text.index('\t#else\n\t\t/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。')
+end = text.index('\t#endif\n', start) + len('\t#endif\n')
+replacement = '\t#else\n\t\t/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */\n\t\tpidY_Speed.target = pidY.out;\n\t\tpidY_Speed.now = pidY_filtered_velocity;\n\t\tpid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,\n\t\t                SPEED_LOOP_I_LIMIT);\n\t\tpidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */\n\t\tfloat cmd_angle = pidY_velocity_damping;\n\t#endif\n'
+text = text[:start] + replacement + text[end:]
+p.write_text(text, encoding='utf-8')
+PY
+```
+
+```text
+Exit code 1
+Traceback (most recent call last):
+  File "<stdin>", line 3, in <module>
+  File "D:\Python310\lib\pathlib.py", line 1134, in read_text
+    with self.open(mode='r', encoding=encoding, errors=errors) as f:
+  File "D:\Python310\lib\pathlib.py", line 1119, in open
+    return self._accessor.open(self, mode, buffering, encoding, errors,
+FileNotFoundError: [Errno 2] No such file or directory: '\\d\\File\\2026diansaiH\\Code_of_ZDT\\Core\\Src\\pid.c'
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:50:52Z)**_
+
+路径用了 Unix 形式，当前环境下这个 Python 进程没认出来。我改成工作区的 Windows 绝对路径再删一次。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:03Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Delete remaining breakaway block from pid.c using Windows path
+
+```bash
+python - <<'PY'
+from pathlib import Path
+p = Path(r'd:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c')
+text = p.read_text(encoding='utf-8')
+needle = '\t#else\n\t\t/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。'
+start = text.index(needle)
+end = text.index('\t#endif\n', start) + len('\t#endif\n')
+replacement = '\t#else\n\t\t/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */\n\t\tpidY_Speed.target = pidY.out;\n\t\tpidY_Speed.now = pidY_filtered_velocity;\n\t\tpid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,\n\t\t                SPEED_LOOP_I_LIMIT);\n\t\tpidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */\n\t\tfloat cmd_angle = pidY_velocity_damping;\n\t#endif\n'
+text = text[:start] + replacement + text[end:]
+p.write_text(text, encoding='utf-8')
+PY
+```
+
+```text
+Exit code 1
+Traceback (most recent call last):
+  File "<stdin>", line 5, in <module>
+ValueError: substring not found
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:08Z)**_
+
+这个旧块的文本开头已经被前面的改动动过了，我不再猜。先把 888 附近实际内容重新读出来，用它作为精确锚点删。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:09Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+886	
+887		float cmd_angle = pidY.out;
+888	#else
+889		/* 仅在距目标超过阈值时使用起动倾角；进入近目标区域立即退出。
+890		 *
+891		 * breakaway 现改为“分级加力”：
+892		 *   - 第一次检测到卡滞时，只给 BREAKAWAY_*_ANGLE_BASE；
+893		 *   - 若后续每过 BREAKAWAY_RAMP_TICKS 仍几乎不动，就把起动角再加一级；
+894		 *   - 一直加到 BREAKAWAY_*_ANGLE_MAX 为止。
+895		 *
+896		 * 这样能避免固定 -3.6° 在某些位置推不动球时永久卡死。
+897		 */
+898		if(breakaway_active) {
+899			if((relative_y <= STUCK_POSITION_THRESHOLD && relative_y >= -STUCK_POSITION_THRESHOLD) ||
+900			   (breakaway_start_error < 0.0f &&
+901			    relative_y >= breakaway_start_error + BREAKAWAY_RELEASE_DISTANCE) ||
+902			   (breakaway_start_error > 0.0f &&
+903			    relative_y <= breakaway_start_error - BREAKAWAY_RELEASE_DISTANCE)) {
+904				breakaway_active = false;
+905				breakaway_angle = 0.0f;
+906				breakaway_ramp_ticks = 0u;
+907			} else if(position_delta > -STUCK_POSITION_DELTA &&
+908			          position_delta < STUCK_POSITION_DELTA) {
+909				if(breakaway_ramp_ticks < BREAKAWAY_RAMP_TICKS) {
+910					breakaway_ramp_ticks++;
+911				} else {
+912					breakaway_ramp_ticks = 0u;
+913					if(breakaway_start_error < 0.0f) {
+914						breakaway_angle += BREAKAWAY_ANGLE_STEP;
+915						if(breakaway_angle > BREAKAWAY_POS_ANGLE_MAX) {
+916							breakaway_angle = BREAKAWAY_POS_ANGLE_MAX;
+917						}
+918					} else {
+919						breakaway_angle -= BREAKAWAY_ANGLE_STEP;
+920						if(breakaway_angle < BREAKAWAY_NEG_ANGLE_MAX) {
+921							breakaway_angle = BREAKAWAY_NEG_ANGLE_MAX;
+922						}
+923					}
+924				}
+925			} else {
+926				breakaway_ramp_ticks = 0u;
+927			}
+928			stuck_ticks = 0u;
+929		} else if((relative_y > STUCK_POSITION_THRESHOLD || relative_y < -STUCK_POSITION_THRESHOLD) &&
+930		          position_delta > -STUCK_POSITION_DELTA &&
+931		          position_delta < STUCK_POSITION_DELTA) {
+932			if(stuck_ticks < STUCK_TICKS_REQUIRED) {
+933				stuck_ticks++;
+934			}
+935			if(stuck_ticks >= STUCK_TICKS_REQUIRED) {
+936				breakaway_start_error = relative_y;
+937				breakaway_active = true;
+938				breakaway_ramp_ticks = 0u;
+939				breakaway_angle = (relative_y < 0.0f) ? BREAKAWAY_POS_ANGLE_BASE : BREAKAWAY_NEG_ANGLE_BASE;
+940			}
+941		} else {
+942			stuck_ticks = 0u;
+943		}
+944	
+945		/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+946		pidY_Speed.target = pidY.out;
+947		pidY_Speed.now = pidY_filtered_velocity;
+948	
+949		/* 起动补偿期间倾角由 BREAKAWAY_* 强制接管，实际执行值与内环输出无关，
+950		 * 此时继续积分只会累积无效误差，退出后造成一次反向过冲，故冻结积分。 */
+951		float iout_frozen = pidY_Speed.iout;
+952		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+953		                SPEED_LOOP_I_LIMIT);
+954		if(breakaway_active) {
+955			pidY_Speed.iout = iout_frozen;
+956			pidY_Speed.out = pidY_Speed.pout + pidY_Speed.iout + pidY_Speed.dout;
+957			if(pidY_Speed.out > SPEED_LOOP_ANGLE_LIMIT) {
+958				pidY_Speed.out = SPEED_LOOP_ANGLE_LIMIT;
+959			} else if(pidY_Speed.out < -SPEED_LOOP_ANGLE_LIMIT) {
+960				pidY_Speed.out = -SPEED_LOOP_ANGLE_LIMIT;
+961			}
+962		}
+963	
+964		pidY_velocity_damping = pidY_Speed.out;  // 保留旧变量名，供 VOFA 观察限幅后的速度环输出
+965	
+966		// 速度环输出作为倾角命令；卡滞时由分级加力的 breakaway 角接管。
+967		float cmd_angle = pidY_velocity_damping;
+968		if(breakaway_active) {
+969			if(breakaway_start_error < 0.0f && cmd_angle < breakaway_angle) {
+970				cmd_angle = breakaway_angle;
+971			} else if(breakaway_start_error > 0.0f && cmd_angle > breakaway_angle) {
+972				cmd_angle = breakaway_angle;
+973			}
+974		}
+975	#endif
+976	
+977		// 负方向（下降）机构补偿 ×1.2。
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:13Z)**_
+
+这次锚点足够了，我直接用脚本按行号范围改掉 888-975 这段。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:24Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Replace breakaway lines with pure cascade branch by line range
+
+```bash
+python - <<'PY'
+from pathlib import Path
+p = Path(r'd:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c')
+lines = p.read_text(encoding='utf-8').splitlines(True)
+start = 887  # 0-based => line 888
+end = 975    # exclusive, remove through line 975
+replacement = [
+    '\t#else\n',
+    '\t\t/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */\n',
+    '\t\tpidY_Speed.target = pidY.out;\n',
+    '\t\tpidY_Speed.now = pidY_filtered_velocity;\n',
+    '\t\tpid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,\n',
+    '\t\t                SPEED_LOOP_I_LIMIT);\n',
+    '\t\tpidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */\n',
+    '\t\tfloat cmd_angle = pidY_velocity_damping;\n',
+    '\t#endif\n'
+]
+lines[start:end] = replacement
+p.write_text(''.join(lines), encoding='utf-8')
+PY
+```
+
+```text
+(Bash completed with no output)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:31Z)**_
+
+现在直接验证是否还残留、是否能过编译。
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:32Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `breakaway|stuck_ticks|STUCK_|BREAKAWAY_`
+
+```text
+No matches found
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:39Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build debug firmware
+
+`cmake --build build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37544 B         1 MB      3.58%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 22:51:50Z)**_
+
+已经在原文件里清理完了，`breakaway / stuck` 这一整套补偿都删掉了，只保留最基本的串级 PID 路径，并且编译通过 ✅
+
+现在的 `pid_control__26Y()` 结构是：
+
+- 分段目标切换还在
+- 最终保持还在
+- 外环：位置 -> 目标速度
+- 内环：速度 -> 倾角
+- **不再有任何卡滞检测 / 强制加力 / breakaway 接管**
+
+我也确认过，`Core/Src/pid.c` 里已经没有这些残留关键词了：
+
+- `breakaway`
+- `stuck_ticks`
+- `STUCK_*`
+- `BREAKAWAY_*`
+
+构建结果：
+
+- `RAM: 3496 B`
+- `FLASH: 37544 B`
+
+你现在可以直接烧录这版，再看系统是不是还会出现你说的那种“调节很不稳定”。这一步的意义很直接：先把所有“额外补偿”拿掉，只看最纯的 PID 本身稳不稳。  
+如果这版明显稳了，问题就确实是原来那套补偿引进去的；如果这版还不稳，那接下来就该集中收缩第二段的 PID 和负向 `×1.2` 补偿了。
+
+---
+
+_**User (2026-08-02 22:55:42Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+PID在哪里调？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 22:55:56Z)**_
+
+现在分两处看，但你这套球控真正要调的 PID，主要就在 [Core/Src/pid.c](Core/Src/pid.c) 里的这两行。
+
+**第一段 `0 -> +5.6cm`** 在 [Core/Src/pid.c:760](Core/Src/pid.c#L760)：
+
+```c
+pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+```
+
+参数顺序是：
+
+```c
+pid_apply_segment_profile(
+    target_y,
+    pos_p, pos_i, pos_d,
+    spd_p, spd_i, spd_d
+);
+```
+
+所以这一行对应：
+
+- 目标位置：`5.6f`
+- 位置环：`1.735, 0, 0`
+- 速度环：`0.99, 0.01, 0`
+
+**第二段 `+5.6 -> -5.5cm`** 在 [Core/Src/pid.c:773](Core/Src/pid.c#L773)：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+```
+
+对应：
+
+- 目标位置：`-5.5f`
+- 位置环：`0.8, 0, 0`
+- 速度环：`1.05, 0, 0`
+
+所以你现在如果说“PID 在哪里调”，最直接就是改这两行。
+
+再对应一下：
+
+- 想调**位置环**：改中间这三个
+  - `pos_p, pos_i, pos_d`
+- 想调**速度环**：改最后这三个
+  - `spd_p, spd_i, spd_d`
+
+另外还有一处不是 PID 参数，但会明显影响手感，在 [Core/Inc/pid.h](Core/Inc/pid.h)：
+
+- `ANGLE_SLEW_PER_TICK`
+- `BALL_VELOCITY_FILTER_ALPHA`
+- `TARGET_HOLD_*`
+
+这些不是 PID，但会让你感觉“明明 PID 没改，系统却变稳/变钝/变抖”。
+
+你现在这版既然已经把 `breakaway` 删掉了，下一步如果要纯调 PID，就盯住这两行改最有效。
+
+---
+
+_**User (2026-08-02 23:00:20Z)**_
+
+<ide_selection>The user selected the lines 760 to 760 from d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c:
+pid_apply_segment_profile
+
+This may or may not be related to the current task.</ide_selection>
+
+,0,0,-110,104
+-89,-596,0,0,-82,78
+-89,-596,-503,0,-82,78
+0,-605,-503,0,48,-45
+0,-605,0,0,48,-45
+33,-605,0,0,36,-34
+33,-605,0,0,36,-34
+22,-605,0,0,27,-25
+22,-605,0,0,27,-25
+11,-605,0,0,20,-19
+11,-605,0,0,20,-19
+11,-605,0,0,15,-14
+11,-605,0,0,15,-14
+11,-605,0,0,11,-10
+11,-605,0,0,11,-10
+0,-605,0,0,8,-8
+0,-605,0,0,8,-8
+0,-605,0,0,6,-6
+0,-605,0,0,6,-6
+0,-605,0,0,4,-4
+0,-605,0,0,4,-4
+0,-605,0,0,3,-3
+0,-605,0,0,3,-3
+0,-605,0,0,2,-2
+0,-605,0,0,2,-2
+0,-605,0,0,2,-1
+0,-605,0,0,2,-1
+0,-605,0,0,1,-1
+0,-605,0,0,1,-1
+0,-605,0,0,1,-1
+0,-605,0,0,1,-1
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,0,0
+0,-605,0,0,
+这个值不是在误差范围之内了吗？
+为啥还是会有输出
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 23:00:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting PID hold zone logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:00:29Z)**_
+
+我先把当前保持区判断和最终角度输出那几行对一下，直接按你这组 VOFA 解释，不靠猜。
+
+_**Agent (claude-opus-4-8 2026-08-02 23:00:29Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+818		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+819			if(target_hold_active) {
+820				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+821					target_hold_active = false;
+822					target_hold_settle_ticks = 0u;
+823				}
+824			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+825			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+826				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+827					target_hold_settle_ticks++;
+828				}
+829				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+830					target_hold_active = true;
+831				}
+832			} else {
+833				target_hold_settle_ticks = 0u;
+834			}
+835		} else {
+836			target_hold_active = false;
+837			target_hold_settle_ticks = 0u;
+838		}
+839	
+840		if(target_hold_active) {
+841			/* 进入误差保持区后，只停止位置环继续推球：
+842			 *   1) 外环目标速度稍后压到 0；
+843			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+844		}
+845	
+846		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+847		pidY.target = 0.0f;
+848		pidY.now = relative_y;
+849		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+850		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+851		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+852		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+853		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+854		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+855		                POS_LOOP_I_LIMIT);
+856		if(target_hold_active) {
+857			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+858			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+859			 */
+860			pidY.out = 0.0f;
+861		}
+862	
+863		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+864		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+865		 */
+866		float control_velocity = estimated_velocity;
+867		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+868			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+869		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+870			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+871		}
+872		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+873		                         (control_velocity - pidY_filtered_velocity);
+874	
+875	#if POSITION_LOOP_DIRECT_DRIVE
+876		/* 单环调试模式：位置环直接输出平台倾角。
+877		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+878		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+879		pidY_velocity_damping = 0.0f;
+880		pidY_Speed.target = 0.0f;
+881		pidY_Speed.now = pidY_filtered_velocity;
+882		pidY_Speed.out = 0.0f;
+883		pidY_Speed.pout = 0.0f;
+884		pidY_Speed.iout = 0.0f;
+885		pidY_Speed.dout = 0.0f;
+886	
+887		float cmd_angle = pidY.out;
+888		#else
+889			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+890			pidY_Speed.target = pidY.out;
+891			pidY_Speed.now = pidY_filtered_velocity;
+892			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+893			                SPEED_LOOP_I_LIMIT);
+894			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+895			float cmd_angle = pidY_velocity_damping;
+896		#endif
+897	
+898		// 负方向（下降）机构补偿 ×1.2。
+899		if(cmd_angle < 0.0f) {
+900			cmd_angle *= 1.2f;
+901		}
+902	
+903		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+904		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+905		static float cmd_angle_last = 0.0f;
+906		{
+907			float delta = cmd_angle - cmd_angle_last;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:00:29Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\main.c`
+
+```text
+170	    // ========== 每10ms：发送 VOFA+ 数据（100Hz） ==========
+171	    if(HAL_GetTick() - last_vofa_time >= 10)
+172	    {
+173	      last_vofa_time = HAL_GetTick();
+174	
+175	      // ===== VOFA+ 发送：6通道 =====
+176	      // 所有通道均 ×100 发送，VOFA+ 中 ÷100 后为真实值。
+177	      int32_t vofa_data[6];
+178	      vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0: 开环目标角度(°)
+179	      vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1: 小球位置(cm)
+180	      vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 原始速度(cm/s)，仅诊断
+181	      vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环目标速度(cm/s)
+182	      vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4: 速度环输出倾角(°)
+183	      vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);    // ch5: 本地差分+低通后的控制速度(cm/s)
+184	      Vofa_usage_SendString(vofa_data, 6);
+185	    }
+186	
+187	    // ========== 处理 MaixCAM 视觉数据 ==========
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:00:54Z)**_
+
+对，**你贴的这段位置误差已经在范围内了**。  
+但它**还不一定算“进入保持”**，因为你现在的代码不是只看位置。
+
+当前保持判定在 [Core/Src/pid.c:824](Core/Src/pid.c#L824)：
+
+```c
+abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT
+```
+
+而且还要连续满足 `TARGET_HOLD_SETTLE_TICKS` 个周期，见 [Core/Src/pid.c:826-830](Core/Src/pid.c#L826-L830)。
+
+也就是说，必须同时满足这 3 条才会真正把外环压成 0：
+
+1. 位置误差进 `±0.5cm`
+2. 本地估计速度也够小
+3. 连续稳定 6 个周期
+
+你这段日志按 6 通道解释是：
+
+- `ch0` 电机角度
+- `ch1` 小球位置
+- `ch3` 外环输出
+- `ch4` 速度环输出
+- `ch5` 本地估计速度
+
+比如你这行：
+
+```text
+0,-605,0,0,48,-45
+```
+
+表示：
+
+- `ch1 = -6.05cm`
+- 目标是 `-5.5cm`
+- 误差是 `0.55cm`
+
+**这其实已经超出 `±0.5cm` 了。**
+
+你后面那些：
+
+```text
+0,-605,0,0,3,-3
+0,-605,0,0,2,-2
+0,-605,0,0,1,-1
+0,-605,0,0,0,0
+```
+
+看起来像“已经很稳”，但位置还是 `-6.05cm`，离 `-5.5cm` 差 `0.55cm`，所以按你现在代码，它**不应该进入保持**。
+
+但你这里又看到 `ch3 = 0`，说明有两种可能：
+
+1. **你看到的是第二段刚切到最终段后的某段数据，外环当时已经因为别的状态过程被压成 0**
+2. **更直接地说：你现在停住的位置已经偏到 `-6.05cm`，而外环却没有继续拉回来，这说明“结构上是零输出了，但判定逻辑和你预期不一致”**
+
+还有一个关键点：
+
+你现在 `ch3 = 0` 只是表示**位置环目标速度为 0**，  
+不等于“完全没有任何输出”。
+
+因为在 [Core/Src/pid.c:889-895](Core/Src/pid.c#L889-L895)：
+
+```c
+pidY_Speed.target = pidY.out;
+pidY_Speed.now = pidY_filtered_velocity;
+pid_cal_clamped(&pidY_Speed, ...);
+pidY_velocity_damping = pidY_Speed.out;
+```
+
+所以即使 `ch3 = 0`：
+
+- 只要 `ch5` 不是 0
+- 内环仍然会为了把速度拉回 0 输出一个小角度
+- 所以 `ch4` 还会有值
+- `ch0` 也可能还不是 0
+
+这正是你看到的现象。
+
+你这组数据里最值得注意的是：
+
+```text
+0,-605,0,0,48,-45
+0,-605,0,0,36,-34
+0,-605,0,0,20,-19
+...
+0,-605,0,0,0,0
+```
+
+这里已经说明：
+
+- 外环 `ch3` 已经是 `0`
+- 内环 `ch4` 也逐步衰减到 `0`
+- 速度 `ch5` 也逐步到 `0`
+- 但位置卡在 `-6.05cm`
+
+所以真正的问题不是“为什么在误差范围内还有输出”，而是：
+
+**你这时其实已经不在误差范围内了，但系统却已经停止继续把球拉回 `-5.5cm`。**
+
+这说明当前逻辑里，最终段切换/保持和你期望的“必须真到 `-5.5 ± 0.5` 才停”还没完全对上。
+
+更直白一点：
+
+- `-6.05cm` 相对 `-5.5cm` 的误差是 `0.55cm`
+- 这不该停
+- 但它停了
+- 所以该继续查的是 **最终段进入保持前后那一小段状态切换逻辑**
+
+现在先不要再猜 PID 参数。  
+这一步该做的是把 **“是否进入最终保持”** 直接打到 VOFA 里，否则你现在只能从 `ch3/ch4/ch5` 猜状态。最省事的做法是把一个通道改成：
+
+- `0` = 普通控制
+- `1` = 已进入最终保持
+
+这样一眼就能知道，`-6.05cm` 那一刻到底是不是代码已经进了 hold。
+
+---
+
+_**User (2026-08-02 23:06:40Z)**_
+
+23,-554,0,4,133,-123
+101,-554,0,4,101,-92
+101,-554,0,4,101,-92
+67,-554,0,4,77,-69
+67,-554,0,4,77,-69
+56,-554,0,4,59,-51
+56,-554,0,4,59,-51
+33,-554,0,0,40,-38
+33,-554,0,0,40,-38
+22,-554,0,0,30,-29
+22,-554,0,0,30,-29
+22,-554,0,0,22,-21
+22,-554,0,0,22,-21
+11,-554,0,0,17,-16
+11,-554,494,0,17,-16
+-78,-546,0,0,-97,92
+-78,-546,0,0,-97,92
+-78,-546,0,0,-72,69
+-78,-546,0,0,-72,69
+-56,-546,0,0,-54,52
+-56,-546,0,0,-54,52
+-44,-546,0,0,-41,39
+-44,-546,0,0,-41,39
+-33,-546,0,0,-30,29
+-33,-546,0,0,-30,29
+-22,-546,0,0,-23,21
+-22,-546,0,0,-23,21
+-11,-546,514,0,-17,16
+-11,-546,514,0,-17,16
+-112,-538,0,0,-123,117
+-112,-538,0,0,-123,117
+-213,-529,533,0,-202,193
+-213,-529,0,0,-202,193
+-179,-529,0,0,-152,144
+-179,-529,501,0,-152,144
+-258,-521,501,0,-224,213
+-258,-521,0,0,-224,213
+-191,-521,0,0,-168,160
+-191,-521,0,0,-168,160
+-146,-521,0,0,-126,120
+-146,-521,0,0,-126,120
+-112,-521,0,0,-94,90
+-112,-521,503,0,-94,90
+-202,-512,503,0,-181,172
+-202,-512,0,0,-181,172
+-157,-512,0,0,-135,129
+-157,-512,0,0,-135,129
+-112,-512,0,0,-101,97
+-112,-512,0,0,-101,97
+-89,-512,0,0,-76,72
+-89,-512,0,0,-76,72
+-67,-512,0,0,-57,54
+-67,-512,0,0,-57,54
+-44,-512,0,0,-43,40
+-44,-512,0,0,-43,40
+-33,-512,0,0,-32,30
+-33,-512,0,0,-32,30
+-22,-512,0,0,-24,23
+-22,-512,0,0,-24,23
+-11,-512,471,0,-18,17
+-11,-512,471,0,-18,17
+-112,-504,0,0,-123,117
+-112,-504,0,0,-123,117
+-101,-504,0,0,-92,88
+-101,-504,0,0,-92,88
+-78,-504,0,0,-69,66
+-78,-504,0,0,-69,66
+-56,-504,0,0,-52,49
+-56,-504,0,0,-52,49
+-44,-504,0,0,-39,37
+-44,-504,0,0,-39,37
+-33,-504,0,0,-29,27
+-33,-504,0,0,-29,27
+-22,-504,0,0,-22,20
+-22,-504,0,0,-22,20
+-11,-504,0,0,-16,15
+-11,-504,0,0,-16,15
+-11,-504,0,0,-12,11
+-11,-504,0,0,-12,11
+0,-504,0,0,-9,8
+0,-504,0,0,-9,8
+0,-504,0,0,-6,6
+0,-504,0,0,-6,6
+0,-504,0,0,-5,4
+0,-504,0,0,-5,4
+0,-504,0,0,-3,3
+0,-504,0,0,-3,3
+0,-504,0,0,-2,2
+0,-504,0,0,-2,2
+0,-504,0,0,-2,2
+0,-504,0,0,-2,2
+0,-504,0,0,-1,1
+0,-504,494,0,-1,1
+-101,-496,494,0,-111,106
+-101,-496,0,0,-111,106
+-89,-496,0,0,-83,79
+-89,-496,0,0,-83,79
+-67,-496,0,0,-62,59
+-67,-496,0,0,-62,59
+-56,-496,0,0,-47,44
+-56,-496,0,0,-47,44
+-33,-496,0,0,-35,33
+-33,-496,502,0,-35,33
+-134,-487,502,-56,-195,130
+-134,-487,0,-56,-195,130
+-191,-487,0,-56,-161,97
+-191,-487,0,-56,-161,97
+-157,-487,0,-56,-135,73
+-157,-487,0,-56,-135,73
+-134,-487,473,-56,-116,54
+-134,-487,473,-56,-116,54
+-236,-479,0,-63,-220,146
+-236,-479,0,-63,-220,146
+-213,-479,0,-63,-182,109
+-213,-479,0,-63,-182,109
+-179,-479,0,-63,-153,82
+-179,-479,0,-63,-153,82
+-157,-479,0,-63,-131,61
+-157,-479,0,-63,-131,61
+-134,-479,499,-63,-115,46
+-134,-479,499,-63,-115,46
+-236,-470,0,-71,-221,139
+-236,-470,0,-71,-221,139
+-213,-470,0,-71,-184,104
+-213,-470,0,-71,-184,104
+-179,-470,0,-71,-157,78
+-179,-470,0,-71,-157,78
+-157,-470,0,-71,-136,58
+-157,-470,0,-71,-136,58
+-134,-470,0,-71,-121,44
+-134,-470,0,-71,-121,44
+-123,-470,0,-71,-109,33
+-123,-470,0,-71,-109,33
+-224,-462,508,-78,-219,129
+-224,-462,508,-78,-219,129
+-213,-462,0,-78,-185,97
+-213,-462,0,-78,-185,97
+-191,-462,0,-78,-159,73
+-191,-462,504,-78,-159,73
+-281,-454,504,-86,-258,159
+-281,-454,0,-86,-258,159
+-258,-454,0,-86,-216,119
+-258,-454,0,-86,-216,119
+-213,-454,0,-86,-185,89
+-213,-454,0,-86,-185,89
+-191,-454,0,-86,-161,67
+-191,-454,0,-86,-161,67
+-168,-454,0,-86,-143,50
+-168,-454,0,-86,-143,50
+-146,-454,0,-86,-130,37
+-146,-454,0,-86,-130,37
+-134,-454,0,-86,-120,28
+-134,-454,0,-86,-120,28
+-134,-454,0,-86,-113,21
+-134,-454,0,-86,-113,21
+-123,-454,0,-86,-107,15
+-123,-454,509,-86,-107,15
+-224,-445,509,-93,-221,116
+-224,-445,0,-93,-221,116
+-224,-445,0,-93,-190,87
+-224,-445,0,-93,-190,87
+-191,-445,0,-93,-167,65
+-191,-445,0,-93,-167,65
+-179,-445,0,-93,-150,49
+-179,-445,0,-93,-150,49
+-157,-445,0,-93,-137,37
+-157,-445,0,-93,-137,37
+-146,-445,0,-93,-127,27
+-146,-445,0,-93,-127,27
+-134,-445,0,-93,-120,20
+-134,-445,0,-93,-120,20
+-134,-445,0,-93,-115,15
+-134,-445,0,-93,-115,15
+-123,-445,0,-93,-110,11
+-123,-445,0,-93,-110,11
+-123,-445,0,-93,-107,8
+-123,-445,0,-93,-107,8
+-123,-445,0,-93,-105,6
+-123,-445,0,-93,-105,6
+-123,-445,0,-93,-103,4
+-123,-445,0,-93,-103,4
+-112,-445,0,-93,-102,3
+-112,-445,0,-93,-102,3
+-112,-445,0,-93,-101,2
+-112,-445,0,-93,-101,2
+-112,-445,0,-93,-100,2
+-112,-445,0,-93,-100,2
+-112,-445,0,-93,-100,1
+-112,-445,0,-93,-100,1
+-112,-445,0,-93,-99,1
+-112,-445,0,-93,-99,1
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-99,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+-112,-445,0,-93,-98,0
+
+这个是啥原因啊？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 23:06:54Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing VOFA dump channel values and PID behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:06:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining plateau due to static friction and control outputs**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:07:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing control loop compensation and friction effects**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:07:04Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining stall cause from zero integral and removed breakaway**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:07:07Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning clickable relative code references**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:07:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying static friction stall in control loop**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:07:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning speed loop I restoration for stall fix**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:07:30Z)**_
+
+原因很明确：**这不是“进入误差范围后还在输出”，而是它根本没进保持区，它是卡在静摩擦死区里了。**
+
+看你这段最典型的数据：
+
+```text
+-112,-445,0,-93,-98,0
+```
+
+按你现在的 VOFA 通道定义，它表示：
+
+- `ch0 = -112` -> 电机命令角约 `-1.12°`
+- `ch1 = -445` -> 小球位置 `-4.45cm`
+- `ch3 = -93` -> 外环目标速度 `-0.93cm/s`
+- `ch4 = -98` -> 速度环输出倾角 `-0.98°`
+- `ch5 = 0` -> 本地估计速度约 `0`
+
+这说明的是：
+
+1. **球并没有到目标**
+   - 目标是 `-5.5cm`
+   - 当前位置 `-4.45cm`
+   - 误差是 `1.05cm`
+   - 这明显 **不在 `±0.5cm` 保持区内**
+
+2. **外环其实一直在工作**
+   - `ch3 = -93`
+   - 说明位置环还在要求它继续往负方向走
+   - 所以不是“保持逻辑误停”导致的
+
+3. **但内环给出的角度太小，推不动球**
+   - `ch4 = -0.98°`
+   - 最终 `ch0 = -1.12°`，是因为代码里负方向还有 `×1.2` 补偿，见 [pid.c:898-900](Core/Src/pid.c#L898-L900)
+   - 也就是说系统一直在给一个大约 `-1.1°` 的固定倾角
+   - 可球的速度估计 `ch5 = 0`
+   - 这就是典型的 **静摩擦/平台零偏死区：角度不够，球不动**
+
+所以现在这段现象的本质是：
+
+**外环想让球继续走，内环也有输出，但输出太小，刚好不足以克服静摩擦，所以位置卡在 `-4.45cm`，然后一直维持这个小角度不变。**
+
+这和你前面把两样东西拿掉直接相关：
+
+- 你把 `breakaway` 删了
+- 你又把第二段速度环 `I` 清零了
+
+这两个一去掉，系统就只剩一个纯 `P` 速度环。  
+纯 `P` 在小误差区很容易出现这种情况：
+
+- 误差还在
+- 但算出来的倾角不够大
+- 球不动
+- 速度还是 0
+- 输出就永远卡在某个小角度上
+
+从代码上看也是这样：
+
+- 保持区判定在 [pid.c:824-830](Core/Src/pid.c#L824-L830)
+- 你这组数据不满足保持条件
+- 外环输出在 [pid.c:854-860](Core/Src/pid.c#L854-L860)
+- 内环输出在 [pid.c:889-895](Core/Src/pid.c#L889-L895)
+
+也就是说，**逻辑没停，环路还在跑，只是“跑不动”。**
+
+现在最该下的判断是：
+
+- 这不是保持区 bug
+- 这是**删除 breakaway 后，第二段纯 PID 在末端没有足够推力**
+
+要继续用“纯 PID、不加 breakaway”这条路，最直接的办法不是再盯保持区，而是把第二段参数改得能推过这个死区。优先级是：
+
+1. 给第二段速度环恢复一个很小的 `I`
+   - [pid.c:773](Core/Src/pid.c#L773)
+   - 现在是：
+   ```c
+   pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+   ```
+   - 先改成：
+   ```c
+   pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+   ```
+
+2. 如果还推不动，再适当增大第二段速度环 `P`
+   - `1.05 -> 1.15` 或 `1.20`
+
+3. 还不够，再考虑把第二段位置环 `P` 稍微提高
+   - `0.8 -> 0.9`
+
+你这段日志已经把问题说得很清楚了：  
+**系统现在不是在“误差范围内乱输出”，而是在“误差范围外，小角度长期推不动球”。**
+
+---
+
+_**User (2026-08-02 23:16:01Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+你重新读一下代码
+然后分析一组数据
+?89,-101,-456,-359,98,-445
+89,-101,-2643,-359,98,-445
+191,-143,-529,-325,301,-534
+191,-143,-529,-325,301,-534
+202,-151,0,-318,203,-505
+202,-151,0,-318,203,-505
+179,-160,-491,-312,190,-484
+179,-160,-510,-312,190,-484
+179,-168,-510,-305,182,-468
+179,-168,-1900,-305,182,-468
+281,-202,-1900,-278,368,-551
+281,-202,-525,-278,368,-551
+269,-210,0,-271,270,-518
+269,-210,0,-271,270,-518
+168,-210,-966,-271,69,-388
+168,-210,-966,-271,69,-388
+269,-252,-1543,-238,359,-491
+269,-252,0,-238,359,-491
+168,-252,0,-238,88,-368
+168,-252,-464,-238,88,-368
+179,-260,-464,-231,182,-381
+179,-260,-2178,-231,182,-381
+281,-294,0,-204,389,-486
+281,-294,0,-204,389,-486
+179,-294,0,-204,123,-364
+179,-294,0,-204,123,-364
+281,-328,-2051,-177,408,-473
+281,-328,0,-177,408,-473
+179,-328,0,-177,144,-355
+179,-328,-461,-177,144,-355
+236,-336,-461,-170,241,-371
+236,-336,0,-170,241,-371
+134,-336,0,-170,77,-278
+134,-336,-570,-170,77,-278
+191,-344,-449,-164,193,-313
+191,-344,-449,-164,193,-313
+292,-361,-500,-150,394,-435
+292,-361,-500,-150,394,-435
+326,-370,-516,-144,332,-431
+326,-370,-485,-144,332,-431
+326,-378,-485,-137,337,-428
+326,-378,-516,-137,337,-428
+337,-386,-516,-130,342,-426
+337,-386,-499,-130,342,-426
+348,-395,-499,-123,348,-424
+348,-395,-477,-123,348,-424
+348,-403,-1557,-117,355,-423
+348,-403,-1557,-117,355,-423
+449,-428,0,-96,541,-517
+449,-428,0,-96,541,-517
+348,-428,0,-96,270,-388
+348,-428,-509,-96,270,-388
+348,-437,-509,-90,359,-396
+348,-437,0,-90,359,-396
+258,-437,0,-90,188,-297
+258,-437,-480,-90,188,-297
+292,-445,-514,-83,299,-327
+292,-445,-514,-83,299,-327
+326,-454,0,-76,330,-350
+326,-454,0,-76,330,-350
+348,-462,-480,-70,354,-368
+348,-462,0,-70,354,-368
+247,-462,0,-70,190,-276
+247,-462,-520,-70,190,-276
+303,-470,-520,-63,307,-312
+303,-470,0,-63,307,-312
+202,-470,-503,-63,157,-234
+202,-470,-503,-63,157,-234
+281,-479,0,-56,284,-280
+281,-479,0,-56,284,-280
+314,-487,-490,-49,326,-315
+314,-487,0,-49,326,-315
+224,-487,0,-49,175,-236
+224,-487,0,-49,175,-236
+123,-487,0,-49,117,-177
+123,-487,-488,-49,117,-177
+224,-496,0,-43,257,-238
+224,-496,0,-43,257,-238
+123,-496,0,-43,125,-178
+123,-496,0,-43,125,-178
+78,-496,0,-43,82,-133
+78,-496,0,-43,82,-133
+44,-496,0,-43,49,-100
+44,-496,0,-43,49,-100
+22,-496,0,-43,24,-75
+22,-496,0,-43,24,-75
+0,-496,0,-43,5,-56
+0,-496,0,-43,5,-56
+0,-496,0,-43,-8,-42
+0,-496,0,-43,-8,-42
+-11,-496,0,-43,-18,-31
+-11,-496,0,-43,-18,-31
+-22,-496,0,-43,-26,-23
+-22,-496,0,-43,-26,-23
+-22,-496,0,-43,-32,-17
+-22,-496,0,-43,-32,-17
+-33,-496,0,-43,-36,-13
+-33,-496,0,-43,-36,-13
+-33,-496,0,-43,-39,-10
+-33,-496,0,-43,-39,-10
+-134,-487,479,-49,-226,97
+-134,-487,0,-49,-226,97
+-123,-487,0,-49,-129,73
+-123,-487,0,-49,-129,73
+-101,-487,0,-49,-111,54
+-101,-487,0,-49,-111,54
+-89,-487,0,-49,-97,41
+-89,-487,0,-49,-97,41
+-191,-479,522,-56,-272,135
+-191,-479,522,-56,-272,135
+-157,-479,0,-56,-165,101
+-157,-479,0,-56,-165,101
+-134,-479,0,-56,-140,76
+-134,-479,0,-56,-140,76
+-112,-479,0,-56,-121,57
+-112,-479,0,-56,-121,57
+-101,-479,0,-56,-107,42
+-101,-479,0,-56,-107,42
+-89,-479,0,-56,-96,32
+-89,-479,0,-56,-96,32
+-78,-479,0,-56,-88,24
+-78,-479,0,-56,-88,24
+-78,-479,0,-56,-82,18
+-78,-479,0,-56,-82,18
+-67,-479,0,-56,-78,13
+-67,-479,0,-56,-78,13
+-67,-479,510,-56,-75,10
+-67,-479,510,-56,-75,10
+-168,-470,0,-63,-256,112
+-168,-470,0,-63,-256,112
+-146,-470,0,-63,-155,84
+-146,-470,0,-63,-155,84
+-134,-470,0,-63,-135,63
+-134,-470,0,-63,-135,63
+-112,-470,0,-63,-119,47
+-112,-470,0,-63,-119,47
+-101,-470,0,-63,-107,35
+-101,-470,0,-63,-107,35
+-89,-470,0,-63,-99,26
+-89,-470,0,-63,-99,26
+-89,-470,0,-63,-92,20
+-89,-470,0,-63,-92,20
+-78,-470,0,-63,-87,15
+-78,-470,525,-63,-87,15
+-179,-462,525,-70,-268,116
+-179,-462,0,-70,-268,116
+-157,-462,0,-70,-166,87
+-157,-462,0,-70,-166,87
+-134,-462,0,-70,-144,65
+-134,-462,0,-70,-144,65
+-123,-462,0,-70,-128,49
+-123,-462,0,-70,-128,49
+-112,-462,-505,-70,-116,36
+-112,-462,-505,-70,-116,36
+-11,-470,0,-63,76,-77
+-11,-470,0,-63,76,-77
+-11,-470,0,-63,-15,-58
+-11,-470,0,-63,-15,-58
+-22,-470,0,-63,-30,-43
+-22,-470,0,-63,-30,-43
+-33,-470,0,-63,-40,-32
+-33,-470,0,-63,-40,-32
+-44,-470,0,-63,-48,-24
+-44,-470,0,-63,-48,-24
+-44,-470,0,-63,-54,-18
+-44,-470,0,-63,-54,-18
+-56,-470,0,-63,-59,-13
+-56,-470,0,-63,-59,-13
+-56,-470,0,-63,-62,-10
+-56,-470,0,-63,-62,-10
+-56,-470,0,-63,-65,-7
+-56,-470,0,-63,-65,-7
+-56,-470,0,-63,-67,-5
+-56,-470,0,-63,-67,-5
+-67,-470,0,-63,-68,-4
+-67,-470,0,-63,-68,-4
+-67,-470,0,-63,-69,-3
+-67,-470,0,-63,-69,-3
+-67,-470,0,-63,-70,-2
+-67,-470,0,-63,-70,-2
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-72,0
+-67,-470,511,-63,-72,0
+-168,-462,511,-70,-256,104
+-168,-462,0,-70,-256,104
+-157,-462,0,-70,-157,78
+-157,-462,0,-70,-157,78
+-134,-462,-504,-70,-138,58
+-134,-462,-504,-70,-138,58
+-33,-470,0,-63,60,-60
+-33,-470,0,-63,60,-60
+-22,-470,0,-63,-27,-45
+-22,-470,0,-63,-27,-45
+-33,-470,0,-63,-39,-34
+-33,-470,0,-63,-39,-34
+-44,-470,0,-63,-47,-25
+-44,-470,0,-63,-47,-25
+-44,-470,0,-63,-53,-19
+-44,-470,0,-63,-53,-19
+-56,-470,0,-63,-58,-14
+-56,-470,0,-63,-58,-14
+-56,-470,0,-63,-62,-10
+-56,-470,0,-63,-62,-10
+-56,-470,0,-63,-64,-8
+-56,-470,0,-63,-64,-8
+-56,-470,0,-63,-66,-6
+-56,-470,0,-63,-66,-6
+-67,-470,0,-63,-68,-4
+-67,-470,0,-63,-68,-4
+-67,-470,0,-63,-69,-3
+-67,-470,0,-63,-69,-3
+-67,-470,0,-63,-70,-2
+-67,-470,0,-63,-70,-2
+-67,-470,0,-63,-70,-1
+-67,-470,0,-63,-70,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-71,-1
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+
+小球经常停在-4.7、-4.8的位置
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:15Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing control loop speed discrepancies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:16Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Tracing PID hold logic and error causes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying stall point within target band**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing PID segment and signal anomalies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Quantifying dead-zone equilibrium and control gains**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Noticing signal bursts in raw Maix data**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing PID code links and signal spikes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Diagnosing PID deadlock and proposing minimal fixes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:16:59Z)**_
+
+我重新按当前代码读了一遍，结论很清楚：
+
+**小球停在 `-4.7 / -4.8`，不是因为代码进了保持区，也不是因为 PID 停了，而是第二段纯串级 PID 的输出太小，推不过静摩擦。**
+
+关键代码在 [Core/Src/pid.c:818-860](Core/Src/pid.c#L818-L860) 和 [Core/Src/pid.c:888-900](Core/Src/pid.c#L888-L900)：
+
+1. **最终保持只在误差进 `±0.5cm` 且速度足够小、连续稳定 6 个周期才会触发**
+2. **第二段现在已经没有 `breakaway`**
+3. **速度环现在按纯 PID 直接输出倾角**
+
+你这组数据里最典型的是后面这一长段：
+
+```text
+-67,-470,0,-63,-72,0
+-67,-470,0,-63,-72,0
+...
+```
+
+按你现在的通道定义：
+
+- `ch0 = -67` -> 电机命令角约 `-0.67°`
+- `ch1 = -470` -> 小球位置 `-4.70cm`
+- `ch3 = -63` -> 外环目标速度 `-0.63cm/s`
+- `ch4 = -72` -> 速度环输出倾角 `-0.72°`
+- `ch5 = 0` -> 本地估计速度约 `0`
+
+这组数和当前代码是完全对得上的：
+
+### 1. 它根本没到目标
+目标是 `-5.5cm`，现在在 `-4.70cm`，误差是 `0.80cm`。  
+所以它**不在保持区里**，保持逻辑没触发。
+
+### 2. 外环其实一直在要求它继续往负方向走
+第二段参数在 [Core/Src/pid.c:773](Core/Src/pid.c#L773)：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+```
+
+在 `-4.70cm` 时：
+
+- 相对目标误差 `relative_y = -4.70 - (-5.5) = +0.80`
+- 外环目标是 `0`
+- 所以误差 `pidY.error = 0 - 0.80 = -0.80`
+- 位置环 `P=0.8`
+- 外环输出大约就是 `-0.64cm/s`
+
+这正好对应你日志里的 `ch3 ≈ -63`。
+
+### 3. 速度环也在工作，但给出来的角度不够大
+此时 `ch5 ≈ 0`，也就是球基本不动。  
+速度环目标速度是 `-0.63cm/s`，反馈是 `0`，而你第二段速度环现在是：
+
+- `P = 1.05`
+- `I = 0`
+- `D = 0`
+
+所以速度环输出大约就是：
+
+- `1.05 × (-0.63) ≈ -0.66°`
+
+这也正好对应你日志里的 `ch4 ≈ -72`，`ch0 ≈ -67` 这一带。
+
+**问题就在这：`-0.7°` 左右的倾角，刚好不足以把球从 `-4.7` 再往 `-5.5` 推过去。**
+
+于是系统就进入一个很典型的状态：
+
+- 外环说：继续往左走一点
+- 内环说：我给你一个小负角
+- 但这个小负角不够克服静摩擦/平台零偏
+- 球速度仍然是 0
+- 输出就长期卡在这个小角度
+- 位置就长期卡在 `-4.7 / -4.8`
+
+这就是你现在看到的现象。
+
+### 4. 那些 `ch2` 的大尖峰不是主因
+你这组里还有很多：
+
+- `-2643`
+- `-1900`
+- `-2178`
+
+这是 `ch2`，也就是 MaixCAM 原始速度。  
+当前控制实际用的是 `ch5`，代码在 [Core/Src/pid.c:805-812](Core/Src/pid.c#L805-L812) 和 [Core/Src/pid.c:863-873](Core/Src/pid.c#L863-L873)。  
+所以这组数据里真正该盯的是 `ch3/ch4/ch5`，不是 `ch2`。
+
+---
+
+**所以这组数据的结论是：**
+
+- 不是保持区误判
+- 不是 PID 停掉了
+- 不是代码没工作
+- 是**第二段参数在纯串级、无 breakaway、速度环 `I=0` 的情况下，末端推力不够，形成了静摩擦死区**
+
+---
+
+**最小改动建议**
+
+先只改第二段这一行 [Core/Src/pid.c:773](Core/Src/pid.c#L773)：
+
+从：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+```
+
+改成：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.01f, 0.0f);
+```
+
+也就是：
+
+- 先只把**第二段速度环 `I` 恢复成 `0.01`**
+
+原因很简单：
+
+- 现在卡在 `-4.7` 是因为纯 `P` 只能给出一个固定小角度
+- 加一点 `I`，它会慢慢把这个小角度积大
+- 一旦积到能克服静摩擦，球就会继续往 `-5.5` 走
+
+如果你还想继续保持“尽量少动结构”，这是当前最对症的一步。
+
+---
+
+_**User (2026-08-02 23:23:05Z)**_
+
+?18,210,-501
+202,-160,-492,-312,194,-481
+202,-160,-492,-312,194,-481
+179,-168,-492,-305,184,-466
+179,-168,-492,-305,184,-466
+78,-168,-501,-305,50,-349
+78,-168,-501,-305,50,-349
+179,-218,-502,-264,226,-462
+179,-218,-502,-264,226,-462
+281,-244,-1483,-244,347,-546
+281,-244,-508,-244,347,-546
+314,-252,-508,-238,318,-514
+314,-252,-490,-238,318,-514
+292,-260,-490,-231,298,-491
+292,-260,-502,-231,298,-491
+281,-269,-1543,-224,286,-473
+281,-269,-1543,-224,286,-473
+382,-302,-500,-197,410,-555
+382,-302,-500,-197,410,-555
+371,-311,-491,-191,379,-521
+371,-311,-511,-191,379,-521
+348,-319,-511,-184,358,-495
+348,-319,-493,-184,358,-495
+337,-328,-493,-177,344,-476
+337,-328,-1511,-177,344,-476
+438,-353,0,-157,460,-557
+438,-353,0,-157,460,-557
+539,-386,-2001,-130,560,-618
+539,-386,-2001,-130,560,-618
+438,-386,0,-130,383,-463
+438,-386,-497,-130,383,-463
+371,-395,-497,-123,378,-452
+371,-395,-500,-123,378,-452
+371,-403,-500,-117,376,-444
+371,-403,-501,-117,376,-444
+371,-412,0,-110,377,-438
+371,-412,0,-110,377,-438
+269,-412,-499,-110,251,-328
+269,-412,-499,-110,251,-328
+371,-428,-499,-96,402,-446
+371,-428,-504,-96,402,-446
+393,-437,-504,-90,402,-439
+393,-437,-510,-90,402,-439
+393,-445,-510,-83,404,-434
+393,-445,0,-83,404,-434
+303,-445,0,-83,279,-326
+303,-445,-501,-83,279,-326
+303,-454,-514,-76,313,-349
+303,-454,-514,-76,313,-349
+337,-462,-497,-70,341,-367
+337,-462,-497,-70,341,-367
+359,-470,0,-63,364,-380
+359,-470,0,-63,364,-380
+382,-479,-415,-56,383,-390
+382,-479,0,-56,383,-390
+281,-479,0,-56,271,-292
+281,-479,-506,-56,271,-292
+314,-487,-506,-49,315,-324
+314,-487,0,-49,315,-324
+213,-487,0,-49,222,-243
+213,-487,0,-49,222,-243
+269,-496,-465,-43,281,-287
+269,-496,-465,-43,281,-287
+191,-496,0,-43,198,-215
+191,-496,0,-43,198,-215
+134,-496,0,-43,136,-161
+134,-496,0,-43,136,-161
+78,-496,0,-43,89,-121
+78,-496,0,-43,89,-121
+44,-496,0,-43,54,-90
+44,-496,0,-43,54,-90
+22,-496,0,-43,28,-68
+22,-496,0,-43,28,-68
+0,-496,0,-43,9,-51
+0,-496,0,-43,9,-51
+0,-496,0,-43,-5,-38
+0,-496,0,-43,-5,-38
+-11,-496,0,-43,-16,-28
+-11,-496,0,-43,-16,-28
+-22,-496,0,-43,-24,-21
+-22,-496,0,-43,-24,-21
+-22,-496,0,-43,-31,-16
+-22,-496,0,-43,-31,-16
+-33,-496,0,-43,-35,-12
+-33,-496,0,-43,-35,-12
+-33,-496,0,-43,-39,-9
+-33,-496,0,-43,-39,-9
+-33,-496,0,-43,-41,-6
+-33,-496,0,-43,-41,-6
+-33,-496,0,-43,-43,-5
+-33,-496,0,-43,-43,-5
+-44,-496,0,-43,-45,-3
+-44,-496,0,-43,-45,-3
+-134,-487,543,-49,-174,102
+-134,-487,0,-49,-174,102
+-134,-487,0,-49,-145,76
+-134,-487,0,-49,-145,76
+-112,-487,0,-49,-123,57
+-112,-487,0,-49,-123,57
+-101,-487,504,-49,-106,43
+-101,-487,504,-49,-106,43
+-202,-479,0,-56,-223,137
+-202,-479,0,-56,-223,137
+-179,-479,0,-56,-183,102
+-179,-479,0,-56,-183,102
+-146,-479,0,-56,-153,77
+-146,-479,0,-56,-153,77
+-123,-479,0,-56,-131,57
+-123,-479,0,-56,-131,57
+-112,-479,0,-56,-115,43
+-112,-479,0,-56,-115,43
+-101,-479,0,-56,-102,32
+-101,-479,0,-56,-102,32
+-89,-479,0,-56,-93,24
+-89,-479,0,-56,-93,24
+-78,-479,0,-56,-86,18
+-78,-479,0,-56,-86,18
+-78,-479,0,-56,-80,13
+-78,-479,492,-56,-80,13
+-179,-470,0,-63,-205,115
+-179,-470,0,-63,-205,115
+-168,-470,468,-63,-172,86
+-168,-470,468,-63,-172,86
+-269,-462,0,-70,-275,169
+-269,-462,0,-70,-275,169
+-224,-462,0,-70,-227,127
+-224,-462,0,-70,-227,127
+-179,-462,0,-70,-190,95
+-179,-462,0,-70,-190,95
+-157,-462,0,-70,-163,71
+-157,-462,0,-70,-163,71
+-134,-462,464,-70,-142,53
+-134,-462,464,-70,-142,53
+-236,-454,0,-76,-255,145
+-236,-454,0,-76,-255,145
+-202,-454,0,-76,-213,108
+-202,-454,0,-76,-213,108
+-179,-454,0,-76,-182,81
+-179,-454,0,-76,-182,81
+-157,-454,0,-76,-158,61
+-157,-454,497,-76,-158,61
+-258,-445,0,-83,-269,150
+-258,-445,0,-83,-269,150
+-224,-445,0,-83,-226,113
+-224,-445,0,-83,-226,113
+-191,-445,0,-83,-193,84
+-191,-445,0,-83,-193,84
+-168,-445,0,-83,-169,63
+-168,-445,0,-83,-169,63
+-146,-445,0,-83,-150,47
+-146,-445,0,-83,-150,47
+-134,-445,0,-83,-137,35
+-134,-445,0,-83,-137,35
+-123,-445,0,-83,-126,26
+-123,-445,0,-83,-126,26
+-112,-445,0,-83,-119,20
+-112,-445,0,-83,-119,20
+-112,-445,0,-83,-113,15
+-112,-445,501,-83,-113,15
+-202,-437,501,-90,-237,116
+-202,-437,0,-90,-237,116
+-202,-437,0,-90,-204,87
+-202,-437,0,-90,-204,87
+-168,-437,0,-90,-179,65
+-168,-437,0,-90,-179,65
+-157,-437,0,-90,-160,49
+-157,-437,0,-90,-160,49
+-134,-437,0,-90,-146,36
+-134,-437,0,-90,-146,36
+-134,-437,0,-90,-135,27
+-134,-437,0,-90,-135,27
+-123,-437,0,-90,-127,20
+-123,-437,0,-90,-127,20
+-112,-437,0,-90,-121,15
+-112,-437,0,-90,-121,15
+-112,-437,0,-90,-117,11
+-112,-437,0,-90,-117,11
+-112,-437,0,-90,-113,8
+-112,-437,0,-90,-113,8
+-101,-437,0,-90,-111,6
+-101,-437,0,-90,-111,6
+-101,-437,0,-90,-109,4
+-101,-437,0,-90,-109,4
+-101,-437,0,-90,-108,3
+-101,-437,0,-90,-108,3
+-101,-437,0,-90,-106,2
+-101,-437,0,-90,-106,2
+-101,-437,0,-90,-106,2
+-101,-437,0,-90,-106,2
+-101,-437,0,-90,-105,1
+-101,-437,0,-90,-105,1
+-101,-437,0,-90,-105,1
+-101,-437,0,-90,-105,1
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+-101,-437,0,-90,-103,0
+你重新读一遍代码，然后分析数据，看看应该怎么调
+
+_**User (2026-08-02 23:24:52Z)**_
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. Primary Request and Intent:
+
+- The overall project is STM32F407 firmware for a ball-balancing / position-control system using:
+  - MaixCAM vision over USART2
+  - stepper motor driver over UART1
+  - VOFA telemetry over USART3
+  - wireless tuning over UART4 on PC10/PC11
+- Earlier in the conversation, the user asked to:
+  - add wireless tuning on PC10/PC11
+  - add a `GET_0` wireless homing/origin command
+  - support tuning the position loop first by bypassing the inner speed loop
+  - restore cascaded PID after tuning
+  - increase positive angle limit
+  - change hold behavior around `±0.5 cm`
+  - implement a rigorous segmented motion:
+    - `0 -> +5.6 cm` with PID set A
+    - then `+5.6 -> -5.5 cm` with PID set B
+    - finally hold at `-5.5 cm`
+- In the portion after the previous compaction, the user’s intent shifted to troubleshooting unstable second-stage behavior and simplifying control logic:
+  - asked where to tune the `+5.6 -> -5.5 cm` PID
+  - supplied multiple VOFA logs and asked why the ball oscillates near target
+  - said “我的意思是现在PID调节的很不稳定”
+  - selected the `breakaway / stuck` macro block in `pid.h` and said they felt these were unnecessary
+  - explicitly requested: delete those `STUCK_* / BREAKAWAY_*` mechanisms and test
+  - then clarified: “那你在原文件清理吧”
+  - asked where PID is tuned in code
+  - then asked for code-informed analysis of VOFA data, including why outputs still exist near target and why the ball often stops around `-4.7` / `-4.8`
+- The most recent unfinished request before this summary was:
+  - “你重新读一下代码 然后分析一组数据”
+  - followed by a long VOFA dump
+  - followed by: “小球经常停在-4.7、-4.8的位置”
+
+2. Key Technical Concepts:
+
+- STM32F407 embedded firmware
+- HAL UART / DMA / interrupt callbacks
+- UART4 on PC10/PC11 for wireless tuning
+- Stepper motor control via `Emm_V5_Pos_Control`
+- Motor homing/origin via `Emm_V5_Origin_Trigger_Return`
+- Cascaded PID:
+  - outer loop: position -> target speed
+  - inner loop: speed -> platform angle
+- Optional direct-drive mode:
+  - `POSITION_LOOP_DIRECT_DRIVE`
+- VOFA telemetry channels:
+  - `ch0`: commanded motor angle
+  - `ch1`: ball position `Y`
+  - `ch2`: raw MaixCAM speed
+  - `ch3`: outer-loop output / target speed
+  - `ch4`: speed-loop output angle
+  - `ch5`: locally estimated filtered velocity
+- Local velocity estimation from position difference:
+  - `estimated_velocity = position_delta / PID_CONTROL_PERIOD_S`
+- Low-pass filtering of local velocity:
+  - `BALL_VELOCITY_FILTER_ALPHA`
+- Hold-zone / final-hold state machine
+- Segmented PID profiles:
+  - first stage to `+5.6`
+  - second stage to `-5.5`
+  - final hold after second stage
+- Conditional anti-windup / clamped PID:
+  - `pid_cal_clamped()`
+- Negative-direction compensation:
+  - `if(cmd_angle < 0.0f) cmd_angle *= 1.2f;`
+- Angle slew limiting:
+  - `ANGLE_SLEW_PER_TICK`
+- Build system:
+  - CMake / Ninja / STM32CubeCLT
+
+3. Files and Code Sections:
+
+- `Core/Src/pid.c`
+  - This is the main control-logic file for segmented cascaded PID and was the primary focus of recent work.
+  - It already contained:
+    - segmented PID state machine
+    - target-hold logic
+    - local velocity estimation
+    - speed-loop control
+    - negative-direction `×1.2` compensation
+  - Important existing code patterns retained:
+    ```c
+    static void pid_apply_segment_profile(float target_y,
+                                          float pos_p, float pos_i, float pos_d,
+                                          float spd_p, float spd_i, float spd_d)
+    {
+        pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+        pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+        ball_target_set(target_y);
+    }
+    ```
+  - First stage profile currently used:
+    ```c
+    pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+    ```
+  - Second stage profile currently used after recent edits:
+    ```c
+    pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.05f, 0.0f, 0.0f);
+    ```
+    - Note: second-stage speed-loop `I` had been set to `0.0f` during troubleshooting.
+  - Final-hold gating logic added earlier and still present:
+    ```c
+    if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+        if(target_hold_active) {
+            if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+                target_hold_active = false;
+                target_hold_settle_ticks = 0u;
+            }
+        } else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+                  abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+            if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+                target_hold_settle_ticks++;
+            }
+            if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+                target_hold_active = true;
+            }
+        } else {
+            target_hold_settle_ticks = 0u;
+        }
+    } else {
+        target_hold_active = false;
+        target_hold_settle_ticks = 0u;
+    }
+    ```
+  - Outer-loop zeroing in hold:
+    ```c
+    pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+                    POS_LOOP_I_LIMIT);
+    if(target_hold_active) {
+        pidY.out = 0.0f;
+    }
+    ```
+  - Local velocity estimation and filtering:
+    ```c
+    float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+    float control_velocity = estimated_velocity;
+    if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+        control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+    } else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+        control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+    }
+    pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+                              (control_velocity - pidY_filtered_velocity);
+    ```
+  - Current pure speed-loop branch after breakaway cleanup was intended to be:
+    ```c
+    pidY_Speed.target = pidY.out;
+    pidY_Speed.now = pidY_filtered_velocity;
+    pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+                    SPEED_LOOP_I_LIMIT);
+    pidY_velocity_damping = pidY_Speed.out;
+    float cmd_angle = pidY_velocity_damping;
+    ```
+  - Negative-direction compensation retained:
+    ```c
+    if(cmd_angle < 0.0f) {
+        cmd_angle *= 1.2f;
+    }
+    ```
+  - The file was edited multiple times to remove all `breakaway / stuck` behavior from `pid_control__26Y()`.
+  - Important reason this file matters:
+    - It is where segmented profiles are defined
+    - It is where the hold-state decision is made
+    - It is where the user’s instability concerns are being debugged
+
+- `Core/Inc/pid.h`
+  - Holds key control constants and mode switches.
+  - Previously contained the breakaway-related macro block:
+    ```c
+    #define STUCK_POSITION_THRESHOLD      1.0f
+    #define STUCK_POSITION_DELTA          0.03f
+    #define STUCK_TICKS_REQUIRED          10u
+    #define BREAKAWAY_POS_ANGLE_BASE      2.0f
+    #define BREAKAWAY_NEG_ANGLE_BASE     -3.0f
+    #define BREAKAWAY_POS_ANGLE_MAX       4.0f
+    #define BREAKAWAY_NEG_ANGLE_MAX      -5.0f
+    #define BREAKAWAY_ANGLE_STEP          0.5f
+    #define BREAKAWAY_RAMP_TICKS          8u
+    #define BREAKAWAY_RELEASE_DISTANCE    0.25f
+    ```
+  - The user explicitly said they felt this was unnecessary and asked to delete it.
+  - Those macros were removed from `pid.h`.
+  - Hold-related constants remain:
+    ```c
+    #define TARGET_HOLD_POSITION_ENTER  0.50f
+    #define TARGET_HOLD_POSITION_EXIT   0.60f
+    #define TARGET_HOLD_SPEED_LIMIT     0.25f
+    #define TARGET_HOLD_SETTLE_TICKS    6u
+    ```
+  - Other still-important constants:
+    ```c
+    #define BALL_VELOCITY_FILTER_ALPHA  0.25f
+    #define ANGLE_SLEW_PER_TICK         1.0f
+    #define SPEED_LOOP_ANGLE_LIMIT      10.0f
+    ```
+
+- `Core/Src/main.c`
+  - Important because it defines VOFA channel mapping used throughout all later analysis:
+    ```c
+    vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0
+    vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1
+    vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2
+    vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3
+    vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);      // ch4
+    vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);     // ch5
+    ```
+  - Earlier hardcoded PID initialization had already been removed so that `pid.c` owns segmented initialization.
+
+- `Core/Src/bt_tune.c`
+  - Previously created and extended to support:
+    - wireless tuning
+    - GETPID
+    - parameter write commands
+    - integrator reset
+    - `GET_0` homing
+  - Important code:
+    ```c
+    if(strcmp(cmd, "GET_0") == 0) {
+        pidY.iout = 0.0f;
+        pidY_Speed.iout = 0.0f;
+        motor_set_angle(0.0f);
+        Emm_V5_Origin_Trigger_Return(BT_TUNE_MOTOR_ADDR, 0, 0);
+        BT_Tune_SendOk();
+        return;
+    }
+    ```
+
+- `Core/Inc/bt_tune.h`
+  - Declares wireless tuning interface:
+    ```c
+    void BT_Tune_Init(void);
+    void BT_Tune_RestartRx(void);
+    void BT_Tune_ByteReceived(void);
+    void BT_Tune_Process(void);
+    ```
+
+- `Core/Src/usart.c`, `Core/Inc/usart.h`, `Core/Src/stm32f4xx_it.c`, `Core/Inc/stm32f4xx_it.h`, `Code_of_ZDT.ioc`, `CMakeLists.txt`
+  - These were modified earlier to support UART4 and compile `bt_tune.c`.
+  - They remain important background context but were not the main focus in the most recent troubleshooting.
+
+4. Errors and fixes:
+
+- Earlier error:
+  - Attempted to use `apply_patch` via Bash, but `/usr/bin/bash: line ... apply_patch: command not found`
+  - Fix:
+    - switched to `Edit` tool and later targeted `Bash`/script-based in-place replacement when `Edit` exact-match became cumbersome
+
+- Earlier warning/fix:
+  - After enabling direct-drive mode, some `breakaway` statics became unused
+  - Fix:
+    - wrapped them with `#if !POSITION_LOOP_DIRECT_DRIVE`
+
+- Later compile failure after deleting breakaway macros from `pid.h`:
+  - `pid.c` still referenced:
+    - `breakaway_active`
+    - `breakaway_start_error`
+    - `breakaway_angle`
+    - `stuck_ticks`
+    - `STUCK_*`
+    - `BREAKAWAY_*`
+  - Build errors included undeclared identifiers in `pid_control__26Y()`
+  - Fix approach:
+    - remove statics
+    - remove target-change resets
+    - remove hold-zone resets
+    - replace the entire `#else` speed-loop branch under `#if POSITION_LOOP_DIRECT_DRIVE`
+    - ultimately used a line-range script replacement because `Edit` exact block matching kept failing
+
+- Multiple `Edit` failures:
+  - Several exact-string replacements failed because file content had already shifted from prior edits
+  - Fix:
+    - re-read current file slices
+    - then either attempt smaller exact edits or use scripted line-range replacement
+
+- Bash replacement path errors:
+  - Python replacement attempt failed with path issues (`FileNotFoundError`) due to Unix-like path form
+  - Fix:
+    - switched to Windows absolute path `d:\\File\\2026diansaiH\\Code_of_ZDT\\Core\\Src\\pid.c`
+
+- Python substring-replacement failure:
+  - `ValueError: substring not found`
+  - Fix:
+    - re-read exact current content
+    - then performed a line-range replacement by line number
+
+- Final successful cleanup/verification:
+  - Removed remaining breakaway lines around lines corresponding to `888-975`
+  - Verified with grep-like search that no `breakaway|stuck_ticks|STUCK_|BREAKAWAY_` remained in `pid.c`
+  - Rebuilt successfully:
+    - `RAM: 3496 B`
+    - `FLASH: 37544 B`
+
+- User feedback that changed direction:
+  - “我觉得没必要写这些 ... 你把他们删了看一下”
+  - “那你在原文件清理吧”
+  - This is important: the user preferred simplification and removal of extra compensation logic instead of tuning around it.
+
+5. Problem Solving:
+
+Solved / implemented earlier:
+- Added wireless PID tuning on UART4
+- Added `GET_0` motor homing command
+- Implemented segmented PID state machine for:
+  - `0 -> +5.6`
+  - `+5.6 -> -5.5`
+  - final hold at `-5.5`
+- Added position+speed+settle-time gating before final hold:
+  - hold no longer entered by position alone
+
+Ongoing troubleshooting in the recent portion:
+- Investigated why ball oscillated or stopped incorrectly near target
+- Determined that:
+  - some earlier “still has output in error band” cases were actually not within the final hold window once target-relative error was interpreted correctly
+  - other cases were not “hold output bug” but rather “outer loop still wants motion, inner loop angle too small to overcome friction”
+- When the user objected to the complexity of `STUCK_* / BREAKAWAY_*`, simplified the controller:
+  - removed all breakaway/static-friction compensation
+  - left only pure cascaded PID
+- After cleanup, the assistant explained that new logs showing the ball stuck near `-4.45` / `-4.70` / `-4.80` were likely due to:
+  - pure PID producing too small a negative angle near the end
+  - insufficient torque/tilt to overcome static friction
+  - the ball therefore stopping short outside the `-5.5 ± 0.5` target band
+- Most recent unresolved investigation:
+  - The user asked to re-read code and analyze a new dataset
+  - The user explicitly reported:
+    - “小球经常停在-4.7、-4.8的位置”
+  - This indicates the short-of-target stall remains an active issue after breakaway removal
+
+6. All user messages:
+
+Messages from before the previous compaction, preserved from prior summary:
+- “#include "bt_tune.h" ... 加入无线调参，使用串口PC10、PC11”
+- “增加电机归零指令“GET_0“电机归零到归零点”
+- VOFA log dump ending with: “这是电机到限幅了吗？”
+- VOFA log dump plus selected `pid.h` lines: “现在限幅不是 ... 十度吗？怎么是再517？”
+- “现在我要调这个串级pid的参数，先调位置环，你把位置环的输出先给我加载到电机，我先单调位置环”
+- “现在我调好了位置环的P时0.68，D项和I项都没有，现在改回串级，我调速度环的pid”
+- “上升角度限幅加大两度”
+- “现在无线调参，电机归零写了吗？”
+- “误差范围在0.5左右，PID还会调节吗？”
+- “误差在0.5cm时停止PID调节”
+- “[Request interrupted by user] 误差在0.5cm时停止PID调节”
+- Very long VOFA dump ending with: “为啥在在误差范围内，PID还在调节？”
+- “那在误差范围内 所有的PID 都停止”
+- Very long VOFA dump ending with: “这里0到500的电机跳变值是怎么回事？”
+- “那应该怎么解决这个电机跳变问题？你分析一下，先别改代码”
+- “那你用这个吧 最稳的方案 不要‘所有 PID 全停’ 保持区里只停位置环，速度环继续做‘目标速度 = 0’的保持”
+- “现在要求小球能从0位置点，往5.6cm处移动，小球一旦到达5.6cm处小球立刻往-5.5位置处移动，然后稳定在-5.5cm处。但是这两段位置移动使用分段PID控制，从0cm处到5.6cm处，PID控制参数为 ... 你明白我意思吗？说一下你想怎么控制这一段”
+- “很好，那你现在开始写代码吧，要求逻辑严谨”
+
+Messages after the previous compaction:
+- “那现在我还想调一下5到-5cm的PID，应该在那调节？”
+- “[Request interrupted by user] 那现在我还想调一下5到-5cm的PID，应该在那调节？”
+- Large VOFA dump ending with: “为啥会在目标附近来回摆？”
+- Large VOFA dump ending with: “还是回来回抖”
+- “甚至听错位置”
+- “我现在把速度环的I项清零了”
+- Very large VOFA dump labeled:
+  - “第一组”
+  - “第二组”
+- “我的意思是现在PID调节的很不稳定”
+- Selected `pid.h` lines containing the `STUCK_* / BREAKAWAY_*` block
+- “我觉得没必要写这些 ... 你把他们删了看一下·”
+- “[Request interrupted by user] ... 你把他们删了看一下·”
+- “那你在原文件清理吧”
+- “PID在哪里调？”
+- Data snippet ending with:
+  - “这个值不是在误差范围之内了吗？”
+  - “为啥还是会有输出”
+- “你重新读一下代码”
+- “然后分析一组数据”
+- Large VOFA dataset
+- “小球经常停在-4.7、-4.8的位置”
+
+7. Pending Tasks:
+
+- Analyze the most recent VOFA dataset with the current cleaned `pid.c` logic in mind.
+- Explain why the ball often stops around `-4.7` / `-4.8` instead of reaching `-5.5`.
+- Likely determine whether the remaining shortfall is due to:
+  - insufficient second-stage PID authority
+  - negative-direction compensation behavior
+  - hold-window transition timing
+  - filtered local velocity behavior
+  - or some combination of these
+- Potentially recommend or implement next PID/logic changes, but only after the requested analysis.
+
+8. Current Work:
+
+Immediately before this summary request:
+- The user asked:
+  - “你重新读一下代码 然后分析一组数据”
+- They then pasted a long VOFA log and concluded:
+  - “小球经常停在-4.7、-4.8的位置”
+- The active codebase state at that point was:
+  - `breakaway / stuck` compensation removed from `pid.h`
+  - all corresponding references removed from `pid.c`
+  - `pid_control__26Y()` reduced to pure cascaded PID with:
+    - segmented profile switching
+    - hold gating by position + speed + settle count
+    - local velocity estimate
+    - normal speed-loop output
+    - negative-direction `×1.2` compensation
+- The assistant had just finished explaining earlier logs in terms of:
+  - target-relative error
+  - whether `ch3 = 0` meant hold or not
+  - whether small residual output came from inner speed-loop damping
+- The assistant had not yet completed the requested fresh analysis of the newest dataset after “重新读一下代码”.
+- The newest dataset strongly shows repeated shortfall and settling before reaching `-5.5`, with many repeated values around:
+  - `ch1 ≈ -470` or `-445`
+  - `ch3` still negative in some regions
+  - `ch4` modest negative output
+  - `ch5` approaching `0`
+- The user’s practical complaint at the current stopping point is:
+  - the ball often halts at about `-4.7` / `-4.8` instead of the intended `-5.5`
+
+9. Optional Next Step:
+
+Directly aligned next step:
+- Analyze the latest VOFA group against the current cleaned `pid_control__26Y()` logic, focusing on why the system settles short around `-4.7` / `-4.8`.
+
+Direct quote showing exactly where work was left:
+- User: “你重新读一下代码”
+- User: “然后分析一组数据”
+- User: “小球经常停在-4.7、-4.8的位置”
+
+The next step should be:
+- explain the latest dataset using the current `pid.c` behavior after breakaway removal
+- determine whether the short-stop is caused by insufficient second-stage control effort, hold logic, filtered velocity, or negative-direction scaling
+- then recommend the minimal next tuning change consistent with the user’s desire for a simpler, cleaner controller
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\bai-kink\.claude\projects\d--File-2026diansaiH-Code-of-ZDT\069a0196-6fe2-4d6d-8ec2-b1d12f4294bb.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 23:24:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning targeted code reading on pid.c**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:01Z)**_
+
+我先把当前 `pid.c` 的控制链和这组数据一一对上，重点看第二段切换、保持区判定、以及 `ch3/ch4/ch5` 这三路到底是谁在给输出。
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:01Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `pid_apply_segment_profile|PID_SEGMENT_HOLD_NEG_55|target_hold_active|pidY_Speed.target|cmd_angle < 0.0f|pid_cal_clamped`
+
+```text
+70:	PID_SEGMENT_HOLD_NEG_55,
+81:static void pid_apply_segment_profile(float target_y,
+679:static void pid_cal_clamped(pid_t *pid, float lo, float hi, float i_limit)
+756:	static bool target_hold_active = false;
+760:		pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+773:			pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.15f, 0.0f, 0.0f);
+776:			target_hold_active = false;
+781:			g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+783:			target_hold_active = false;
+795:		target_hold_active = false;
+818:	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+819:		if(target_hold_active) {
+821:				target_hold_active = false;
+830:				target_hold_active = true;
+836:		target_hold_active = false;
+840:	if(target_hold_active) {
+854:	pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+856:	if(target_hold_active) {
+880:	pidY_Speed.target = 0.0f;
+890:		pidY_Speed.target = pidY.out;
+892:		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+899:	if(cmd_angle < 0.0f) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:01Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Inc\pid.h`
+
+```text
+93	////////////////////26//////////////
+94	/* ── 电机角度限幅（基于上电零点），只需改这两个数字 ── */
+95	#define ANGLE_LIMIT_MAX   12.0f    /* 正向最终机械保护角度 (°) */
+96	#define ANGLE_LIMIT_MIN  -12.0f    /* 反向最终机械保护角度 (°) */
+97	
+98	/* 串级控制的正常工作范围；最终机械限幅仅作为最后一级保护。 */
+99	#define POSITION_LOOP_DIRECT_DRIVE    0       /* 1: 位置环直接输出电机角度，便于单独调位置环；0: 恢复串级 PID */
+100	#define BALL_VELOCITY_CONTROL_LIMIT  8.0f  /* 进入速度环前的速度反馈限幅 (cm/s) */
+101	
+102	/* 外位置环输出的目标速度限幅 (cm/s)。
+103	 * 必须满足 限幅 ≈ 外环P × 位置半量程（0.40 × 12.5 ≈ 5.0），否则误差一超过
+104	 * 限幅/P 的距离，外环就恒定饱和，位置信息丢失，串级退化成纯调速器。
+105	 * 曾用 1.5f：外环在 |error| > 3.75cm 即饱和，球从远处滚来时目标速度恒为
+106	 * 1.5cm/s，而实际下滑速度可达 6cm/s，内环立刻输出满量程负角提前刹车，
+107	 * 球在离目标还有 10cm 处就被摁住甚至被推回，无法抵达目标。不要再调回该值。
+108	 */
+109	#define BALL_TARGET_SPEED_LIMIT       10.0f
+110	#define SPEED_LOOP_ANGLE_LIMIT        10.0f  /* 内速度环输出的正常倾角限幅 (°) */
+111	
+112	/* 内速度环积分限幅 (°)：积分项唯一职责是补偿"命令 0° 并非真正水平"的机械零点
+113	 * 偏差与滚动摩擦，因此上限取略小于正常倾角限幅，避免积分独自吃满整个工作范围。
+114	 */
+115	#define SPEED_LOOP_I_LIMIT            2.5f
+116	
+117	/* 外位置环积分限幅 (cm/s)：外环目前 Ki=0，故取 0 —— 配合 pid_cal_clamped()
+118	 * 可保证 iout 恒为 0，任何饱和都不会在 Ki=0 的环上留下永久偏置。
+119	 * 若将来给外环加积分，把这里改成非零上限即可。
+120	 */
+121	#define POS_LOOP_I_LIMIT              0.0f
+122	
+123	/* 倾角变化率限制：限制每个控制周期(20ms)命令角度的最大变化量，
+124	 * 仅用于避免相邻周期从 +限幅 直接跳到 -限幅 的机械冲击，不应成为主要滞后来源。
+125	 * 1.0°/20ms = 50°/s：全量程 ±4° 换向约需 160ms，仍远快于小球动力学。
+126	 * 注意：0.15°/tick(7.5°/s) 会让 4° 命令需要 540ms 才到位，
+127	 * 相位滞后远超小球响应时间，会直接导致越过目标后无法收敛，不要再调回该值。
+128	 */
+129	#define ANGLE_SLEW_PER_TICK          1.0f
+130	
+131	/* 控制周期与本地速度估计。
+132	 * 主循环实际每 20ms 调一次控制，因此直接用位置差分 / 0.02s 估计球速。
+133	 * 位置量测比 MaixCAM 直接给出的速度更连续稳定，适合作为内环反馈。
+134	 */
+135	#define PID_CONTROL_PERIOD_S        0.02f
+136	
+137	/* 本地估计速度低通：滤波后的速度作为串级速度环的当前值。 */
+138	#define BALL_VELOCITY_FILTER_ALPHA  0.25f
+139	
+140	/* 接近目标后的稳态区。
+141	 *
+142	 * 需求改为：|位置误差| <= 0.5cm 时就停止 PID 调节。
+143	 * 为避免视觉噪声和轻微回弹导致反复进出保持区，退出门限留 0.1cm 回差，
+144	 * 即误差重新增大到 0.6cm 以上才恢复闭环。
+145	 */
+146	#define TARGET_HOLD_POSITION_ENTER  0.50f
+147	#define TARGET_HOLD_POSITION_EXIT   0.60f
+148	#define TARGET_HOLD_SPEED_LIMIT     0.25f
+149	#define TARGET_HOLD_SETTLE_TICKS    6u    /* 进入最终保持前，位置与速度需连续稳定 6 × 20ms = 120ms */
+150	
+151	extern float Y;
+152	extern float Y_last;
+153	
+154	/* 小球目标位置，单位 cm，坐标系与 Y 保持一致；可在运行中随时更新。 */
+155	extern volatile float ball_target_y;
+156	void ball_target_set(float target_y);
+157	float ball_target_get(void);
+158	
+159	extern pid_t pidY;        /* 单环直驱时：位置 -> 平台倾角；串级时：位置 -> 小球目标速度 */
+160	extern pid_t pidY_Speed;  /* 串级模式下：小球速度 -> 平台倾角 */
+161	extern float pidY_velocity_damping;  /* 保留旧变量名，当前为速度环倾角输出 */
+162	extern float pidY_filtered_velocity; /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+163	
+164	void pid_control__26Y(void);
+165	void motor_set_angle(float target_deg);
+166	float motor_get_command_angle(void);
+167	
+168	void pidout_limit_Y(pid_t *pid);
+169	
+170	
+171	
+172
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:06Z)**_
+
+我看到第二段参数和你上次那版又不一样了：现在 `Spd_P` 已经是 `1.15`，`Spd_I` 还是 `0`。这会直接影响我对这组数据的判断，我再把关键代码段读出来精确对照。
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:07Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+740		}
+741	
+742		if(target_pulses >= 0) {
+743			Emm_V5_Pos_Control(MOTOR_ADDR, 0, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)target_pulses, 1, 0);
+744		} else {
+745			Emm_V5_Pos_Control(MOTOR_ADDR, 1, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)(-target_pulses), 1, 0);
+746		}
+747	
+748		motor_command_pulses = target_pulses;
+749	}
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758	
+759		if(!g_pid_segment_initialized) {
+760			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+761			g_pid_segment = PID_SEGMENT_TO_POS_56;
+762			g_pid_segment_initialized = true;
+763		}
+764	
+765		Y = ball_error;  // 视觉小球绝对位置
+766	
+767		/* 分段状态机：
+768		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+769		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+770		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+771		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+772			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+773				pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.15f, 0.0f, 0.0f);
+774				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+775				control_initialized = false;
+776				target_hold_active = false;
+777				target_hold_settle_ticks = 0u;
+778			}
+779		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+780			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+781				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+782				control_initialized = false;
+783				target_hold_active = false;
+784				target_hold_settle_ticks = 0u;
+785			}
+786		}
+787	
+788		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+789		float target_y = ball_target_get();
+790		float relative_y = Y - target_y;
+791		bool target_changed = !control_initialized || target_y != target_y_last;
+792	
+793		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+794		if(target_changed) {
+795			target_hold_active = false;
+796			target_hold_settle_ticks = 0u;
+797			relative_y_last = relative_y;
+798			target_y_last = target_y;
+799			control_initialized = true;
+800		}
+801	
+802		float position_delta = relative_y - relative_y_last;
+803		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+804	
+805		/* 内环速度反馈改为本地位置差分速度。
+806		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+807		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+808		 */
+809		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+810		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+811		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+812	
+813		/* 最终保持只在第二段完成后生效。
+814		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+815		 *
+816		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+817		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+818		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+819			if(target_hold_active) {
+820				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+821					target_hold_active = false;
+822					target_hold_settle_ticks = 0u;
+823				}
+824			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+825			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+826				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+827					target_hold_settle_ticks++;
+828				}
+829				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+830					target_hold_active = true;
+831				}
+832			} else {
+833				target_hold_settle_ticks = 0u;
+834			}
+835		} else {
+836			target_hold_active = false;
+837			target_hold_settle_ticks = 0u;
+838		}
+839	
+840		if(target_hold_active) {
+841			/* 进入误差保持区后，只停止位置环继续推球：
+842			 *   1) 外环目标速度稍后压到 0；
+843			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+844		}
+845	
+846		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+847		pidY.target = 0.0f;
+848		pidY.now = relative_y;
+849		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+850		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+851		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+852		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+853		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+854		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+855		                POS_LOOP_I_LIMIT);
+856		if(target_hold_active) {
+857			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+858			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+859			 */
+860			pidY.out = 0.0f;
+861		}
+862	
+863		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+864		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+865		 */
+866		float control_velocity = estimated_velocity;
+867		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+868			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+869		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+870			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+871		}
+872		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+873		                         (control_velocity - pidY_filtered_velocity);
+874	
+875	#if POSITION_LOOP_DIRECT_DRIVE
+876		/* 单环调试模式：位置环直接输出平台倾角。
+877		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+878		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+879		pidY_velocity_damping = 0.0f;
+880		pidY_Speed.target = 0.0f;
+881		pidY_Speed.now = pidY_filtered_velocity;
+882		pidY_Speed.out = 0.0f;
+883		pidY_Speed.pout = 0.0f;
+884		pidY_Speed.iout = 0.0f;
+885		pidY_Speed.dout = 0.0f;
+886	
+887		float cmd_angle = pidY.out;
+888		#else
+889			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+890			pidY_Speed.target = pidY.out;
+891			pidY_Speed.now = pidY_filtered_velocity;
+892			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+893			                SPEED_LOOP_I_LIMIT);
+894			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+895			float cmd_angle = pidY_velocity_damping;
+896		#endif
+897	
+898		// 负方向（下降）机构补偿 ×1.2。
+899		if(cmd_angle < 0.0f) {
+900			cmd_angle *= 1.0f;
+901		}
+902	
+903		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+904		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+905		static float cmd_angle_last = 0.0f;
+906		{
+907			float delta = cmd_angle - cmd_angle_last;
+908			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+909			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+910			cmd_angle = cmd_angle_last + delta;
+911			cmd_angle_last = cmd_angle;
+912		}
+913		motor_set_angle(cmd_angle);
+914	
+915		relative_y_last = relative_y;
+916		Y_last = Y;
+917	}
+918	
+919	void pidout_limit_Y(pid_t *pid)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:07Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\main.c`
+
+```text
+170	    // ========== 每10ms：发送 VOFA+ 数据（100Hz） ==========
+171	    if(HAL_GetTick() - last_vofa_time >= 10)
+172	    {
+173	      last_vofa_time = HAL_GetTick();
+174	
+175	      // ===== VOFA+ 发送：6通道 =====
+176	      // 所有通道均 ×100 发送，VOFA+ 中 ÷100 后为真实值。
+177	      int32_t vofa_data[6];
+178	      vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0: 开环目标角度(°)
+179	      vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1: 小球位置(cm)
+180	      vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 原始速度(cm/s)，仅诊断
+181	      vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环目标速度(cm/s)
+182	      vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4: 速度环输出倾角(°)
+183	      vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);    // ch5: 本地差分+低通后的控制速度(cm/s)
+184	      Vofa_usage_SendString(vofa_data, 6);
+185	    }
+186	
+187	    // ========== 处理 MaixCAM 视觉数据 ==========
+188	    if(rxMaixcamFlag == true)
+189	    {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing dataset structure and tuning parameters**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Interpreting channel data near stall condition**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing angle and position discrepancies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Investigating control lag and ball rebound behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Suspecting external disturbance causing position jump**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:36Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying dead zone and static friction effects**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:37Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Recommending adding integral to speed loop**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:40Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming speed loop steady-state error**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:45Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying need for negative compensation adjustment**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:46Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Outlining staged tuning recommendations**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:51Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning markdown relative path links**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:52Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining PID data mapping with examples**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:25:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning clear tuning guidance structure**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:26:27Z)**_
+
+我重新按当前代码对了一遍，这组数据说明的不是“保持区提前介入”，而是更具体的一件事：
+
+**第二段 `-5.5cm` 附近，纯串级 PID 的末端驱动力不够，球先卡在 `-4.96`，随后又回弹到 `-4.37`，最后在更大的误差下再次卡住。**
+
+先把当前控制链钉死在代码上：
+
+- 分段切换在 [Core/Src/pid.c:771-785](Core/Src/pid.c#L771-L785)
+- 最终保持判定在 [Core/Src/pid.c:818-860](Core/Src/pid.c#L818-L860)
+- 串级速度环在 [Core/Src/pid.c:889-900](Core/Src/pid.c#L889-L900)
+- VOFA 通道定义在 [Core/Src/main.c:177-183](Core/Src/main.c#L177-L183)
+
+你现在第二段参数实际是：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.15f, 0.0f, 0.0f);
+```
+
+也就是：
+- 位置环：`P=0.8, I=0, D=0`
+- 速度环：`P=1.15, I=0, D=0`
+
+而且负方向补偿现在其实是关掉的，因为这里是 `* 1.0f`：
+[Core/Src/pid.c:898-900](Core/Src/pid.c#L898-L900)
+
+---
+
+**先看你这组数据里最关键的两段。**
+
+第一段卡在 `-4.96`：
+
+```text
+0,-496,0,-43,9,-51
+-11,-496,0,-43,-16,-28
+-22,-496,0,-43,-31,-16
+-33,-496,0,-43,-43,-5
+-44,-496,0,-43,-45,-3
+```
+
+按通道解释：
+
+- `ch1 = -496` -> 球在 `-4.96cm`
+- 目标是 `-5.5cm`
+- 位置误差是 `0.54cm`
+- `ch3 = -43` -> 外环目标速度 `-0.43cm/s`
+- `ch5` 从 `-0.51` 慢慢衰减到接近 `0`
+- `ch4` 最后只剩 `-0.45°`
+- `ch0` 也只剩 `-0.44°`
+
+这和代码完全一致：
+
+- 外环 `P=0.8`，误差 `0.54`，所以输出大约就是 `-0.43`
+- 速度环 `P=1.15`，速度快到 0 以后，输出只剩大约 `-0.49°`
+- 因为 `Spd_I = 0`，它不会继续积累
+- 所以命令角就固定在一个很小的负角上
+- 这个角度推不过静摩擦/零偏，球就停在 `-4.96`
+
+注意这里**没有进入保持区**。  
+保持区要求 `|误差| <= 0.5cm`，你这里是 `0.54cm`，差一点点，还在闭环里。
+
+---
+
+第二段更关键，它后来回弹并卡在 `-4.37`：
+
+```text
+-101,-437,0,-90,-104,0
+-101,-437,0,-90,-103,0
+...
+```
+
+这一串几乎不动，说明系统已经进入另一个静态平衡点：
+
+- `ch1 = -437` -> 球在 `-4.37cm`
+- 对目标 `-5.5cm`，误差已经变成 `1.13cm`
+- `ch3 = -90` -> 外环目标速度 `-0.90cm/s`
+- `ch5 = 0` -> 本地估计速度就是 0
+- `ch4 ≈ -1.03°`
+- `ch0 ≈ -1.01°`
+
+这再次和代码一一对应：
+
+- 外环 `0.8 × 1.13 ≈ 0.90`
+- 内环 `1.15 × 0.90 ≈ 1.03°`
+
+所以现在的实际情况是：
+
+**球停住时，控制器还能给的稳定负角，只有 `-0.4° ~ -1.0°` 这一档。  
+而你的机械系统在第二段负方向末端，明显需要比这个更大的持续负角，球才会继续走。**
+
+---
+
+**这组数据还有一个容易误判的点：前半段 `ch4` 经常是正的，但 `ch3` 是负的。这个不是错。**
+
+例如最前面：
+
+```text
+202,-160,-492,-312,194,-481
+```
+
+这里球在 `-1.60cm`，目标是 `-5.5cm`，所以外环希望继续往负方向走，`ch3=-3.12` 正常。  
+但球当时已经在快速往负方向滚，`ch5=-4.81`，速度比目标还快，所以速度环给一个**正角去刹车**，`ch4=+1.94`。这一段控制逻辑是对的，说明主链路没反。
+
+---
+
+**所以这组数据的结论很明确：**
+
+1. 不是保持区逻辑导致停错位置  
+2. 不是 MaixCAM 原始速度 `ch2` 的尖峰在直接搞控制  
+3. 不是代码没继续输出  
+4. 是第二段参数在 `Spd_I = 0` 时，末端推力不够，形成了静摩擦死区  
+5. 负方向补偿现在也没了，所以第二段更容易停短
+
+---
+
+**调参不要乱动，按这个顺序来。**
+
+第一步，先别改保持区、别改第一段，只动第二段速度环 `I`。  
+也就是把 [Core/Src/pid.c:773](Core/Src/pid.c#L773) 这一行的第二段参数改成：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.15f, 0.01f, 0.0f);
+```
+
+原因很直接：
+
+- 现在纯 `P` 在停住时只能给一个固定小负角
+- 加一点 `I`，它会在“目标速度负、实际速度 0”的状态下慢慢积累
+- 角度会从 `-0.4° / -1.0°` 继续往更负的方向顶
+- 顶到超过静摩擦门槛，球就会继续向 `-5.5` 走
+
+---
+
+**第二步，如果加 `Spd_I=0.01` 后还会停在 `-4.7 ~ -4.9`，再加第二段 `Spd_P`，不要先动位置环。**
+
+建议顺序：
+
+1. `Spd_I: 0 -> 0.01`
+2. 还不够，再试 `Spd_P: 1.15 -> 1.25`
+3. 再不够，再试 `Spd_I: 0.01 -> 0.015`
+
+为什么先动速度环，不先动位置环：
+
+- 你现在的问题不是“外环不知道还没到目标”
+- 外环其实很清楚，`ch3` 一直是负的
+- 真正的问题是“内环没有把这个目标速度转换成足够的持续负角”
+
+所以先修内环才对路。
+
+---
+
+**第三步，暂时不要碰这些地方：**
+
+- [Core/Inc/pid.h:146-149](Core/Inc/pid.h#L146-L149) 的保持区门限
+- 外环 `Pos_P=0.8`
+- 速度估计滤波 `BALL_VELOCITY_FILTER_ALPHA`
+
+因为这组数据已经说明主问题不在这些地方。
+
+---
+
+我给你的结论压成一句话就是：
+
+**这组数据不是“PID乱抖”，而是“第二段末端驱动力不足，纯 P 速度环在停住后不会继续长角度，所以球卡在 `-4.96` 和 `-4.37` 这类位置”。  
+先把第二段 `Spd_I` 从 `0` 恢复到 `0.01`，这是现在最对症的调法。**
+
+---
+
+_**User (2026-08-02 23:42:06Z)**_
+
+<ide_selection>The user selected the lines 818 to 860 from d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c:
+	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+		if(target_hold_active) {
+			if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+				target_hold_active = false;
+				target_hold_settle_ticks = 0u;
+			}
+		} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+		          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+			if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+				target_hold_settle_ticks++;
+			}
+			if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+				target_hold_active = true;
+			}
+		} else {
+			target_hold_settle_ticks = 0u;
+		}
+	} else {
+		target_hold_active = false;
+		target_hold_settle_ticks = 0u;
+	}
+
+	if(target_hold_active) {
+		/* 进入误差保持区后，只停止位置环继续推球：
+		 *   1) 外环目标速度稍后压到 0；
+		 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+	}
+
+	/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+	pidY.target = 0.0f;
+	pidY.now = relative_y;
+	/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+	 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+	 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+	 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+	 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+	pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+	                POS_LOOP_I_LIMIT);
+	if(target_hold_active) {
+		/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+		 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+		 */
+
+
+This may or may not be related to the current task.</ide_selection>
+
+416,-554,0,3,421,-110
+416,-554,0,3,421,-110
+371,-554,0,3,379,-82
+371,-554,0,3,379,-82
+337,-554,0,0,342,-61
+337,-554,0,0,342,-61
+314,-554,0,0,319,-46
+314,-554,0,0,319,-46
+292,-554,0,0,302,-34
+292,-554,0,0,302,-34
+281,-554,484,0,289,-26
+281,-554,484,0,289,-26
+179,-546,0,0,113,85
+179,-546,0,0,113,85
+134,-546,0,0,138,64
+134,-546,0,0,138,64
+157,-546,0,0,158,48
+157,-546,0,0,158,48
+168,-546,0,0,172,36
+168,-546,488,0,172,36
+67,-538,0,0,15,132
+67,-538,0,0,15,132
+-22,-529,516,0,-112,204
+-22,-529,516,0,-112,204
+-44,-529,0,0,-51,153
+-44,-529,501,0,-51,153
+-146,-521,501,0,-173,219
+-146,-521,0,0,-173,219
+-101,-521,0,0,-107,164
+-101,-521,0,0,-107,164
+-56,-521,553,0,-58,123
+-56,-521,553,0,-58,123
+-157,-504,481,0,-341,292
+-157,-504,481,0,-341,292
+-247,-504,0,0,-253,219
+-247,-504,0,0,-253,219
+-179,-504,0,0,-187,164
+-179,-504,517,0,-187,164
+-281,-496,517,0,-306,228
+-281,-496,0,0,-306,228
+-236,-496,0,0,-237,171
+-236,-496,0,0,-237,171
+-337,-487,536,-49,-434,233
+-337,-487,536,-49,-434,233
+-359,-487,0,-49,-369,175
+-359,-487,528,-49,-369,175
+-461,-479,528,-56,-500,236
+-461,-479,0,-56,-500,236
+-427,-479,0,-56,-435,177
+-427,-479,0,-56,-435,177
+-382,-479,494,-56,-387,132
+-382,-479,494,-56,-387,132
+-483,-462,498,-70,-694,299
+-483,-462,498,-70,-694,299
+-584,-462,0,-70,-612,224
+-584,-462,0,-70,-612,224
+-551,-462,0,-70,-551,168
+-551,-462,504,-70,-551,168
+-641,-454,504,-76,-686,231
+-641,-454,0,-76,-686,231
+-618,-454,0,-76,-625,173
+-618,-454,0,-76,-625,173
+-719,-445,498,-83,-728,235
+-719,-445,498,-83,-728,235
+-629,-445,0,-83,-639,176
+-629,-445,492,-83,-639,176
+-731,-437,492,-90,-741,237
+-731,-437,0,-90,-741,237
+-641,-437,0,-90,-652,177
+-641,-437,499,-90,-652,177
+-742,-428,0,-96,-753,238
+-742,-428,0,-96,-753,238
+-663,-428,0,-96,-663,178
+-663,-428,0,-96,-663,178
+-596,-428,0,-96,-596,134
+-596,-428,0,-96,-596,134
+-539,-428,0,-96,-546,100
+-539,-428,485,-96,-546,100
+-641,-420,485,-103,-676,180
+-641,-420,0,-103,-676,180
+-607,-420,0,-103,-608,135
+-607,-420,0,-103,-608,135
+-551,-420,0,-103,-557,101
+-551,-420,0,-103,-557,101
+-517,-420,0,-103,-519,76
+-517,-420,0,-103,-519,76
+-483,-420,0,-103,-491,57
+-483,-420,0,-103,-491,57
+-461,-420,0,-103,-469,42
+-461,-420,0,-103,-469,42
+-449,-420,0,-103,-453,32
+-449,-420,0,-103,-453,32
+-438,-420,0,-103,-441,24
+-438,-420,0,-103,-441,24
+-337,-428,-530,-96,-265,-86
+-337,-428,-530,-96,-265,-86
+-292,-428,0,-96,-297,-65
+-292,-428,0,-96,-297,-65
+-314,-428,0,-96,-322,-48
+-314,-428,0,-96,-322,-48
+-337,-428,0,-96,-340,-36
+-337,-428,0,-96,-340,-36
+-348,-428,0,-96,-354,-27
+-348,-428,0,-96,-354,-27
+-247,-437,-510,-90,-193,-125
+-247,-437,-510,-90,-193,-125
+-236,-437,0,-90,-240,-94
+-236,-437,0,-90,-240,-94
+-269,-437,0,-90,-277,-70
+-269,-437,0,-90,-277,-70
+-303,-437,0,-90,-305,-53
+-303,-437,-512,-90,-305,-53
+-202,-445,0,-83,-152,-144
+-202,-445,0,-83,-152,-144
+-202,-445,0,-83,-203,-108
+-202,-445,0,-83,-203,-108
+-101,-454,-476,-76,-65,-186
+-101,-454,0,-76,-65,-186
+-123,-454,0,-76,-129,-139
+-123,-454,0,-76,-129,-139
+-168,-454,0,-76,-179,-104
+-168,-454,-474,-76,-179,-104
+-78,-462,-474,-70,-39,-183
+-78,-462,0,-70,-39,-183
+-101,-462,0,-70,-101,-137
+-101,-462,0,-70,-101,-137
+-146,-462,0,-70,-150,-103
+-146,-462,0,-70,-150,-103
+-179,-462,0,-70,-188,-77
+-179,-462,0,-70,-188,-77
+-213,-462,0,-70,-218,-58
+-213,-462,-380,-70,-218,-58
+-112,-470,0,-63,-63,-148
+-112,-470,0,-63,-63,-148
+-112,-470,0,-63,-114,-111
+-112,-470,0,-63,-114,-111
+-146,-470,0,-63,-154,-83
+-146,-470,0,-63,-154,-83
+-179,-470,0,-63,-186,-62
+-179,-470,0,-63,-186,-62
+-202,-470,0,-63,-211,-47
+-202,-470,-480,-63,-211,-47
+-101,-479,-480,-56,-52,-140
+-101,-479,0,-56,-52,-140
+-89,-479,0,-56,-100,-105
+-89,-479,0,-56,-100,-105
+-134,-479,0,-56,-137,-78
+-134,-479,0,-56,-137,-78
+-157,-479,0,-56,-167,-59
+-157,-479,0,-56,-167,-59
+-179,-479,0,-56,-190,-44
+-179,-479,0,-56,-190,-44
+-202,-479,0,-56,-209,-33
+-202,-479,0,-56,-209,-33
+-224,-479,0,-56,-225,-24
+-224,-479,0,-56,-225,-24
+-236,-479,0,-56,-238,-18
+-236,-479,0,-56,-238,-18
+-247,-479,0,-56,-249,-14
+-247,-479,0,-56,-249,-14
+-258,-479,0,-56,-259,-10
+-258,-479,0,-56,-259,-10
+-258,-479,0,-56,-268,-7
+-258,-479,0,-56,-268,-7
+-269,-479,0,-56,-276,-5
+-269,-479,0,-56,-276,-5
+-168,-487,-514,-49,-105,-109
+-168,-487,-514,-49,-105,-109
+-134,-487,0,-49,-142,-82
+-134,-487,0,-49,-142,-82
+-168,-487,0,-49,-172,-61
+-168,-487,0,-49,-172,-61
+-191,-487,0,-49,-195,-46
+-191,-487,0,-49,-195,-46
+-213,-487,0,-49,-214,-34
+-213,-487,0,-49,-214,-34
+-224,-487,0,-49,-230,-25
+-224,-487,0,-49,-230,-25
+-236,-487,0,-49,-242,-19
+-236,-487,0,-49,-242,-19
+-247,-487,0,-49,-253,-14
+-247,-487,0,-49,-253,-14
+-258,-487,0,-49,-263,-10
+-258,-487,0,-49,-263,-10
+-269,-487,0,-49,-271,-8
+-269,-487,0,-49,-271,-8
+-269,-487,0,-49,-278,-6
+-269,-487,0,-49,-278,-6
+-371,-479,487,-56,-464,100
+-371,-479,487,-56,-464,100
+-438,-479,0,-56,-440,75
+-438,-479,0,-56,-440,75
+-416,-479,0,-56,-419,56
+-416,-479,0,-56,-419,56
+-393,-479,0,-56,-398,42
+-393,-479,0,-56,-398,42
+-382,-479,0,-56,-382,31
+-382,-479,0,-56,-382,31
+-359,-479,0,-56,-370,23
+-359,-479,0,-56,-370,23
+-359,-479,0,-56,-361,17
+-359,-479,0,-56,-361,17
+-348,-479,0,-56,-355,13
+-348,-479,0,-56,-355,13
+-348,-479,0,-56,-350,10
+-348,-479,0,-56,-350,10
+-337,-479,0,-56,-346,7
+-337,-479,0,-56,-346,7
+-337,-479,0,-56,-343,5
+-337,-479,0,-56,-343,5
+-337,-479,0,-56,-341,4
+-337,-479,0,-56,-341,4
+-337,-479,0,-56,-339,3
+-337,-479,0,-56,-339,3
+-337,-479,0,-56,-338,2
+-337,-479,0,-56,-338,2
+-337,-479,0,-56,-337,1
+-337,-479,0,-56,-337,1
+-326,-479,0,-56,-336,1
+-326,-479,0,-56,-336,1
+-326,-479,0,-56,-336,1
+-326,-479,0,-56,-336,1
+-326,-479,0,-56,-336,0
+-326,-479,0,-56,-336,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,-511,-56,-335,0
+-326,-479,-511,-56,-335,0
+-224,-487,0,-49,-161,-104
+-224,-487,0,-49,-161,-104
+-191,-487,0,-49,-198,-78
+-191,-487,0,-49,-198,-78
+-224,-487,0,-49,-227,-59
+-224,-487,0,-49,-227,-59
+-247,-487,0,-49,-249,-44
+-247,-487,-520,-49,-249,-44
+-146,-496,-520,-43,-89,-138
+-146,-496,0,-43,-89,-138
+-134,-496,0,-43,-135,-103
+-134,-496,0,-43,-135,-103
+-168,-496,0,-43,-170,-77
+-168,-496,0,-43,-170,-77
+-191,-496,0,-43,-198,-58
+-191,-496,0,-43,-198,-58
+-213,-496,0,-43,-219,-43
+-213,-496,-492,-43,-219,-43
+-112,-504,-492,-36,-58,-137
+-112,-504,0,-36,-58,-137
+-101,-504,0,-36,-103,-103
+-101,-504,0,-36,-103,-103
+0,-512,-443,-29,40,-182
+0,-512,-443,-29,40,-182
+-11,-512,0,-29,-17,-136
+-11,-512,-508,-29,-17,-136
+78,-521,-508,-23,117,-207
+78,-521,-492,-23,117,-207
+179,-529,0,-16,231,-260
+179,-529,0,-16,231,-260
+146,-529,-435,-16,151,-195
+146,-529,-435,-16,151,-195
+247,-538,0,-9,270,-251
+247,-538,0,-9,270,-251
+348,-546,-489,-2,372,-293
+348,-546,-505,-2,372,-293
+449,-554,-505,3,462,-325
+449,-554,0,3,462,-325
+359,-554,0,3,365,-243
+359,-554,-511,3,365,-243
+461,-563,0,10,471,-287
+461,-563,0,10,471,-287
+562,-571,-505,17,565,-320
+562,-571,-505,17,565,-320
+641,-580,-489,24,649,-345
+641,-580,0,24,649,-345
+539,-580,0,24,547,-259
+539,-580,0,24,547,-259
+472,-580,0,24,472,-194
+472,-580,-483,24,472,-194
+562,-588,0,30,595,-250
+562,-588,0,30,595,-250
+517,-588,0,30,523,-188
+517,-588,0,30,523,-188
+618,-596,-501,37,648,-246
+618,-596,0,37,648,-246
+573,-596,0,37,578,-184
+573,-596,0,37,578,-184
+506,-596,0,37,513,-138
+506,-596,0,37,513,-138
+461,-596,0,37,461,-103
+461,-596,0,37,461,-103
+416,-596,0,37,422,-77
+416,-596,0,37,422,-77
+393,-596,0,37,393,-58
+393,-596,0,37,393,-58
+314,-596,0,0,315,-43
+314,-596,502,0,315,-43
+213,-588,502,0,134,72
+213,-588,0,0,134,72
+146,-588,0,0,156,54
+146,-588,0,0,156,54
+168,-588,0,0,172,40
+168,-588,0,0,172,40
+179,-588,0,0,184,30
+179,-588,529,0,184,30
+78,-580,529,0,25,127
+78,-580,0,0,25,127
+56,-580,0,0,64,95
+56,-580,495,0,64,95
+-33,-571,495,0,-75,176
+-33,-571,0,0,-75,176
+-11,-571,497,0,-22,132
+-11,-571,497,0,-22,132
+-112,-563,0,0,-150,204
+-112,-563,0,0,-150,204
+-213,-554,494,0,-256,258
+-213,-554,520,0,-256,258
+-314,-546,520,0,-347,298
+-314,-546,0,0,-347,298
+-247,-546,0,0,-257,224
+-247,-546,519,0,-257,224
+-348,-538,458,0,-358,273
+-348,-538,458,0,-358,273
+-438,-529,0,0,-444,309
+-438,-529,532,0,-444,309
+-517,-521,532,0,-519,337
+-517,-521,478,0,-519,337
+-584,-512,478,0,-586,358
+-584,-512,0,0,-586,358
+-483,-512,0,0,-479,268
+-483,-512,510,0,-479,268
+-562,-504,0,0,-566,306
+-562,-504,0,0,-566,306
+-641,-496,501,0,-642,334
+-641,-496,501,0,-642,334
+-742,-487,507,-49,-790,356
+-742,-487,0,-49,-790,356
+-686,-487,0,-49,-688,267
+-686,-487,0,-49,-688,267
+-607,-487,0,-49,-613,200
+-607,-487,0,-49,-613,200
+-539,-487,520,-49,-550,150
+-539,-487,520,-49,-550,150
+-641,-479,0,-56,-661,217
+-641,-479,0,-56,-661,217
+-742,-470,487,-63,-747,268
+-742,-470,487,-63,-747,268
+-641,-470,487,-63,-646,201
+-641,-470,0,-63,-646,201
+-562,-470,0,-63,-571,150
+-562,-470,538,-63,-571,150
+-663,-462,0,-70,-682,218
+-663,-462,0,-70,-682,218
+-596,-462,0,-70,-600,163
+-596,-462,0,-70,-600,163
+-528,-462,0,-70,-539,122
+-528,-462,0,-70,-539,122
+-483,-462,0,-70,-493,92
+-483,-462,0,-70,-493,92
+-449,-462,0,-70,-458,69
+-449,-462,0,-70,-458,69
+-427,-462,0,-70,-432,51
+-427,-462,0,-70,-432,51
+-404,-462,0,-70,-413,38
+-404,-462,0,-70,-413,38
+-393,-462,0,-70,-398,29
+-393,-462,0,-70,-398,29
+-382,-462,0,-70,-387,21
+-382,-462,-504,-70,-387,21
+-281,-470,-504,-63,-209,-88
+-281,-470,0,-63,-209,-88
+-236,-470,0,-63,-242,-66
+-236,-470,0,-63,-242,-66
+-258,-470,0,-63,-268,-49
+-258,-470,0,-63,-268,-49
+-281,-470,0,-63,-288,-37
+-281,-470,0,-63,-288,-37
+-292,-470,0,-63,-302,-28
+-292,-470,-507,-63,-302,-28
+-202,-479,-507,-56,-138,-126
+-202,-479,0,-56,-138,-126
+-179,-479,0,-56,-182,-94
+-179,-479,-489,-56,-182,-94
+-78,-487,0,-49,-37,-175
+-78,-487,0,-49,-37,-175
+-89,-487,0,-49,-95,-131
+-89,-487,0,-49,-95,-131
+-134,-487,0,-49,-140,-98
+-134,-487,-485,-49,-140,-98
+-33,-496,-485,-43,4,-179
+-33,-496,0,-43,4,-179
+-44,-496,0,-43,-54,-134
+-44,-496,0,-43,-54,-134
+-89,-496,0,-43,-98,-100
+-89,-496,0,-43,-98,-100
+-123,-496,0,-43,-133,-75
+-123,-496,0,-43,-133,-75
+-157,-496,0,-43,-160,-56
+-157,-496,0,-43,-160,-56
+-56,-504,-415,-36,-2,-147
+-56,-504,0,-36,-2,-147
+-44,-504,0,-36,-50,-110
+-44,-504,0,-36,-50,-110
+-78,-504,0,-36,-87,-82
+-78,-504,0,-36,-87,-82
+11,-512,-660,-29,62,-167
+11,-512,-660,-29,62,-167
+0,-512,0,-29,9,-125
+0,-512,0,-29,9,-125
+-22,-512,0,-29,-31,-94
+-22,-512,0,-29,-31,-94
+-56,-512,0,-29,-62,-70
+-56,-512,0,-29,-62,-70
+-78,-512,0,-29,-86,-52
+-78,-512,0,-29,-86,-52
+-101,-512,0,-29,-105,-39
+-101,-512,0,-29,-105,-39
+-67,-512,0,0,-72,-29
+-67,-512,0,0,-72,-29
+22,-521,-402,0,86,-127
+22,-521,-497,0,86,-127
+123,-529,-497,0,216,-200
+123,-529,0,0,216,-200
+146,-529,0,0,156,-150
+146,-529,0,0,156,-150
+101,-529,0,0,111,-112
+101,-529,0,0,111,-112
+67,-529,0,0,77,-84
+67,-529,0,0,77,-84
+44,-529,0,0,51,-63
+44,-529,-517,0,51,-63
+146,-538,-517,0,200,-152
+146,-538,0,0,200,-152
+146,-538,0,0,155,-114
+146,-538,0,0,155,-114
+112,-538,0,0,120,-85
+112,-538,0,0,120,-85
+89,-538,-459,0,94,-64
+89,-538,-459,0,94,-64
+191,-546,0,0,243,-153
+191,-546,0,0,243,-153
+191,-546,0,0,197,-114
+191,-546,0,0,197,-114
+157,-546,0,0,163,-86
+157,-546,0,0,163,-86
+134,-546,0,0,137,-64
+134,-546,0,0,137,-64
+112,-546,0,0,117,-48
+112,-546,0,0,117,-48
+101,-546,0,0,103,-36
+101,-546,0,0,103,-36
+89,-546,0,0,92,-27
+89,-546,0,0,92,-27
+78,-546,0,0,84,-20
+78,-546,0,0,84,-20
+67,-546,0,0,78,-15
+67,-546,0,0,78,-15
+67,-546,0,0,73,-11
+67,-546,0,0,73,-11
+67,-546,0,0,70,-8
+67,-546,0,0,70,-8
+56,-546,0,0,67,-6
+56,-546,0,0,67,-6
+56,-546,0,0,65,-4
+56,-546,0,0,65,-4
+56,-546,0,0,64,-3
+56,-546,0,0,64,-3
+56,-546,0,0,62,-2
+56,-546,0,0,62,-2
+56,-546,0,0,62,-2
+56,-546,0,0,62,-2
+56,-546,0,0,61,-1
+56,-546,0,0,61,-1
+56,-546,0,0,61,-1
+56,-546,0,0,61,-1
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,60,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+56,-546,0,0,59,0
+第一组数据
+
+854,-412,0,-110,-862,297
+-854,-412,511,-110,-862,297
+-911,-403,511,-117,-918,328
+-911,-403,511,-117,-918,328
+-956,-395,511,-123,-962,351
+-956,-395,0,-123,-962,351
+-854,-395,502,-123,-830,263
+-854,-395,502,-123,-830,263
+-888,-386,0,-130,-899,302
+-888,-386,0,-130,-899,302
+-798,-386,0,-130,-786,226
+-798,-386,0,-130,-786,226
+-866,-378,502,-137,-868,275
+-866,-378,0,-137,-868,275
+-764,-378,0,-137,-765,206
+-764,-378,0,-137,-765,206
+-686,-378,0,-137,-688,154
+-686,-378,0,-137,-688,154
+-629,-378,0,-137,-630,116
+-629,-378,0,-137,-630,116
+-584,-378,0,-137,-586,87
+-584,-378,0,-137,-586,87
+-551,-378,0,-137,-553,65
+-551,-378,0,-137,-553,65
+-528,-378,0,-137,-529,48
+-528,-378,0,-137,-529,48
+-506,-378,0,-137,-511,36
+-506,-378,-503,-137,-511,36
+-404,-386,0,-130,-329,-77
+-404,-386,0,-130,-329,-77
+-303,-395,-508,-123,-187,-163
+-303,-395,-508,-123,-187,-163
+-247,-395,0,-123,-248,-122
+-247,-395,0,-123,-248,-122
+-292,-395,0,-123,-297,-91
+-292,-395,0,-123,-297,-91
+-326,-395,0,-123,-332,-68
+-326,-395,-335,-123,-332,-68
+-224,-412,-463,-110,-24,-251
+-224,-412,-463,-110,-24,-251
+-123,-420,0,-103,68,-293
+-123,-420,0,-103,68,-293
+-22,-428,-500,-96,148,-325
+-22,-428,0,-96,148,-325
+33,-428,0,-96,41,-243
+33,-428,0,-96,41,-243
+-33,-428,0,-96,-41,-182
+-33,-428,-503,-96,-41,-182
+56,-437,0,-90,72,-242
+56,-437,0,-90,72,-242
+0,-437,-507,-90,-9,-181
+0,-437,-507,-90,-9,-181
+89,-454,-506,-76,268,-336
+89,-454,0,-76,268,-336
+157,-454,0,-76,160,-252
+157,-454,-498,-76,160,-252
+247,-462,-498,-70,255,-294
+247,-462,-499,-70,255,-294
+337,-470,-499,-63,339,-325
+337,-470,0,-63,339,-325
+236,-470,0,-63,235,-244
+236,-470,0,-63,235,-244
+326,-479,-497,-56,334,-288
+326,-479,0,-56,334,-288
+236,-479,0,-56,242,-216
+236,-479,-496,-56,242,-216
+337,-487,-496,-49,350,-267
+337,-487,0,-49,350,-267
+258,-487,0,-49,265,-200
+258,-487,-498,-49,265,-200
+359,-496,0,-43,378,-255
+359,-496,0,-43,378,-255
+292,-496,0,-43,298,-191
+292,-496,0,-43,298,-191
+393,-504,-504,-36,415,-248
+393,-504,0,-36,415,-248
+326,-504,0,-36,336,-186
+326,-504,0,-36,336,-186
+269,-504,0,-36,277,-139
+269,-504,0,-36,277,-139
+224,-504,0,-36,231,-104
+224,-504,0,-36,231,-104
+191,-504,0,-36,196,-78
+191,-504,0,-36,196,-78
+168,-504,0,-36,169,-58
+168,-504,0,-36,169,-58
+202,-504,0,0,206,-44
+202,-504,0,0,206,-44
+191,-504,0,0,193,-33
+191,-504,0,0,193,-33
+179,-504,0,0,183,-24
+179,-504,0,0,183,-24
+168,-504,0,0,175,-18
+168,-504,0,0,175,-18
+168,-504,0,0,170,-13
+168,-504,0,0,170,-13
+157,-504,0,0,165,-10
+157,-504,506,0,165,-10
+56,-496,506,0,-5,97
+56,-496,0,0,-5,97
+22,-496,505,0,23,72
+22,-496,505,0,23,72
+-67,-487,0,-49,-202,159
+-67,-487,0,-49,-202,159
+-157,-487,0,-49,-159,119
+-157,-487,499,-49,-159,119
+-258,-479,499,-56,-307,194
+-258,-479,0,-56,-307,194
+-247,-479,0,-56,-254,146
+-247,-479,0,-56,-254,146
+-213,-479,507,-56,-216,109
+-213,-479,507,-56,-216,109
+-314,-462,503,-70,-530,282
+-314,-462,503,-70,-530,282
+-416,-462,0,-70,-452,211
+-416,-462,512,-70,-452,211
+-506,-454,512,-76,-575,263
+-506,-454,0,-76,-575,263
+-494,-454,0,-76,-503,197
+-494,-454,501,-76,-503,197
+-596,-445,0,-83,-630,253
+-596,-445,0,-83,-630,253
+-697,-437,501,-90,-741,295
+-697,-437,501,-90,-741,295
+-652,-437,0,-90,-662,221
+-652,-437,506,-90,-662,221
+-753,-428,506,-96,-783,270
+-753,-428,0,-96,-783,270
+-697,-428,0,-96,-700,203
+-697,-428,503,-96,-700,203
+-787,-420,503,-103,-791,257
+-787,-420,503,-103,-791,257
+-686,-420,503,-103,-695,193
+-686,-420,503,-103,-695,193
+-618,-420,503,-103,-622,144
+-618,-420,0,-103,-622,144
+-562,-420,0,-103,-568,108
+-562,-420,0,-103,-568,108
+-517,-420,0,-103,-527,81
+-517,-420,251,-103,-527,81
+-618,-412,251,-110,-664,166
+-618,-412,251,-110,-664,166
+-596,-412,0,-110,-602,124
+-596,-412,0,-110,-602,124
+-551,-412,0,-110,-555,93
+-551,-412,0,-110,-555,93
+-517,-412,0,-110,-520,70
+-517,-412,167,-110,-520,70
+-618,-403,167,-117,-662,157
+-618,-403,-493,-117,-662,157
+-517,-412,-493,-110,-435,13
+-517,-412,-493,-110,-435,13
+-427,-412,-493,-110,-430,9
+-427,-412,-493,-110,-430,9
+-416,-412,-493,-110,-426,7
+-416,-412,-493,-110,-426,7
+-416,-412,-493,-110,-423,5
+-416,-412,0,-110,-423,5
+-416,-412,0,-110,-421,4
+-416,-412,0,-110,-421,4
+-416,-412,0,-110,-420,3
+-416,-412,0,-110,-420,3
+-416,-412,0,-110,-419,2
+-416,-412,0,-110,-419,2
+-416,-412,0,-110,-418,1
+-416,-412,0,-110,-418,1
+-416,-412,0,-110,-417,1
+-416,-412,-500,-110,-417,1
+-314,-420,-500,-103,-249,-104
+-314,-420,0,-103,-249,-104
+-281,-420,0,-103,-288,-78
+-281,-420,0,-103,-288,-78
+-314,-420,-505,-103,-317,-58
+-314,-420,-505,-103,-317,-58
+-213,-428,0,-96,-166,-148
+-213,-428,0,-96,-166,-148
+-213,-428,0,-96,-221,-111
+-213,-428,-503,-96,-221,-111
+-112,-437,-503,-90,-85,-188
+-112,-437,0,-90,-85,-188
+-146,-437,0,-90,-151,-141
+-146,-437,-501,-90,-151,-141
+-44,-445,0,-83,-24,-211
+-44,-445,0,-83,-24,-211
+44,-454,-503,-76,82,-263
+44,-454,-503,-76,82,-263
+0,-454,0,-76,-3,-197
+0,-454,0,-76,-3,-197
+89,-462,-479,-70,108,-253
+89,-462,0,-70,108,-253
+22,-462,0,-70,25,-189
+22,-462,0,-70,25,-189
+-33,-462,-509,-70,-38,-142
+-33,-462,-509,-70,-38,-142
+56,-479,-502,-56,252,-306
+56,-479,-502,-56,252,-306
+146,-479,0,-56,155,-230
+146,-479,0,-56,155,-230
+78,-479,0,-56,80,-172
+78,-479,0,-56,80,-172
+22,-479,0,-56,23,-129
+22,-479,-514,-56,23,-129
+112,-487,0,-49,157,-202
+112,-487,0,-49,157,-202
+89,-487,0,-49,91,-151
+89,-487,0,-49,91,-151
+191,-496,-500,-43,220,-218
+191,-496,-500,-43,220,-218
+146,-496,0,-43,150,-163
+146,-496,0,-43,150,-163
+89,-496,0,-43,96,-122
+89,-496,0,-43,96,-122
+44,-496,0,-43,55,-92
+44,-496,0,-43,55,-92
+22,-496,0,-43,23,-69
+22,-496,0,-43,23,-69
+0,-496,0,-43,-1,-51
+0,-496,0,-43,-1,-51
+-11,-496,0,-43,-21,-38
+-11,-496,0,-43,-21,-38
+-33,-496,0,-43,-37,-29
+-33,-496,0,-43,-37,-29
+-44,-496,0,-43,-50,-21
+-44,-496,0,-43,-50,-21
+-56,-496,0,-43,-61,-16
+-56,-496,0,-43,-61,-16
+-67,-496,0,-43,-70,-12
+-67,-496,0,-43,-70,-12
+-78,-496,0,-43,-78,-9
+-78,-496,0,-43,-78,-9
+-78,-496,0,-43,-85,-6
+-78,-496,505,-43,-85,-6
+-179,-487,505,-49,-271,99
+-179,-487,0,-49,-271,99
+-236,-487,0,-49,-246,74
+-236,-487,0,-49,-246,74
+-224,-487,0,-49,-228,56
+-224,-487,0,-49,-228,56
+-326,-479,467,-56,-395,147
+-326,-479,0,-56,-395,147
+-348,-479,0,-56,-357,110
+-348,-479,0,-56,-357,110
+-326,-479,0,-56,-329,82
+-326,-479,0,-56,-329,82
+-303,-479,0,-56,-310,62
+-303,-479,0,-56,-310,62
+-292,-479,497,-56,-297,46
+-292,-479,497,-56,-297,46
+-393,-470,0,-63,-467,139
+-393,-470,0,-63,-467,139
+-427,-470,0,-63,-432,104
+-427,-470,0,-63,-432,104
+-404,-470,0,-63,-407,78
+-404,-470,0,-63,-407,78
+-382,-470,0,-63,-389,59
+-382,-470,507,-63,-389,59
+-483,-462,0,-70,-557,149
+-483,-462,0,-70,-557,149
+-517,-462,0,-70,-519,111
+-517,-462,0,-70,-519,111
+-416,-470,-551,-63,-313,-21
+-416,-470,0,-63,-313,-21
+-314,-470,0,-63,-321,-15
+-314,-470,0,-63,-321,-15
+-326,-470,0,-63,-327,-11
+-326,-470,0,-63,-327,-11
+-326,-470,0,-63,-331,-8
+-326,-470,0,-63,-331,-8
+-224,-479,-469,-56,-161,-111
+-224,-479,-469,-56,-161,-111
+-191,-479,0,-56,-201,-83
+-191,-479,0,-56,-201,-83
+-224,-479,0,-56,-231,-62
+-224,-479,0,-56,-231,-62
+-247,-479,0,-56,-256,-47
+-247,-479,0,-56,-256,-47
+-269,-479,-497,-56,-276,-35
+-269,-479,-497,-56,-276,-35
+-168,-487,0,-49,-113,-131
+-168,-487,0,-49,-113,-131
+-157,-487,0,-49,-158,-98
+-157,-487,-494,-49,-158,-98
+-56,-496,-494,-43,-14,-178
+-56,-496,0,-43,-14,-178
+-67,-496,0,-43,-72,-134
+-67,-496,0,-43,-72,-134
+-112,-496,0,-43,-116,-100
+-112,-496,0,-43,-116,-100
+-146,-496,0,-43,-151,-75
+-146,-496,0,-43,-151,-75
+-168,-496,0,-43,-178,-56
+-168,-496,0,-43,-178,-56
+-191,-496,0,-43,-199,-42
+-191,-496,0,-43,-199,-42
+-213,-496,0,-43,-216,-31
+-213,-496,-505,-43,-216,-31
+-112,-504,0,-36,-51,-128
+-112,-504,0,-36,-51,-128
+-11,-512,-476,-29,84,-201
+-11,-512,-476,-29,84,-201
+11,-512,0,-29,21,-151
+11,-512,0,-29,21,-151
+-22,-512,0,-29,-26,-113
+-22,-512,0,-29,-26,-113
+-56,-512,0,-29,-63,-85
+-56,-512,0,-29,-63,-85
+-89,-512,0,-29,-92,-63
+-89,-512,0,-29,-92,-63
+-112,-512,0,-29,-114,-47
+-112,-512,0,-29,-114,-47
+-78,-512,0,0,-84,-35
+-78,-512,0,0,-84,-35
+-89,-512,0,0,-95,-26
+-89,-512,0,0,-95,-26
+-101,-512,0,0,-103,-20
+-101,-512,0,0,-103,-20
+-101,-512,0,0,-109,-15
+-101,-512,0,0,-109,-15
+-112,-512,0,0,-113,-11
+-112,-512,0,0,-113,-11
+-112,-512,0,0,-117,-8
+-112,-512,0,0,-117,-8
+-112,-512,0,0,-119,-6
+-112,-512,0,0,-119,-6
+-112,-512,0,0,-121,-4
+-112,-512,0,0,-121,-4
+-112,-512,0,0,-123,-3
+-112,-512,0,0,-123,-3
+-123,-512,0,0,-124,-2
+-123,-512,0,0,-124,-2
+-123,-512,0,0,-124,-2
+-123,-512,0,0,-124,-2
+-123,-512,0,0,-125,-1
+-123,-512,0,0,-125,-1
+-123,-512,0,0,-126,-1
+-123,-512,0,0,-126,-1
+-123,-512,0,0,-126,0
+-123,-512,0,0,-126,0
+-123,-512,0,0,-126,0
+-123,-512,0,0,-126,0
+-224,-504,549,0,-294,104
+-224,-504,549,0,-294,104
+-258,-504,0,0,-263,78
+-258,-504,0,0,-263,78
+-236,-504,0,0,-239,58
+-236,-504,0,0,-239,58
+-213,-504,0,0,-222,44
+-213,-504,0,0,-222,44
+-202,-504,0,0,-209,33
+-202,-504,0,0,-209,33
+-191,-504,0,0,-199,24
+-191,-504,0,0,-199,24
+-191,-504,0,0,-191,18
+-191,-504,0,0,-191,18
+-179,-504,0,0,-186,13
+-179,-504,502,0,-186,13
+-281,-496,502,0,-349,115
+-281,-496,0,0,-349,115
+-314,-496,0,0,-315,86
+-314,-496,0,0,-315,86
+-281,-496,0,0,-289,64
+-281,-496,0,0,-289,64
+-258,-496,0,0,-269,48
+-258,-496,499,0,-269,48
+-359,-487,499,-49,-503,141
+-359,-487,0,-49,-503,141
+-461,-487,0,-49,-465,106
+-461,-487,0,-49,-465,106
+-438,-487,0,-49,-438,79
+-438,-487,0,-49,-438,79
+-404,-487,508,-49,-414,59
+-404,-487,508,-49,-414,59
+-506,-479,0,-56,-559,149
+-506,-479,0,-56,-559,149
+-494,-479,0,-56,-503,112
+-494,-479,0,-56,-503,112
+-461,-479,0,-56,-461,84
+-461,-479,0,-56,-461,84
+-427,-479,0,-56,-429,63
+-427,-479,0,-56,-429,63
+-404,-479,0,-56,-406,47
+-404,-479,0,-56,-406,47
+-382,-479,0,-56,-388,35
+-382,-479,0,-56,-388,35
+-371,-479,0,-56,-374,26
+-371,-479,0,-56,-374,26
+-359,-479,0,-56,-364,19
+-359,-479,0,-56,-364,19
+-348,-479,0,-56,-357,14
+-348,-479,0,-56,-357,14
+-348,-479,0,-56,-351,11
+-348,-479,0,-56,-351,11
+-337,-479,0,-56,-347,8
+-337,-479,0,-56,-347,8
+-247,-487,-517,-49,-171,-98
+-247,-487,0,-49,-171,-98
+-202,-487,0,-49,-206,-74
+-202,-487,0,-49,-206,-74
+-224,-487,0,-49,-233,-55
+-224,-487,0,-49,-233,-55
+-247,-487,0,-49,-255,-41
+-247,-487,0,-49,-255,-41
+-146,-496,-500,-43,-94,-136
+-146,-496,-500,-43,-94,-136
+-134,-496,0,-43,-139,-102
+-134,-496,0,-43,-139,-102
+-168,-496,0,-43,-174,-76
+-168,-496,0,-43,-174,-76
+-191,-496,0,-43,-201,-57
+-191,-496,0,-43,-201,-57
+-213,-496,0,-43,-223,-43
+-213,-496,0,-43,-223,-43
+-236,-496,0,-43,-240,-32
+-236,-496,0,-43,-240,-32
+-247,-496,0,-43,-254,-24
+-247,-496,0,-43,-254,-24
+-258,-496,0,-43,-266,-18
+-258,-496,0,-43,-266,-18
+-269,-496,0,-43,-275,-13
+-269,-496,0,-43,-275,-13
+-281,-496,0,-43,-284,-10
+-281,-496,0,-43,-284,-10
+-281,-496,0,-43,-291,-7
+-281,-496,0,-43,-291,-7
+-292,-496,0,-43,-298,-5
+-292,-496,0,-43,-298,-5
+-303,-496,0,-43,-304,-4
+-303,-496,0,-43,-304,-4
+-303,-496,0,-43,-309,-3
+-303,-496,0,-43,-309,-3
+-303,-496,0,-43,-311,-2
+-303,-496,0,-43,-311,-2
+-303,-496,0,-43,-312,-1
+-303,-496,0,-43,-312,-1
+-303,-496,0,-43,-312,-1
+-303,-496,504,-43,-312,-1
+-404,-487,504,-49,-480,103
+-404,-487,0,-49,-480,103
+-438,-487,0,-49,-441,77
+-438,-487,0,-49,-441,77
+-404,-487,0,-49,-412,58
+-404,-487,0,-49,-412,58
+-382,-487,0,-49,-390,43
+-382,-487,0,-49,-390,43
+-483,-479,503,-56,-541,137
+-483,-479,0,-56,-541,137
+-483,-479,0,-56,-490,103
+-483,-479,0,-56,-490,103
+-449,-479,0,-56,-451,77
+-449,-479,0,-56,-451,77
+-416,-479,0,-56,-422,58
+-416,-479,0,-56,-422,58
+-393,-479,0,-56,-400,43
+-393,-479,0,-56,-400,43
+-382,-479,0,-56,-384,32
+-382,-479,0,-56,-384,32
+-371,-479,0,-56,-371,24
+-371,-479,0,-56,-371,24
+-359,-479,0,-56,-362,18
+-359,-479,0,-56,-362,18
+-348,-479,0,-56,-355,13
+-348,-479,0,-56,-355,13
+-348,-479,0,-56,-350,10
+-348,-479,0,-56,-350,10
+-337,-479,0,-56,-346,7
+-337,-479,0,-56,-346,7
+-337,-479,0,-56,-343,5
+-337,-479,-500,-56,-343,5
+-236,-487,-500,-49,-168,-100
+-236,-487,0,-49,-168,-100
+-202,-487,0,-49,-204,-75
+-202,-487,0,-49,-204,-75
+-224,-487,0,-49,-231,-56
+-224,-487,0,-49,-231,-56
+-247,-487,0,-49,-253,-42
+-247,-487,0,-49,-253,-42
+-269,-487,0,-49,-271,-31
+-269,-487,0,-49,-271,-31
+-281,-487,0,-49,-285,-23
+-281,-487,0,-49,-285,-23
+-292,-487,0,-49,-298,-17
+-292,-487,-502,-49,-298,-17
+-191,-496,0,-43,-129,-118
+-191,-496,0,-43,-129,-118
+-168,-496,0,-43,-169,-88
+-168,-496,0,-43,-169,-88
+-191,-496,0,-43,-200,-66
+-191,-496,0,-43,-200,-66
+-213,-496,0,-43,-224,-49
+-213,-496,0,-43,-224,-49
+-236,-496,0,-43,-244,-37
+-236,-496,0,-43,-244,-37
+-258,-496,0,-43,-259,-28
+-258,-496,0,-43,-259,-28
+-269,-496,0,-43,-272,-21
+-269,-496,0,-43,-272,-21
+-281,-496,0,-43,-283,-15
+-281,-496,0,-43,-283,-15
+-281,-496,0,-43,-292,-11
+-281,-496,0,-43,-292,-11
+-292,-496,0,-43,-299,-8
+-292,-496,0,-43,-299,-8
+-303,-496,0,-43,-304,-6
+-303,-496,0,-43,-304,-6
+-303,-496,0,-43,-307,-5
+-303,-496,0,-43,-307,-5
+-303,-496,0,-43,-309,-3
+-303,-496,0,-43,-309,-3
+-303,-496,0,-43,-310,-2
+-303,-496,0,-43,-310,-2
+-303,-496,0,-43,-311,-2
+-303,-496,0,-43,-311,-2
+-303,-496,0,-43,-312,-1
+-303,-496,0,-43,-312,-1
+-303,-496,0,-43,-313,-1
+-303,-496,0,-43,-313,-1
+-303,-496,0,-43,-313,0
+-303,-496,0,-43,-313,0
+-303,-496,0,-43,-313,0
+-303,-496,0,-43,-313,0
+-303,-496,0,-43,-314,0
+-303,-496,487,-43,-314,0
+-404,-487,487,-49,-481,104
+-404,-487,0,-49,-481,104
+-438,-487,0,-49,-442,78
+-438,-487,0,-49,-442,78
+-404,-487,0,-49,-413,58
+-404,-487,0,-49,-413,58
+-382,-487,0,-49,-391,44
+-382,-487,0,-49,-391,44
+-371,-487,0,-49,-374,33
+-371,-487,0,-49,-374,33
+-359,-487,0,-49,-362,24
+-359,-487,0,-49,-362,24
+-348,-487,0,-49,-352,18
+-348,-487,0,-49,-352,18
+-337,-487,250,-49,-345,13
+-337,-487,250,-49,-345,13
+-438,-479,0,-56,-508,115
+-438,-479,0,-56,-508,115
+-461,-479,0,-56,-464,86
+-461,-479,0,-56,-464,86
+-427,-479,0,-56,-432,64
+-427,-479,0,-56,-432,64
+-404,-479,0,-56,-408,48
+-404,-479,0,-56,-408,48
+-382,-479,0,-56,-389,36
+-382,-479,0,-56,-389,36
+-371,-479,0,-56,-376,27
+-371,-479,0,-56,-376,27
+-359,-479,0,-56,-365,20
+-359,-479,0,-56,-365,20
+-348,-479,0,-56,-358,15
+-348,-479,0,-56,-358,15
+-348,-479,0,-56,-352,11
+-348,-479,-503,-56,-352,11
+-247,-487,0,-49,-175,-96
+-247,-487,0,-49,-175,-96
+-202,-487,0,-49,-209,-72
+-202,-487,0,-49,-209,-72
+-236,-487,0,-49,-236,-54
+-236,-487,0,-49,-236,-54
+-247,-487,0,-49,-257,-40
+-247,-487,0,-49,-257,-40
+-269,-487,0,-49,-274,-30
+-269,-487,0,-49,-274,-30
+-281,-487,0,-49,-288,-22
+-281,-487,0,-49,-288,-22
+-292,-487,0,-49,-299,-17
+-292,-487,0,-49,-299,-17
+-303,-487,0,-49,-305,-12
+-303,-487,0,-49,-305,-12
+-303,-487,0,-49,-310,-9
+-303,-487,0,-49,-310,-9
+-303,-487,0,-49,-314,-7
+-303,-487,0,-49,-314,-7
+-314,-487,0,-49,-316,-5
+-314,-487,0,-49,-316,-5
+-314,-487,0,-49,-318,-4
+-314,-487,0,-49,-318,-4
+-314,-487,0,-49,-320,-3
+-314,-487,0,-49,-320,-3
+-314,-487,0,-49,-321,-2
+-314,-487,0,-49,-321,-2
+-314,-487,0,-49,-322,-1
+-314,-487,0,-49,-322,-1
+-314,-487,0,-49,-322,-1
+-314,-487,0,-49,-322,-1
+-314,-487,0,-49,-323,0
+-314,-487,0,-49,-323,0
+-314,-487,0,-49,-323,0
+-314,-487,0,-49,-323,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-314,-487,0,-49,-324,0
+-416,-479,504,-56,-492,104
+-416,-479,0,-56,-492,104
+-449,-479,0,-56,-453,78
+-449,-479,0,-56,-453,78
+-416,-479,0,-56,-423,59
+-416,-479,0,-56,-423,59
+-393,-479,0,-56,-401,44
+-393,-479,0,-56,-401,44
+-382,-479,0,-56,-384,33
+-382,-479,0,-56,-384,33
+-371,-479,0,-56,-372,24
+-371,-479,0,-56,-372,24
+-359,-479,0,-56,-362,18
+-359,-479,0,-56,-362,18
+-348,-479,0,-56,-355,14
+-348,-479,0,-56,-355,14
+-348,-479,0,-56,-350,10
+-348,-479,0,-56,-350,10
+-337,-479,0,-56,-346,7
+-337,-479,0,-56,-346,7
+-337,-479,0,-56,-343,5
+-337,-479,0,-56,-343,5
+-337,-479,0,-56,-341,4
+-337,-479,0,-56,-341,4
+-337,-479,0,-56,-339,3
+-337,-479,0,-56,-339,3
+-337,-479,0,-56,-338,2
+-337,-479,0,-56,-338,2
+-337,-479,0,-56,-337,1
+-337,-479,0,-56,-337,1
+-326,-479,0,-56,-337,1
+-326,-479,0,-56,-337,1
+-326,-479,0,-56,-336,1
+-326,-479,0,-56,-336,1
+-326,-479,0,-56,-336,0
+-326,-479,0,-56,-336,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-335,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+-326,-479,0,-56,-334,0
+第二组数据，收敛的太慢了而且误差还有点大
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing dataset convergence and hold behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying dataset labeling and oscillation patterns**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Connecting hold activation to PID code conditions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing data for tuning recommendations**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:36Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Reevaluating PID parameter effects on convergence**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:36Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting pid_cal_clamped implementation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:39Z)**_
+
+这组里有一个现象必须先核实：不少平台角 `ch4` 已经到 `-3°` 左右，但按你表面这组 `P` 值不该这么大。我把 `pid_cal_clamped()` 和底层 PID 算法再读一下，确认是不是还有别的项在放大输出。
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:39Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+650			pid->out = pid->pout + pid->iout + pid->dout;
+651		}
+652	
+653		// ��¼ǰ����ƫ��
+654		pid->error[2] = pid->error[1];
+655		pid->error[1] = pid->error[0];
+656	
+657	//	// ����޷�
+658	//	if(pid->out>=MAX_DUTY)	
+659	//		pid->out=MAX_DUTY;
+660	//	if(pid->out<=0)	
+661	//		pid->out=0;
+662		
+663	}
+664	
+665	void pidout_limit(pid_t *pid)
+666	{
+667		PIDOUT_CLAMP(pid, 0, MAX_DUTY);
+668	}
+669	
+670	/* 带条件积分与输出限幅的位置式 PID（串级环专用）
+671	 *
+672	 * 与 PIDOUT_CLAMP 的反算抗饱和相比，本函数从不把比例项的溢出量写进 iout：
+673	 *   1. 先试算积分增量，只有「输出未饱和」或「误差方向会让积分退出饱和」时才采纳；
+674	 *   2. iout 独立限幅到 ±i_limit（i_limit=0 即彻底禁用积分，等价纯 P/PD）；
+675	 *   3. 最后只截断 out，iout 保持干净。
+676	 *
+677	 * 这样比例项可以随意撞限幅，积分状态不会被污染，不存在 Ki=0 时留下永久偏置的问题。
+678	 */
+679	static void pid_cal_clamped(pid_t *pid, float lo, float hi, float i_limit)
+680	{
+681		pid->error[0] = pid->target - pid->now;
+682	
+683		pid->pout = pid->p * pid->error[0];
+684		pid->dout = pid->d * (pid->error[0] - pid->error[1]);
+685	
+686		/* 条件积分：先看不含新增量的输出是否已经饱和到同一侧。 */
+687		if(i_limit > 0.0f) {
+688			float out_wo_new_i = pid->pout + pid->iout + pid->dout;
+689			bool sat_hi = (out_wo_new_i >= hi) && (pid->error[0] > 0.0f);
+690			bool sat_lo = (out_wo_new_i <= lo) && (pid->error[0] < 0.0f);
+691			if(!sat_hi && !sat_lo) {
+692				pid->iout += pid->i * pid->error[0];
+693				if(pid->iout >  i_limit) pid->iout =  i_limit;
+694				if(pid->iout < -i_limit) pid->iout = -i_limit;
+695			}
+696		} else {
+697			pid->iout = 0.0f;  /* 显式禁用积分，杜绝历史残留偏置 */
+698		}
+699	
+700		pid->out = pid->pout + pid->iout + pid->dout;
+701	
+702		pid->error[2] = pid->error[1];
+703		pid->error[1] = pid->error[0];
+704	
+705		/* 只截断输出，不回写 iout。 */
+706		if(pid->out > hi) pid->out = hi;
+707		if(pid->out < lo) pid->out = lo;
+708	}
+709	
+710	void pidout_Servo_limit(pid_t *pid)
+711	{
+712		PIDOUT_CLAMP(pid, -40.0f, 40.0f);
+713	}
+714	
+715	
+716	
+717	
+718	
+719	/*
+720	void pidout_limit_Y(pid_t *pid)
+721	{
+722		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+723	}
+724	*/
+725	float motor_get_command_angle(void)
+726	{
+727		return (float)motor_command_pulses / PULSES_PER_DEG;
+728	}
+729	
+730	void motor_set_angle(float target_deg)
+731	{
+732		/* PID 输出是相对上电回零点的绝对目标倾角。 */
+733		if(target_deg > ANGLE_LIMIT_MAX) target_deg = ANGLE_LIMIT_MAX;
+734		if(target_deg < ANGLE_LIMIT_MIN) target_deg = ANGLE_LIMIT_MIN;
+735	
+736		/* 驱动器绝对位置模式：+θ 为零点上方，-θ 为零点下方。 */
+737		int32_t target_pulses = (int32_t)(target_deg * PULSES_PER_DEG);
+738		if(target_pulses == motor_command_pulses) {
+739			return;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:39Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+1	#include "pid.h"
+2	#include "Emm_V5.h"              /* ball_error、Emm_V5_Pos_Control */
+3	
+4	extern volatile float ball_velocity;  /* 视觉小球速度，定义在 main.c，中断写主循环读 */
+5	
+6	#define PULSES_PER_DEG  8.89f  /* 3200脉冲/圈，1°=8.89脉冲 */
+7	
+8	/* 上一次下发的绝对目标脉冲，仅用于 VOFA 显示和避免重复发同一目标。 */
+9	static int32_t motor_command_pulses = 0;
+10	
+11	/* 由 pid.h 的角度限幅换算成脉冲阈值（仅 pid.c 内部使用） */
+12	#define PULSE_LIMIT_MAX  (ANGLE_LIMIT_MAX * PULSES_PER_DEG)            /* 正向限幅脉冲 */
+13	#define PULSE_LIMIT_MIN  (ANGLE_LIMIT_MIN * PULSES_PER_DEG)            /* 反向限幅脉冲 */
+14	#define PULSE_DEAD_MAX   ((ANGLE_LIMIT_MAX - 2.0f) * PULSES_PER_DEG)  /* 正向死区起点（限位前2°） */
+15	#define PULSE_DEAD_MIN   ((ANGLE_LIMIT_MIN + 2.0f) * PULSES_PER_DEG)  /* 反向死区起点（限位前2°） */
+16	
+17	#define MAX_DUTY  7200    /* 旧代码需要，PWM最大占空比 */
+18	#define MOTOR_ADDR 1      /* 旧代码需要，电机地址 */
+19	#define MOTOR_POSITION_SPEED_RPM  100u   /* 串口绝对位置命令速度 */
+20	
+21	/*pid_t motorA;
+22	pid_t motorB;
+23	pid_t motorC;
+24	pid_t motorD;
+25	
+26	pid_t weizhiA;
+27	pid_t weizhiB;
+28	pid_t weizhiC;
+29	pid_t weizhiD;
+30	
+31	pid_t ServoA;
+32	pid_t ServoB;
+33	
+34	pid_t ServoA_Speed;
+35	pid_t ServoB_Speed;
+36	
+37	pid_t ServoA_Pid;
+38	pid_t ServoB_Pid;
+39	
+40	int redX_last;
+41	int redY_last;*/
+42	
+43	int redXSpeed;
+44	int redYSpeed;
+45	
+46	float Y;
+47	float Y_last;
+48	
+49	/* 目标坐标与视觉 Y 使用同一坐标系，默认回到画面中心。 */
+50	volatile float ball_target_y = 0.0f;
+51	
+52	void ball_target_set(float target_y)
+53	{
+54		ball_target_y = target_y;
+55	}
+56	
+57	float ball_target_get(void)
+58	{
+59		return ball_target_y;
+60	}
+61	
+62	pid_t pidY;
+63	pid_t pidY_Speed;
+64	float pidY_velocity_damping;
+65	float pidY_filtered_velocity = 0.0f;  /* 低通滤波后的视觉速度 (cm/s)，供 VOFA ch5 */
+66	
+67	typedef enum {
+68		PID_SEGMENT_TO_POS_56 = 0,
+69		PID_SEGMENT_TO_NEG_55,
+70		PID_SEGMENT_HOLD_NEG_55,
+71	} pid_segment_t;
+72	
+73	static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+74	static bool g_pid_segment_initialized = false;
+75	
+76	static float pid_absf(float value)
+77	{
+78		return (value >= 0.0f) ? value : -value;
+79	}
+80	
+81	static void pid_apply_segment_profile(float target_y,
+82		                                  float pos_p, float pos_i, float pos_d,
+83		                                  float spd_p, float spd_i, float spd_d)
+84	{
+85		pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+86		pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+87		ball_target_set(target_y);
+88	}
+89	
+90	void pid_init(pid_t *pid, uint32_t mode, float p, float i, float d,float f)
+91	{
+92		pid->pid_mode = mode;
+93		pid->p = p;
+94		pid->i = i;
+95		pid->d = d;
+96		pid->f = f;
+97		pid->target = 0;
+98		pid->now = 0;
+99		pid->out = 0;
+100		pid->iout = 0;
+101		pid->error[0] = pid->error[1] = pid->error[2] = 0;
+102		pid->target_last = 0;
+103	}
+104	
+105	/*void motor_target_set(int spe1, int spe2)
+106	{
+107		if(spe1 >= 0)
+108		{
+109			motorA_dir = 1;
+110			motorA.target = spe1;
+111		}
+112		else
+113		{
+114			motorA_dir = 0;
+115			motorA.target = -spe1;
+116		}
+117		
+118		if(spe2 >= 0)
+119		{
+120			motorB_dir = 1;
+121			motorB.target = spe2;
+122		}
+123		else
+124		{
+125			motorB_dir = 0;
+126			motorB.target = -spe2;
+127		}
+128	}
+129	
+130	void motor_target_set_CD(int spe1, int spe2)
+131	{
+132		if(spe1 >= 0)
+133		{
+134			motorC_dir = 1;
+135			motorC.target = spe1;
+136		}
+137		else
+138		{
+139			motorC_dir = 0;
+140			motorC.target = -spe1;
+141		}
+142		
+143		if(spe2 >= 0)
+144		{
+145			motorD_dir = 1;
+146			motorD.target = spe2;
+147		}
+148		else
+149		{
+150			motorD_dir = 0;
+151			motorD.target = -spe2;
+152		}
+153	}
+154	
+155	//void Servo_target_set(int spe1, int spe2)
+156	//{
+157	//	ServoA.target = spe1;
+158	//	ServoB.target = spe2;
+159	//	
+160	//	
+161	//}
+162	
+163	void pid_control(void)
+164	{
+165		// 1.�趨Ŀ���ٶ�
+166	//	motorA.target = 50;
+167		motor_target_set(30,30);
+168		// 2.��ȡ��ǰ�Ƕ�
+169		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedA;}
+170		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+171		Encoder_count1 = 0;
+172		Encoder_count2 = 0;
+173		// 3.PID�������������
+174		pid_cal(&motorA);
+175		pid_cal(&motorB);
+176		// �������޷�
+177		pidout_limit(&motorA);
+178		pidout_limit(&motorB);
+179		// 4.PID�����ֵ ��������
+180		motorA_duty(motorA.out);
+181		motorB_duty(motorB.out);
+182	}
+183	
+184	void pid_control_speed(void)
+185	{
+186		// 1.�趨Ŀ���ٶ�
+187	//	motorA.target = 50;
+188		motor_target_set(30,30);
+189		// 2.��ȡ��ǰ�Ƕ�
+190		if(motorA_dir){motorA.now = speedA;}else{motorA.now = -speedA;}
+191		if(motorB_dir){motorB.now = speedB;}else{motorB.now = -speedB;}
+192		Encoder_count1 = 0;
+193		Encoder_count2 = 0;
+194		// 3.PID�������������
+195		pid_cal(&motorA);
+196		pid_cal(&motorB);
+197		// �������޷�
+198		pidout_limit(&motorA);
+199		pidout_limit(&motorB);
+200		// 4.PID�����ֵ ��������
+201		motorA_duty(motorA.out);
+202		motorB_duty(motorB.out);
+203	}
+204	
+205	void pid_control_speed_CD(void)
+206	{
+207		// 1.�趨Ŀ���ٶ�
+208	//	motorA.target = 50;
+209		motor_target_set_CD(200,200);
+210		// 2.��ȡ��ǰ�Ƕ�
+211		if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+212		if(motorD_dir){motorD.now = speedD;}else{motorD.now = -speedD;}
+213	//	if(motorC_dir){motorC.now = speedC;}else{motorC.now = -speedC;}
+214	//	if(motorD_dir){PositionD = (((Encoder_Timer_Overflow_D-1)*65535)+(TIM_GetCounter(TIM5)));}
+215	//	else{PositionD = -(-(Encoder_Timer_Overflow_D*65535)+(65535-TIM_GetCounter(TIM5)));}
+216		Encoder_count3	= 0;
+217		Encoder_count4 = 0;
+218		// 3.PID�������������
+219		pid_cal(&motorC);
+220		pid_cal(&motorD);
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing dataset convergence and hold logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:54Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting hold thresholds and dataset behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:42:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Noticing new dataset start values**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing PID output inconsistencies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying runtime PID gain changes via BT tuning**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:06Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Examining hold state PID integral behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:11Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing PID integral influence on speed loop output**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:12Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying persistent integral output causing hold bias**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:16Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying hold zone error tolerance settings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Deciding to recommend hold threshold change**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining hold activation effect on error and speed**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Recommending tuning PID parameters**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing control behavior in two regimes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Noting residual integral affecting speed loop**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:40Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying PID integral bias impact**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:44Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying PID tuning and reset recommendations**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting control loop parameters for faster convergence**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:43:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning code reference inclusion and error correlation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:44:23Z)**_
+
+你选中的这段 [Core/Src/pid.c:818-860](Core/Src/pid.c#L818-L860) 跟这次现象**直接相关**。  
+这次我重新按当前代码和你两组数据对了一遍，结论分成两件事看更准确。
+
+**1. 误差“还有点大”这件事，很多时候不是 PID 没收敛，而是代码已经主动进保持区了。**
+
+现在的逻辑是：
+
+- 目标固定 `-5.5cm`
+- 只要满足  
+  `|Y + 5.5| <= 0.5cm`  
+  且 `|estimated_velocity| <= 0.25cm/s`  
+  连续 6 个控制周期
+- 就把 `target_hold_active = true`
+- 然后外环直接被压成 `pidY.out = 0`
+
+也就是一旦进这个窗，`ch3` 会变成 `0`，外环不再继续追位置。
+
+你数据里这种点很多，比如：
+
+```text
+202,-504,0,0,206,-44
+-123,-512,0,0,-126,0
+56,-546,0,0,59,0
+```
+
+按 VOFA 定义：
+
+- `ch1=-504` 表示位置 `-5.04cm`，离目标还有 `0.46cm`
+- `ch1=-512` 表示位置 `-5.12cm`，离目标还有 `0.38cm`
+- `ch1=-546` 表示位置 `-5.46cm`，离目标只有 `0.04cm`
+
+它们共同特点都是：
+
+- `ch3 = 0`
+- 说明已经进入了你现在写死的“最终保持”
+
+所以你说“误差有点大”，这件事在当前代码下是**允许发生的**。  
+因为你把最终停止条件定义成了 `±0.5cm`，那它停在 `-5.04`、`-5.12`、`-5.46` 都是合法结果，不是 bug。
+
+---
+
+**2. 收敛太慢这件事，主要不是速度环推不动，而是第二段外环给的目标速度太小，再叠加保持窗太早接管。**
+
+第二段参数在 [Core/Src/pid.c:773](Core/Src/pid.c#L773)：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.15f, 0.0f, 0.0f);
+```
+
+这意味着第二段外环只有：
+
+- `Pos_P = 0.8`
+- `Pos_I = 0`
+- `Pos_D = 0`
+
+所以当球已经到 `-4.79cm` 时，位置误差只有 `0.71cm`，外环目标速度也就只有：
+
+- `0.8 × 0.71 ≈ 0.57`
+- 对应日志里就是 `ch3 ≈ -56`
+
+这其实很小。
+
+你后面很多慢慢爬的片段，本质就是：
+
+- 外环已经只让它以很小目标速度继续走
+- 一旦速度再掉下来、位置又进了 `±0.5cm`
+- 保持逻辑就把外环直接切成 `0`
+
+所以看起来像“最后一段拖很久，而且停的位置还有误差”。
+
+---
+
+**还有一个很关键的信号：你这次数据里，内环其实已经不算弱。**
+
+比如这一类：
+
+```text
+-326,-479,0,-56,-334,0
+-314,-487,0,-49,-324,0
+```
+
+意思是：
+
+- 位置在 `-4.79 / -4.87`
+- 外环目标速度只有 `-0.56 / -0.49`
+- 但平台角已经到了 `-3.34° / -3.24°`
+- 同时 `ch5 ≈ 0`
+
+这说明现在这组数据里，**内环并不是没力**。  
+如果还是默认那组纯 `P=1.15, I=0` 的第二段速度环，按理说 `ch4` 不该到 `-3°` 这么大。
+
+这通常只会有两种情况：
+
+1. 你运行时通过蓝牙把速度环参数改过了  
+2. 你把 `I` 改小甚至改成 0 了，但**旧的积分状态还残留着**
+
+这一点非常重要。因为当前 `pid_cal_clamped()` 在 `i_limit > 0` 时，不会自动清空旧 `iout`。  
+所以你**每次改完参数，尤其是把 `Spd_I` 从非零改成 0 之后，最好先发一次积分清零命令再测**，不然这组数据会被历史积分污染。
+
+---
+
+**所以这两组数据对应的判断是：**
+
+第一类现象：
+- 停在 `-5.04 / -5.12 / -5.46`
+- `ch3 = 0`
+- 这是保持区逻辑在起作用
+- 误差大小主要由 `±0.5cm` 这个门限决定
+
+第二类现象：
+- 接近目标时拖得很慢
+- `ch3` 只有 `-0.56 / -0.49 / -0.43`
+- 是第二段位置环 `P=0.8` 给的目标速度太保守
+- 不是主因出在速度环没力
+
+---
+
+**按现在这份代码，我建议你这样调，顺序不要乱。**
+
+1. **先清积分再测**
+   - 每次改完蓝牙参数后，先发一次积分复位命令
+   - 否则你看到的 `ch4` 里会混着旧 `iout`
+
+2. **想让最终误差更小，先改保持区，不先改 PID**
+   - 当前：
+     - `TARGET_HOLD_POSITION_ENTER = 0.50f`
+     - `TARGET_HOLD_POSITION_EXIT  = 0.60f`
+   - 建议先试：
+     - `ENTER = 0.25f`
+     - `EXIT  = 0.35f`
+
+   这样外环不会在 `-5.04 / -5.12` 这么早就停掉。
+
+3. **想让第二段末端收敛快一点，先加第二段位置环 P**
+   - 现在第二段 `Pos_P = 0.8`
+   - 建议先试 `0.95`，再看
+   - 还慢就试 `1.05`
+
+   原因很简单：你现在慢，是因为 `ch3` 太小，不是 `ch4` 太小。
+
+4. **这组数据里先不要继续猛加第二段速度环 P/I**
+   - 因为 `ch4` 已经经常打到 `-3°` 左右
+   - 再加内环，更容易把末端弄成来回摆，而不一定更快到点
+
+---
+
+**我给你一个最直接的判断句：**
+
+你现在“收敛慢且误差大”的主因有两个，优先级是：
+
+1. **保持区太宽，导致 `-5.04 ~ -5.12` 这种位置就直接停外环了**
+2. **第二段外位置环 `P=0.8` 太保守，末端给的目标速度太小**
+
+不是先去怀疑速度环本身。
+
+你下一轮最好先做这两件事：
+
+- 把保持区从 `±0.5cm` 收紧到 `±0.25cm`
+- 把第二段 `Pos_P` 从 `0.8` 提到 `0.95`
+
+这样再看一组 VOFA，判断会更干净。
+
+---
+
+_**User (2026-08-02 23:45:21Z)**_
+
+在那个文件改？改什么？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-02 23:45:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning concise file and line references**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:45:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying precise files for pid modifications**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-02 23:45:37Z)**_
+
+改两个地方。
+
+**1. 收紧最终保持区**  
+改 [Core/Inc/pid.h:146-149](Core/Inc/pid.h#L146-L149)
+
+现在是：
+
+```c
+#define TARGET_HOLD_POSITION_ENTER  0.50f
+#define TARGET_HOLD_POSITION_EXIT   0.60f
+#define TARGET_HOLD_SPEED_LIMIT     0.25f
+#define TARGET_HOLD_SETTLE_TICKS    6u
+```
+
+先改成：
+
+```c
+#define TARGET_HOLD_POSITION_ENTER  0.25f
+#define TARGET_HOLD_POSITION_EXIT   0.35f
+#define TARGET_HOLD_SPEED_LIMIT     0.25f
+#define TARGET_HOLD_SETTLE_TICKS    6u
+```
+
+这一步的作用是：  
+不要在 `-5.04 / -5.12` 这种位置就提前把外环停掉。
+
+---
+
+**2. 提高第二段位置环 P，让末端收敛快一点**  
+改 [Core/Src/pid.c:773](Core/Src/pid.c#L773)
+
+现在是：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.8f, 0.0f, 0.0f, 1.15f, 0.0f, 0.0f);
+```
+
+先改成：
+
+```c
+pid_apply_segment_profile(-5.5f, 0.95f, 0.0f, 0.0f, 1.15f, 0.0f, 0.0f);
+```
+
+这一步的作用是：  
+第二段接近目标时，外环给的目标速度别太小，不然最后一段会拖。
+
+---
+
+**先只改这两个，不要同时再动速度环。**  
+因为你这次数据里 `ch4` 已经经常到 `-3°` 左右，说明内环并不算弱，当前更像是：
+
+- 保持区进得太早
+- 第二段外环太保守
+
+另外，改完参数后，先发一次蓝牙积分清零命令再测，避免旧积分状态干扰这一轮数据判断。
+
+---
+
+_**User (2026-08-03 04:15:31Z)**_
+
+<ide_selection>The user selected the lines 773 to 773 from d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c:
+			pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+
+This may or may not be related to the current task.</ide_selection>
+
+-517,-596,500,-2,-741,442
+-517,-596,0,-2,-741,442
+-573,-596,0,-2,-581,331
+-573,-596,502,-2,-581,331
+-663,-588,502,-8,-667,353
+-663,-588,1512,-8,-667,353
+-764,-563,503,-27,-944,465
+-764,-563,503,-27,-944,465
+-866,-554,0,-33,-984,454
+-866,-554,0,-33,-984,454
+-956,-546,499,-40,-1000,445
+-956,-546,499,-40,-1000,445
+-866,-546,0,-40,-871,334
+-866,-546,0,-40,-871,334
+-944,-538,350,-46,-953,355
+-944,-538,350,-46,-953,355
+-989,-529,533,-52,-992,371
+-989,-529,0,-52,-992,371
+-888,-529,0,-52,-830,278
+-888,-529,508,-52,-830,278
+-899,-521,508,-59,-903,314
+-899,-521,495,-59,-903,314
+-956,-512,0,-65,-960,340
+-956,-512,0,-65,-960,340
+-854,-512,0,-65,-811,255
+-854,-512,0,-65,-811,255
+-888,-504,503,-71,-894,296
+-888,-504,0,-71,-894,296
+-787,-504,0,-71,-764,222
+-787,-504,510,-71,-764,222
+-854,-496,510,-78,-862,271
+-854,-496,0,-78,-862,271
+-753,-496,0,-78,-743,203
+-753,-496,0,-78,-743,203
+-652,-496,0,-78,-654,152
+-652,-496,0,-78,-654,152
+-584,-496,0,-78,-587,114
+-584,-496,-504,-78,-587,114
+-483,-504,-504,-71,-342,-18
+-483,-504,0,-71,-342,-18
+-382,-504,0,-71,-350,-14
+-382,-504,-499,-71,-350,-14
+-281,-512,0,-65,-156,-115
+-281,-512,0,-65,-156,-115
+-179,-521,-505,-59,0,-191
+-179,-521,-505,-59,0,-191
+-78,-521,0,-59,-74,-143
+-78,-521,-499,-59,-74,-143
+11,-529,-499,-52,72,-212
+11,-529,0,-52,72,-212
+0,-529,0,-52,-9,-159
+0,-529,-502,-52,-9,-159
+89,-538,-502,-46,133,-224
+89,-538,-502,-46,133,-224
+44,-538,0,-46,47,-168
+44,-538,0,-46,47,-168
+146,-546,-510,-40,187,-231
+146,-546,-510,-40,187,-231
+236,-554,-495,-33,305,-278
+236,-554,0,-33,305,-278
+191,-554,0,-33,200,-208
+191,-554,-501,-33,200,-208
+292,-563,-501,-27,327,-261
+292,-563,0,-27,327,-261
+224,-563,-508,-27,230,-196
+224,-563,-508,-27,230,-196
+326,-580,-501,-14,549,-347
+326,-580,-501,-14,549,-347
+416,-580,0,-14,422,-260
+416,-580,-486,-14,422,-260
+517,-588,-486,-8,532,-300
+517,-588,0,-8,532,-300
+416,-588,0,-8,422,-225
+416,-588,0,-8,422,-225
+337,-588,0,-8,339,-168
+337,-588,0,-8,339,-168
+269,-588,0,-8,277,-126
+269,-588,0,-8,277,-126
+224,-588,0,-8,230,-95
+224,-588,0,-8,230,-95
+191,-588,0,-8,195,-71
+191,-588,-500,-8,195,-71
+292,-596,-500,-2,374,-158
+292,-596,0,-2,374,-158
+314,-596,0,-2,317,-118
+314,-596,0,-2,317,-118
+213,-588,500,-8,67,15
+213,-588,500,-8,67,15
+112,-588,0,-8,72,11
+112,-588,0,-8,72,11
+67,-588,0,-8,76,8
+67,-588,0,-8,76,8
+67,-588,0,-8,78,6
+67,-588,0,-8,78,6
+78,-588,0,-8,80,5
+78,-588,0,-8,80,5
+78,-588,0,-8,81,3
+78,-588,0,-8,81,3
+-11,-580,503,-14,-124,107
+-11,-580,500,-14,-124,107
+-112,-571,500,-21,-292,185
+-112,-571,0,-21,-292,185
+-213,-571,0,-21,-227,139
+-213,-571,0,-21,-227,139
+-168,-571,499,-21,-178,104
+-168,-571,499,-21,-178,104
+-269,-563,0,-27,-349,183
+-269,-563,0,-27,-349,183
+-371,-554,501,-33,-491,242
+-371,-554,0,-33,-491,242
+-404,-554,0,-33,-406,181
+-404,-554,0,-33,-406,181
+-337,-554,0,-33,-344,136
+-337,-554,0,-33,-344,136
+-292,-554,168,-33,-298,102
+-292,-554,168,-33,-298,102
+-393,-546,168,-40,-470,181
+-393,-546,168,-40,-470,181
+-494,-538,249,-46,-614,241
+-494,-538,502,-46,-614,241
+-596,-529,502,-52,-737,285
+-596,-529,0,-52,-737,285
+-629,-529,0,-52,-639,214
+-629,-529,0,-52,-639,214
+-562,-529,0,-52,-566,160
+-562,-529,0,-52,-566,160
+-506,-529,167,-52,-513,120
+-506,-529,167,-52,-513,120
+-607,-521,0,-59,-680,195
+-607,-521,504,-59,-680,195
+-708,-512,504,-65,-804,251
+-708,-512,0,-65,-804,251
+-686,-512,0,-65,-694,188
+-686,-512,498,-65,-694,188
+-787,-504,498,-71,-806,246
+-787,-504,0,-71,-806,246
+-697,-504,0,-71,-699,184
+-697,-504,0,-71,-699,184
+-607,-504,0,-71,-618,138
+-607,-504,0,-71,-618,138
+-708,-496,501,-78,-752,209
+-708,-496,0,-78,-752,209
+-652,-496,0,-78,-660,156
+-652,-496,0,-78,-660,156
+-584,-496,0,-78,-592,117
+-584,-496,0,-78,-592,117
+-539,-496,0,-78,-540,88
+-539,-496,0,-78,-540,88
+-438,-504,-503,-71,-307,-38
+-438,-504,-503,-71,-307,-38
+-337,-504,-503,-71,-324,-29
+-337,-504,0,-71,-324,-29
+-326,-504,0,-71,-337,-21
+-326,-504,0,-71,-337,-21
+-337,-504,0,-71,-346,-16
+-337,-504,-499,-71,-346,-16
+-236,-512,0,-65,-153,-117
+-236,-512,0,-65,-153,-117
+-202,-512,0,-65,-203,-87
+-202,-512,0,-65,-203,-87
+-236,-512,0,-65,-241,-65
+-236,-512,-251,-65,-241,-65
+-134,-521,-251,-59,-66,-154
+-134,-521,-251,-59,-66,-154
+-123,-521,-251,-59,-127,-115
+-123,-521,-248,-59,-127,-115
+-22,-529,-248,-52,30,-191
+-22,-529,-248,-52,30,-191
+67,-538,-251,-46,161,-248
+67,-538,-251,-46,161,-248
+56,-538,0,-46,66,-186
+56,-538,-499,-46,66,-186
+157,-546,-499,-40,199,-245
+157,-546,-506,-40,199,-245
+258,-554,-506,-33,312,-288
+258,-554,0,-33,312,-288
+202,-554,-504,-33,204,-216
+202,-554,-504,-33,204,-216
+303,-571,-500,-21,516,-362
+303,-571,-500,-21,516,-362
+382,-571,0,-21,382,-271
+382,-571,-500,-21,382,-271
+472,-580,-500,-14,487,-308
+472,-580,0,-14,487,-308
+382,-580,0,-14,374,-231
+382,-580,-500,-14,374,-231
+472,-588,0,-8,494,-278
+472,-588,0,-8,494,-278
+382,-588,0,-8,393,-209
+382,-588,0,-8,393,-209
+314,-588,0,-8,316,-156
+314,-588,-501,-8,316,-156
+416,-596,-501,-2,464,-222
+416,-596,0,-2,464,-222
+382,-596,0,-2,383,-166
+382,-596,0,-2,383,-166
+314,-596,0,-2,322,-125
+314,-596,0,-2,322,-125
+269,-596,0,-2,277,-93
+269,-596,0,-2,277,-93
+236,-596,0,-2,242,-70
+236,-596,0,-2,242,-70
+213,-596,0,-2,217,-52
+213,-596,0,-2,217,-52
+191,-596,0,0,202,-39
+191,-596,0,0,202,-39
+179,-596,500,0,187,-29
+179,-596,500,0,187,-29
+78,-588,0,0,-17,82
+78,-588,0,0,-17,82
+11,-588,0,0,12,62
+11,-588,0,0,12,62
+33,-588,0,0,35,46
+33,-588,0,0,35,46
+44,-588,0,0,52,34
+44,-588,502,0,52,34
+-44,-580,502,0,-129,131
+-44,-580,503,0,-129,131
+-146,-571,0,0,-276,203
+-146,-571,0,0,-276,203
+-191,-571,501,0,-202,152
+-191,-571,501,0,-202,152
+-292,-563,0,0,-341,219
+-292,-563,0,0,-341,219
+-393,-554,691,0,-456,269
+-393,-554,0,0,-456,269
+-348,-554,0,0,-358,202
+-348,-554,0,0,-358,202
+-281,-554,0,0,-285,151
+-281,-554,0,0,-285,151
+-224,-554,0,0,-230,113
+-224,-554,0,0,-230,113
+-179,-554,0,0,-188,85
+-179,-554,0,0,-188,85
+-281,-521,400,-59,-637,263
+-281,-521,0,-59,-637,263
+-382,-521,0,-59,-547,197
+-382,-521,0,-59,-547,197
+-472,-521,0,-59,-481,148
+-472,-521,0,-59,-481,148
+-427,-521,0,-59,-433,111
+-427,-521,0,-59,-433,111
+-393,-521,0,-59,-399,83
+-393,-521,0,-59,-399,83
+-494,-512,125,-65,-580,167
+-494,-512,509,-65,-580,167
+-596,-504,509,-71,-732,230
+-596,-504,509,-71,-732,230
+-652,-504,509,-71,-656,173
+-652,-504,0,-71,-656,173
+-596,-504,508,-71,-600,129
+-596,-504,508,-71,-600,129
+-697,-496,508,-78,-740,202
+-697,-496,508,-78,-740,202
+-641,-496,508,-78,-652,151
+-641,-496,166,-78,-652,151
+-742,-487,166,-84,-780,218
+-742,-487,166,-84,-780,218
+-674,-487,166,-84,-684,164
+-674,-487,0,-84,-684,164
+-607,-487,0,-84,-612,123
+-607,-487,0,-84,-612,123
+-551,-487,0,-84,-559,92
+-551,-487,0,-84,-559,92
+-652,-479,248,-90,-713,174
+-652,-479,0,-90,-713,174
+-629,-479,0,-90,-637,130
+-629,-479,0,-90,-637,130
+-573,-479,0,-90,-580,98
+-573,-479,0,-90,-580,98
+-528,-479,0,-90,-537,73
+-528,-479,0,-90,-537,73
+-494,-479,0,-90,-505,55
+-494,-479,0,-90,-505,55
+-472,-479,0,-90,-480,41
+-472,-479,0,-90,-480,41
+-461,-479,0,-90,-462,31
+-461,-479,-506,-90,-462,31
+-359,-487,-506,-84,-254,-81
+-359,-487,0,-84,-254,-81
+-281,-487,-506,-84,-290,-61
+-281,-487,-506,-84,-290,-61
+-179,-496,0,-78,-114,-150
+-179,-496,0,-78,-114,-150
+-89,-504,-535,-71,28,-218
+-89,-504,0,-71,28,-218
+-56,-504,0,-71,-57,-163
+-56,-504,0,-71,-57,-163
+-123,-504,0,-71,-124,-122
+-123,-504,-502,-71,-124,-122
+-22,-512,0,-65,29,-197
+-22,-512,0,-65,29,-197
+-44,-512,0,-65,-48,-147
+-44,-512,0,-65,-48,-147
+-101,-512,0,-65,-108,-110
+-101,-512,0,-65,-108,-110
+-146,-512,0,-65,-154,-83
+-146,-512,-498,-65,-154,-83
+-44,-546,-498,-40,224,-262
+-44,-546,0,-40,224,-262
+44,-546,-504,-40,125,-196
+44,-546,-504,-40,125,-196
+134,-554,0,-33,256,-252
+134,-554,0,-33,256,-252
+157,-554,0,-33,161,-189
+157,-554,0,-33,161,-189
+258,-563,-502,-27,295,-247
+258,-563,0,-27,295,-247
+202,-563,0,-27,202,-185
+202,-563,0,-27,202,-185
+123,-563,0,-27,133,-138
+123,-563,-502,-27,133,-138
+224,-571,0,-21,285,-209
+224,-571,0,-21,285,-209
+202,-571,0,-21,207,-156
+202,-571,0,-21,207,-156
+303,-580,-503,-14,354,-222
+303,-580,0,-14,354,-222
+269,-580,0,-14,272,-167
+269,-580,0,-14,272,-167
+202,-580,0,-14,210,-125
+202,-580,-502,-14,210,-125
+303,-588,0,-8,369,-198
+303,-588,0,-8,369,-198
+292,-588,0,-8,296,-149
+292,-588,0,-8,296,-149
+236,-588,0,-8,241,-111
+236,-588,0,-8,241,-111
+191,-588,0,-8,200,-83
+191,-588,0,-8,200,-83
+168,-588,0,-8,168,-62
+168,-588,0,-8,168,-62
+134,-588,0,-8,145,-47
+134,-588,0,-8,145,-47
+134,-588,0,0,143,-35
+134,-588,0,0,143,-35
+123,-588,0,0,130,-26
+123,-588,0,0,130,-26
+112,-588,0,0,120,-19
+112,-588,0,0,120,-19
+112,-588,0,0,113,-14
+112,-588,0,0,113,-14
+101,-588,0,0,108,-11
+101,-588,0,0,108,-11
+101,-588,504,0,104,-8
+101,-588,504,0,104,-8
+0,-580,0,0,-93,98
+0,-580,0,0,-93,98
+-89,-571,467,0,-251,179
+-89,-571,0,0,-251,179
+-179,-571,0,0,-186,134
+-179,-571,501,0,-186,134
+-281,-563,501,0,-332,205
+-281,-563,0,0,-332,205
+-247,-563,0,0,-257,154
+-247,-563,0,0,-257,154
+-348,-554,482,0,-396,220
+-348,-554,482,0,-396,220
+-314,-554,482,0,-316,165
+-314,-554,482,0,-316,165
+-247,-554,482,0,-256,124
+-247,-554,482,0,-256,124
+-202,-554,482,0,-211,93
+-202,-554,125,0,-211,93
+-303,-546,520,0,-371,174
+-303,-546,520,0,-371,174
+-404,-538,0,-46,-588,236
+-404,-538,0,-46,-588,236
+-506,-529,502,-52,-713,282
+-506,-529,0,-52,-713,282
+-607,-529,0,-52,-616,211
+-607,-529,502,-52,-616,211
+-708,-521,502,-59,-751,263
+-708,-521,502,-59,-751,263
+-652,-521,502,-59,-661,197
+-652,-521,502,-59,-661,197
+-584,-521,502,-59,-595,148
+-584,-521,502,-59,-595,148
+-539,-521,502,-59,-547,111
+-539,-521,100,-59,-547,111
+-641,-512,100,-65,-694,188
+-641,-512,0,-65,-694,188
+-607,-512,0,-65,-611,141
+-607,-512,502,-65,-611,141
+-708,-504,0,-71,-744,210
+-708,-504,0,-71,-744,210
+-809,-496,498,-78,-847,263
+-809,-496,498,-78,-847,263
+-731,-496,0,-78,-732,197
+-731,-496,-500,-78,-732,197
+-629,-504,-500,-71,-450,43
+-629,-504,0,-71,-450,43
+-528,-504,0,-71,-432,32
+-528,-504,0,-71,-432,32
+-427,-504,0,-71,-417,24
+-427,-504,0,-71,-417,24
+-404,-504,0,-71,-407,18
+-404,-504,0,-71,-407,18
+-393,-504,0,-71,-399,13
+-393,-504,0,-71,-399,13
+-382,-504,0,-71,-393,10
+-382,-504,0,-71,-393,10
+-382,-504,0,-71,-388,7
+-382,-504,-500,-71,-388,7
+-281,-512,0,-65,-187,-99
+-281,-512,0,-65,-187,-99
+-224,-512,-501,-65,-229,-74
+-224,-512,-501,-65,-229,-74
+-123,-521,0,-59,-57,-160
+-123,-521,-500,-59,-57,-160
+-22,-529,-500,-52,84,-225
+-22,-529,0,-52,84,-225
+0,-529,0,-52,-2,-169
+0,-529,-502,-52,-2,-169
+89,-538,-502,-46,136,-231
+89,-538,-502,-46,136,-231
+44,-538,-502,-46,47,-173
+44,-538,-502,-46,47,-173
+146,-546,-167,-40,185,-235
+146,-546,-167,-40,185,-235
+89,-546,0,-40,96,-176
+89,-546,-503,-40,96,-176
+191,-554,-503,-33,234,-237
+191,-554,0,-33,234,-237
+134,-554,0,-33,144,-178
+134,-554,-506,-33,144,-178
+236,-563,-497,-27,282,-238
+236,-563,-497,-27,282,-238
+337,-580,-504,-14,586,-378
+337,-580,-504,-14,586,-378
+438,-580,0,-14,448,-284
+438,-580,0,-14,448,-284
+337,-580,0,-14,343,-213
+337,-580,-501,-14,343,-213
+438,-588,-501,-8,470,-264
+438,-588,0,-8,470,-264
+371,-588,0,-8,373,-198
+371,-588,0,-8,373,-198
+472,-596,-505,-2,506,-253
+472,-596,-505,-2,506,-253
+404,-596,0,-2,414,-190
+404,-596,0,-2,414,-190
+337,-596,0,-2,345,-142
+337,-596,0,-2,345,-142
+292,-596,0,-2,293,-107
+292,-596,0,-2,293,-107
+247,-596,0,-2,254,-80
+247,-596,0,-2,254,-80
+213,-596,0,-2,224,-60
+213,-596,0,-2,224,-60
+202,-596,0,0,207,-45
+202,-596,0,0,207,-45
+179,-596,0,0,190,-33
+179,-596,0,0,190,-33
+168,-596,0,0,178,-25
+168,-596,0,0,178,-25
+168,-596,0,0,169,-19
+168,-596,0,0,169,-19
+157,-596,0,0,162,-14
+157,-596,0,0,162,-14
+146,-596,0,0,157,-10
+146,-596,503,0,157,-10
+56,-588,503,0,-40,96
+56,-588,0,0,-40,96
+0,-588,0,0,-5,72
+0,-588,0,0,-5,72
+11,-588,0,0,20,54
+11,-588,0,0,20,54
+-78,-580,500,0,-153,145
+-78,-580,500,0,-153,145
+-89,-580,0,0,-101,109
+-89,-580,501,0,-101,109
+-191,-571,501,0,-255,187
+-191,-571,0,0,-255,187
+-179,-571,0,0,-187,140
+-179,-571,501,0,-187,140
+-281,-563,0,0,-331,210
+-281,-563,0,0,-331,210
+-247,-563,504,0,-255,157
+-247,-563,504,0,-255,157
+-348,-554,504,0,-392,223
+-348,-554,504,0,-392,223
+-303,-554,504,0,-311,167
+-303,-554,167,0,-311,167
+-404,-546,167,0,-444,230
+-404,-546,0,0,-444,230
+-359,-546,0,0,-361,172
+-359,-546,0,0,-361,172
+-292,-546,0,0,-298,129
+-292,-546,0,0,-298,129
+-393,-538,167,-46,-531,202
+-393,-538,502,-46,-531,202
+-494,-529,502,-52,-668,256
+-494,-529,0,-52,-668,256
+-573,-529,0,-52,-581,192
+-573,-529,503,-52,-581,192
+-674,-521,503,-59,-722,249
+-674,-521,503,-59,-722,249
+-629,-521,0,-59,-638,187
+-629,-521,0,-59,-638,187
+-573,-521,0,-59,-576,140
+-573,-521,0,-59,-576,140
+-528,-521,0,-59,-531,105
+-528,-521,167,-59,-531,105
+-629,-512,167,-65,-686,183
+-629,-512,502,-65,-686,183
+-731,-504,502,-71,-800,242
+-731,-504,0,-71,-800,242
+-686,-504,0,-71,-694,182
+-686,-504,0,-71,-694,182
+-607,-504,0,-71,-614,136
+-607,-504,0,-71,-614,136
+-708,-496,394,-78,-749,207
+-708,-496,394,-78,-749,207
+-652,-496,0,-78,-658,155
+-652,-496,0,-78,-658,155
+-584,-496,0,-78,-590,116
+-584,-496,0,-78,-590,116
+-528,-496,0,-78,-539,87
+-528,-496,0,-78,-539,87
+-494,-496,0,-78,-501,65
+-494,-496,0,-78,-501,65
+-472,-496,0,-78,-472,49
+-472,-496,0,-78,-472,49
+-371,-504,-543,-71,-256,-68
+-371,-504,0,-71,-256,-68
+-281,-504,0,-71,-286,-51
+-281,-504,0,-71,-286,-51
+-303,-504,0,-71,-308,-38
+-303,-504,-501,-71,-308,-38
+-202,-512,0,-65,-123,-133
+-202,-512,0,-65,-123,-133
+-168,-512,0,-65,-178,-100
+-168,-512,0,-65,-178,-100
+-213,-512,0,-65,-221,-75
+-213,-512,0,-65,-221,-75
+-247,-512,0,-65,-255,-56
+-247,-512,0,-65,-255,-56
+-281,-512,0,-65,-282,-42
+-281,-512,0,-65,-282,-42
+-303,-512,0,-65,-304,-31
+-303,-512,0,-65,-304,-31
+-314,-512,0,-65,-322,-23
+-314,-512,0,-65,-322,-23
+-213,-546,-335,-40,79,-217
+-213,-546,0,-40,79,-217
+-112,-546,0,-40,-3,-163
+-112,-546,0,-40,-3,-163
+-56,-546,0,-40,-67,-122
+-56,-546,-501,-40,-67,-122
+22,-554,0,-33,90,-196
+22,-554,0,-33,90,-196
+11,-554,0,-33,15,-147
+11,-554,0,-33,15,-147
+-33,-554,0,-33,-41,-110
+-33,-554,-498,-33,-41,-110
+56,-563,-498,-27,121,-188
+56,-563,0,-27,121,-188
+44,-563,0,-27,50,-141
+44,-563,0,-27,50,-141
+0,-563,-505,-27,-3,-105
+0,-563,-505,-27,-3,-105
+89,-571,0,-21,161,-184
+89,-571,0,-21,161,-184
+89,-571,0,-21,92,-138
+89,-571,-482,-21,92,-138
+191,-580,-482,-14,245,-208
+191,-580,0,-14,245,-208
+157,-580,0,-14,168,-156
+157,-580,0,-14,168,-156
+101,-580,0,-14,110,-117
+101,-580,0,-14,110,-117
+56,-580,0,-14,66,-88
+56,-580,0,-14,66,-88
+22,-580,0,-14,32,-66
+22,-580,0,-14,32,-66
+0,-580,0,-14,7,-49
+0,-580,0,-14,7,-49
+11,-580,0,0,15,-37
+11,-580,0,0,15,-37
+0,-580,0,0,2,-27
+0,-580,0,0,2,-27
+0,-580,0,0,-7,-20
+0,-580,0,0,-7,-20
+-11,-580,0,0,-15,-15
+-11,-580,0,0,-15,-15
+-11,-580,0,0,-21,-11
+-11,-580,-493,0,-21,-11
+78,-588,-493,0,168,-113
+78,-588,0,0,168,-113
+123,-588,0,0,127,-85
+123,-588,0,0,127,-85
+89,-588,0,0,96,-64
+89,-588,0,0,96,-64
+67,-588,0,0,73,-48
+67,-588,0,0,73,-48
+-22,-580,505,0,-138,68
+-22,-580,0,0,-138,68
+-112,-580,0,0,-113,51
+-112,-580,0,0,-113,51
+-89,-580,0,0,-94,38
+-89,-580,0,0,-94,38
+-78,-580,0,0,-80,29
+-78,-580,0,0,-80,29
+-67,-580,0,0,-69,21
+-67,-580,0,0,-69,21
+-56,-580,0,0,-61,16
+-56,-580,0,0,-61,16
+-44,-580,0,0,-55,12
+-44,-580,0,0,-55,12
+-44,-580,0,0,-51,9
+现在会在目标位置附近来回震荡，我觉得单独调节PID已经很难解决了吧？我们要不要单独依据
+			pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+这个位置打一定逻辑补充补丁？
+如果加的话加什么？分析一下，只针对这一个点，不要求改全局执行函数。你先仔细分析不要丢该代码
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:15:45Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing profile-related code segment**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:15:45Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Decoding profile segment control dynamics**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:15:49Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying integral windup causing oscillation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:15:54Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Examining target_hold logic for oscillation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:15:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Proposing local terminal damping patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:15:58Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning near-target terminal patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:04Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning integral clamp near target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing velocity filtering mismatch effects**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:15Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing hold mode oscillation causes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:17Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing targeted terminal band patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing near-target holding conditions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating patch options for final-target control**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying scheduled gains necessity**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:32Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preserving key PID apply call**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:36Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Outlining landing control thresholds and gains**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Noting raw velocity impact on hold logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:16:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing local patch for -6.0 landing zone**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:17:17Z)**_
+
+要。  
+而且就你现在这组数据看，**继续只靠这一组 PID 硬调，性价比已经不高了**。不是完全调不出来，而是这一个点同时在做两件互相冲突的事：
+
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+这组参数既要负责：
+
+1. 从远处把球快速拉到 `-6.0`
+2. 到了 `-6.0` 附近又要安静停住
+
+这两个目标对参数要求相反。
+
+你这次数据已经把这个矛盾暴露得很明显了。
+
+**先看几组最关键的数据。**
+
+第一类，球已经几乎到点，但速度环还在大力刹车：
+
+```text
+-517,-596,500,-2,-741,442
+-663,-588,502,-8,-667,353
+-764,-563,503,-27,-944,465
+```
+
+按通道定义：
+
+- `ch1=-596 / -588 / -563`，位置已经非常接近 `-6.0`
+- `ch3=-2 / -8 / -27`，外环目标速度已经很小
+- 但 `ch5=4.42 / 3.53 / 4.65`，说明球带着很大速度冲进终点区
+- 所以 `ch4=-7.41 / -6.67 / -9.44`，速度环在猛烈刹车
+
+这说明什么？
+
+**说明远场参数是够猛的，甚至末端已经偏猛。**
+
+---
+
+第二类，到了目标附近以后，外环已经被压成 0，但球还是会被速度环来回拉：
+
+```text
+191,-596,0,0,202,-39
+179,-596,500,0,187,-29
+78,-588,0,0,-17,82
+-44,-580,502,0,-129,131
+```
+
+这几组很关键：
+
+- `ch3=0`，说明 [Core/Src/pid.c:818-860](Core/Src/pid.c#L818-L860) 这段保持逻辑已经介入了
+- 但 `ch4` 还在正负来回给角度
+- `ch5` 也在正负切换
+
+也就是说：
+
+**你现在不是“到不了点”，而是“进入终点区后，仍然带着能量，速度环继续强力纠偏，结果在终点附近反复穿越”。**
+
+这不是单一一组 `P/I` 很擅长解决的问题。
+
+---
+
+**所以我的判断是：这个点适合加一个“局部末端落点补丁”，而不是继续全靠这组 PID 硬拧。**
+
+而且补丁不要加成“全局新机制”，就只针对这个 `-6.0` 点。
+
+---
+
+## 我建议的补丁类型
+
+**保留你这句不动，把它当成“远场接近参数”：**
+
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+然后只在 `target=-6.0` 且已经接近目标时，加一个**末端落点区**。
+
+核心思路不是再造复杂状态机，而是：
+
+**远处用现在这组猛参数；近处自动切成一组更软的“落点参数”。**
+
+---
+
+## 为什么这是最合适的补丁
+
+因为你现在的问题不是单一方向的。
+
+如果你继续只调这一组参数，会陷入两难：
+
+- 把 `Spd_P / Spd_I` 调小  
+  远处推不动，末端倒是安静一点
+- 把 `Spd_P / Spd_I` 调大  
+  远处很利索，但末端更容易来回穿
+
+这就是典型的**需要分区控制**，而不是一套参数吃全程。
+
+---
+
+## 只针对 `-6.0` 的最小补丁内容
+
+我建议补丁只做三件事。
+
+### 1. 进入 `-6.0` 附近后，切一组“软落点参数”
+比如当：
+
+- `ball_target_y == -6.0f`
+- 且 `abs(relative_y) <= 0.6f`
+
+就把当前这组强参数，临时切成更软的一组，例如：
+
+- `Pos_P` 从 `0.750` 降到 `0.35 ~ 0.45`
+- `Spd_P` 从 `1.75` 降到 `0.9 ~ 1.1`
+- `Spd_I` 从 `0.1` 降到 `0.01 ~ 0.03`
+
+为什么这样做：
+
+- 外环目标速度会明显变小，不再逼着球继续猛冲
+- 内环也不会在目标附近继续给很大的刹车角
+
+这一步是最核心的。
+
+---
+
+### 2. 切入这个“落点区”时，把速度环积分清零一次
+这是局部补丁里很值得加的一条。
+
+因为你现在第二段速度环有 `I=0.1`，而且前面远场阶段误差和速度都不小。  
+到了终点附近，如果还带着前面累积下来的 `iout`，很容易出现：
+
+- 位置已经到了
+- 但速度环还在凭历史积分继续推
+
+所以只在进入 `-6.0` 的落点区时，做一次：
+
+- `pidY_Speed.iout = 0.0f`
+
+这个非常对症，而且影响范围很小。
+
+---
+
+### 3. 只在这个落点区里，把速度环输出角限得更小
+也就是不要动全局的 `SPEED_LOOP_ANGLE_LIMIT`，只对 `-6.0` 这一个点附近单独限一下。
+
+例如近区内把速度环输出角限制在：
+
+- `±2.0°` 或 `±2.5°`
+
+原因很简单：
+
+你数据里在终点附近还出现了 `ch4=-7.41°`、`-6.67°`、`-9.44°` 这种量级。  
+这对“到点刹车”是能用的，但对“静稳落点”太激进了。
+
+所以近区需要一个局部的、小一点的角度上限。
+
+---
+
+## 我不建议优先加的补丁
+
+### 1. 不建议先加 static friction / breakaway 那种补偿
+这次主要问题不是“推不动”，而是“到了终点附近仍然太凶”。
+
+### 2. 不建议先改全局保持逻辑
+你选中的 [Core/Src/pid.c:818-860](Core/Src/pid.c#L818-L860) 确实参与了现象，但它不是这次最该先动的地方。  
+现在更像是：
+
+- 进入保持前，速度已经太大
+- 进入保持后，速度环又太硬
+
+所以先做 `-6.0` 局部末端模式，比直接重写全局保持逻辑更稳。
+
+---
+
+## 最值得做的局部补丁方案
+
+如果只选一个方案，我推荐这个：
+
+**给 `-6.0` 目标单独加“末端落点区”**
+
+触发条件建议：
+
+- `target == -6.0f`
+- `abs(relative_y) <= 0.6f`
+
+进入后做三件事：
+
+1. `pidY_Speed.iout = 0`
+2. 临时换成更软的近区 PID
+3. 近区内把速度环输出角单独限到 `±2.0° ~ ±2.5°`
+
+这比继续硬拧下面这组参数更靠谱：
+
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+因为这句本身没错，它适合“接近目标”，但**不适合同时承担最终落点**。
+
+---
+
+一句话压缩结论：
+
+**这一个点该加的不是“更猛的补偿”，而是“近目标软着陆逻辑”：
+保留当前这句做远场参数，在 `-6.0` 附近单独切软参数、清一次速度环积分、并单独缩小末端角度限幅。**
+
+这就是现在最对症的补丁方向。
+
+---
+
+_**User (2026-08-03 04:25:41Z)**_
+
+到了进端先清楚积分，然后末端再使用新的PID参数？
+
+_**User (2026-08-03 04:25:52Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-03 04:26:04Z)**_
+
+到了近端先清楚积分，然后末端再使用新的PID参数？
+
+_**User (2026-08-03 04:26:06Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-03 04:26:13Z)**_
+
+到了进端先清除积分，然后末端再使用新的PID参数？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:26:42Z)**_
+
+对，这就是我建议的最小局部补丁，而且顺序也应该是这个顺序：
+
+**先进入近端区，先清积分，再切末端 PID。**
+
+顺序别反。原因很明确。
+
+如果先切末端 PID、后清积分，会有一个问题：
+
+- 你虽然把 `P/I` 参数换成了“更软”的末端参数
+- 但速度环里还带着远场阶段累出来的 `iout`
+- 这个历史积分会直接污染末端阶段
+- 结果就是你以为自己进了“软着陆”，实际上第一拍输出还是很冲
+
+所以更合理的是：
+
+1. 识别“进入 `-6.0` 近端区”
+2. **只在第一次进入时**清掉积分状态
+3. 然后切到末端 PID 参数
+4. 后面一直用末端参数，直到离开近端区或者完成保持
+
+---
+
+## 只针对这个点，建议你就做成这种逻辑
+
+假设只针对：
+
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+这个目标点，增加一个局部布尔状态，例如“是否已进入 `-6.0` 末端区”。
+
+### 触发条件
+建议先用：
+
+- `ball_target_y == -6.0f`
+- `abs(relative_y) <= 0.6f`
+
+`0.6f` 是个比较合适的起点，够早，能开始软着陆；又不会远到影响主程推进。
+
+---
+
+## 进入近端区时做什么
+
+### 第一步：只执行一次积分清零
+优先清这几个：
+
+```c
+pidY.iout = 0.0f;
+pidY_Speed.iout = 0.0f;
+```
+
+虽然你外环现在很多时候 `I=0`，按理说外环积分没在用，但既然做局部切换，顺手一起清掉更干净。  
+真正关键的是：
+
+```c
+pidY_Speed.iout = 0.0f;
+```
+
+因为你当前这组里速度环是：
+
+```c
+Spd_P = 1.75f
+Spd_I = 0.1f
+Spd_D = 0.0f
+```
+
+远场阶段这个积分很容易攒起来。
+
+---
+
+### 第二步：切末端 PID 参数
+也就是进入近端区后，不再继续用：
+
+```c
+(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f)
+```
+
+而改用一组更软的末端参数。
+
+我建议第一版先试：
+
+```c
+(-6.0f, 0.40f, 0.0f, 0.0f, 1.00f, 0.02f, 0.0f)
+```
+
+也就是：
+
+- `Pos_P: 0.750 -> 0.40`
+- `Spd_P: 1.75 -> 1.00`
+- `Spd_I: 0.10 -> 0.02`
+
+这组的目的不是“推得猛”，而是“落得稳”。
+
+---
+
+## 为什么还要保留一点速度环 I
+这里不要把末端 `Spd_I` 直接砍成 `0`。
+
+因为你现在这个系统在终点附近明显存在：
+
+- 机械零偏
+- 静摩擦
+- 微小持续补偿需求
+
+所以末端速度环最好保留一点很小的 `I`，例如 `0.02`。  
+这样它还能慢慢消除小残差，但不会像 `0.1` 那样太容易积过头。
+
+---
+
+## 这个补丁最关键的实现细节
+**“清积分”只在第一次进入近端区时执行一次。**
+
+不能每个周期都清，不然末端 PID 根本积不起来，速度环会变成残废。
+
+所以逻辑应该是这种意思：
+
+- 当前不在近端区，且现在刚进入近端区  
+  -> 清一次积分  
+  -> 切末端 PID  
+  -> 置标志 `near_target_patch_active = true`
+
+- 已经在近端区  
+  -> 不再重复清积分  
+  -> 继续用末端 PID
+
+- 如果又明显离开近端区  
+  -> 恢复远场参数  
+  -> `near_target_patch_active = false`
+
+---
+
+## 你这个想法本身是对的，但还要补一条
+你现在说的是：
+
+> 到了近端先清除积分，然后末端再使用新的PID参数？
+
+我认可。  
+但我建议你再补一条：
+
+**末端阶段最好再单独收一个更小的内环角度上限。**
+
+因为你数据里最明显的问题之一，就是到点附近时 `ch4` 还会打出很大的刹车角。  
+所以即使换了末端 PID，我还是建议在这个局部逻辑里再加一个近端专用限幅，比如：
+
+- 末端速度环输出角限制到 `±2.0° ~ ±2.5°`
+
+这样软着陆会更稳。
+
+---
+
+## 最后给你一个最简洁的结论
+你这句理解可以直接落地：
+
+**是的，到了近端先清积分，然后切到末端 PID。**
+
+而且我建议把这一小段局部逻辑完整定义成：
+
+1. 进入 `-6.0` 近端区  
+2. 一次性清 `pidY.iout` 和 `pidY_Speed.iout`  
+3. 切到更软的末端 PID  
+4. 末端阶段再单独缩小速度环输出角限幅
+
+这就是当前最合理、最小、只针对这一个点的补丁方案。
+
+---
+
+_**User (2026-08-03 04:27:21Z)**_
+
+更软的PID能刹车吗？
+
+_**User (2026-08-03 04:27:23Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-03 04:27:35Z)**_
+
+更软的PID能停住球吗吗？
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:27:43Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining softer PID braking nuance in Chinese**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:27:58Z)**_
+
+能，但**有前提**。  
+“更软”不等于“没刹车”，它的意思是：
+
+- 刹车更早
+- 力度更小
+- 不在目标点附近猛抽角度
+
+所以它不是靠最后一瞬间硬拦住球，而是靠**提前进入末端区，慢慢把速度卸掉**。
+
+你现在这组数据里，远场这组参数：
+
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+已经证明一件事：  
+**它会刹，而且刹得很猛。**  
+问题不是“刹不住”，而是“刹得太猛，到了点附近还在来回穿”。
+
+所以末端换“更软的 PID”，目标不是增强刹车，而是把原来那种过猛的刹车，变成更平顺的减速和停稳。
+
+---
+
+## 你真正该担心的不是“更软能不能刹”
+而是这两个条件有没有满足：
+
+### 1. 进入末端区是否够早
+如果你等到已经冲到 `-5.9`、而且速度还很大时，才切软 PID，那当然刹不住。  
+因为这时候剩下的距离太短了。
+
+所以软 PID 要想有效，必须**提前切入**。  
+比如在：
+
+- `abs(relative_y) <= 0.6f`
+- 或者甚至 `0.8f`
+
+就开始进入末端区。
+
+---
+
+### 2. 软，不代表没有速度环
+末端阶段依然是有速度环的，只是别像现在这么凶。
+
+比如末端参数如果设成：
+
+```c
+Pos_P = 0.40
+Spd_P = 1.00
+Spd_I = 0.02
+```
+
+它仍然会：
+
+- 看到球速度过快时给反向角度
+- 看到球已经接近停下时慢慢收角
+- 看到球有小残差时靠一点点 `I` 顶住
+
+所以它**能刹，也能停住**，只是方式从“硬拦”变成了“软着陆”。
+
+---
+
+## 更准确地说
+### 更软的 PID 能不能刹车？
+**能。**  
+但它适合“提前减速”，不适合“最后一厘米暴力拦停”。
+
+### 更软的 PID 能不能停住球？
+**能。**  
+但前提是给它留一点很小的积分，或者给它一点点持续补偿能力。  
+如果你把末端 PID 调得又软、又完全没积分，那它有可能会停不牢，最后在一个小偏差处挂住。
+
+所以末端更合理的是：
+
+- `Pos_P` 变小
+- `Spd_P` 变小
+- `Spd_I` 也变小，但**不为 0**
+
+---
+
+## 你这个场景里，最合理的结构是
+不是单纯一句“换软 PID”，而是：
+
+1. 远场继续用现在这组猛参数，把球拉过来
+2. 到近端后先清一次积分
+3. 切到更软的末端 PID
+4. 末端 PID 里保留一点小积分，用来最终停住
+
+这四步一起，软 PID 才既能刹，又能停稳。
+
+---
+
+## 一句话结论
+**更软的 PID 可以刹车，也可以停住球；但它不是靠最后一刻硬刹，而是靠更早进入末端区、先卸速度、再靠小积分稳住。**  
+如果切得太晚，软 PID 就会显得“刹不住”；如果切得够早，它反而比现在这种猛参数更容易停稳。
+
+---
+
+_**User (2026-08-03 04:30:07Z)**_
+
+<ide_selection>The user selected the lines 773 to 773 from d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c:
+-6.0
+
+This may or may not be related to the current task.</ide_selection>
+
+那你写一下，PID调节函数还是使用			pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+格式
+然后只改在-6.0这个停止点的逻辑。在还有0.8cm到达目标位置时就切换新的PID参数
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:14Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting pid.c state machine**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:17Z)**_
+
+我先把 `-6.0` 这一段当前状态机和目标切换点读准，然后只在这个停止点附近加局部逻辑，不碰全局控制链。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:17Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758	
+759		if(!g_pid_segment_initialized) {
+760			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+761			g_pid_segment = PID_SEGMENT_TO_POS_56;
+762			g_pid_segment_initialized = true;
+763		}
+764	
+765		Y = ball_error;  // 视觉小球绝对位置
+766	
+767		/* 分段状态机：
+768		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+769		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+770		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+771		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+772			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+773				pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+774				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+775				control_initialized = false;
+776				target_hold_active = false;
+777				target_hold_settle_ticks = 0u;
+778			}
+779		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+780			if(pid_absf(Y + 5.5f) <= TARGET_HOLD_POSITION_ENTER) {
+781				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+782				control_initialized = false;
+783				target_hold_active = false;
+784				target_hold_settle_ticks = 0u;
+785			}
+786		}
+787	
+788		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+789		float target_y = ball_target_get();
+790		float relative_y = Y - target_y;
+791		bool target_changed = !control_initialized || target_y != target_y_last;
+792	
+793		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+794		if(target_changed) {
+795			target_hold_active = false;
+796			target_hold_settle_ticks = 0u;
+797			relative_y_last = relative_y;
+798			target_y_last = target_y;
+799			control_initialized = true;
+800		}
+801	
+802		float position_delta = relative_y - relative_y_last;
+803		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+804	
+805		/* 内环速度反馈改为本地位置差分速度。
+806		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+807		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+808		 */
+809		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+810		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+811		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+812	
+813		/* 最终保持只在第二段完成后生效。
+814		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+815		 *
+816		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+817		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+818		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+819			if(target_hold_active) {
+820				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+821					target_hold_active = false;
+822					target_hold_settle_ticks = 0u;
+823				}
+824			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+825			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+826				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+827					target_hold_settle_ticks++;
+828				}
+829				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+830					target_hold_active = true;
+831				}
+832			} else {
+833				target_hold_settle_ticks = 0u;
+834			}
+835		} else {
+836			target_hold_active = false;
+837			target_hold_settle_ticks = 0u;
+838		}
+839	
+840		if(target_hold_active) {
+841			/* 进入误差保持区后，只停止位置环继续推球：
+842			 *   1) 外环目标速度稍后压到 0；
+843			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+844		}
+845	
+846		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+847		pidY.target = 0.0f;
+848		pidY.now = relative_y;
+849		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+850		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+851		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+852		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+853		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+854		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+855		                POS_LOOP_I_LIMIT);
+856		if(target_hold_active) {
+857			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+858			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+859			 */
+860			pidY.out = 0.0f;
+861		}
+862	
+863		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+864		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+865		 */
+866		float control_velocity = estimated_velocity;
+867		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+868			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+869		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+870			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+871		}
+872		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+873		                         (control_velocity - pidY_filtered_velocity);
+874	
+875	#if POSITION_LOOP_DIRECT_DRIVE
+876		/* 单环调试模式：位置环直接输出平台倾角。
+877		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+878		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+879		pidY_velocity_damping = 0.0f;
+880		pidY_Speed.target = 0.0f;
+881		pidY_Speed.now = pidY_filtered_velocity;
+882		pidY_Speed.out = 0.0f;
+883		pidY_Speed.pout = 0.0f;
+884		pidY_Speed.iout = 0.0f;
+885		pidY_Speed.dout = 0.0f;
+886	
+887		float cmd_angle = pidY.out;
+888		#else
+889			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+890			pidY_Speed.target = pidY.out;
+891			pidY_Speed.now = pidY_filtered_velocity;
+892			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+893			                SPEED_LOOP_I_LIMIT);
+894			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+895			float cmd_angle = pidY_velocity_damping;
+896		#endif
+897	
+898		// 负方向（下降）机构补偿 ×1.2。
+899		if(cmd_angle < 0.0f) {
+900			cmd_angle *= 1.0f;
+901		}
+902	
+903		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+904		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+905		static float cmd_angle_last = 0.0f;
+906		{
+907			float delta = cmd_angle - cmd_angle_last;
+908			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+909			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+910			cmd_angle = cmd_angle_last + delta;
+911			cmd_angle_last = cmd_angle;
+912		}
+913		motor_set_angle(cmd_angle);
+914	
+915		relative_y_last = relative_y;
+916		Y_last = Y;
+917	}
+918	
+919	void pidout_limit_Y(pid_t *pid)
+920	{
+921		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+922	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:18Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `-6\.0f|pid_apply_segment_profile\(|PID_SEGMENT_|target_hold_active`
+
+```text
+68:	PID_SEGMENT_TO_POS_56 = 0,
+69:	PID_SEGMENT_TO_NEG_55,
+70:	PID_SEGMENT_HOLD_NEG_55,
+73:static pid_segment_t g_pid_segment = PID_SEGMENT_TO_POS_56;
+81:static void pid_apply_segment_profile(float target_y,
+756:	static bool target_hold_active = false;
+760:		pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+761:		g_pid_segment = PID_SEGMENT_TO_POS_56;
+771:	if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+773:			pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+774:			g_pid_segment = PID_SEGMENT_TO_NEG_55;
+776:			target_hold_active = false;
+779:	} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+781:			g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+783:			target_hold_active = false;
+795:		target_hold_active = false;
+818:	if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+819:		if(target_hold_active) {
+821:				target_hold_active = false;
+830:				target_hold_active = true;
+836:		target_hold_active = false;
+840:	if(target_hold_active) {
+856:	if(target_hold_active) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Correcting stop logic and hold condition inconsistencies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Implementing near-target PID profile patch for -6.0 stop**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Updating comments to reflect -6.0 target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:32Z)**_
+
+我准备只在 [Core/Src/pid.c](Core/Src/pid.c) 动这一段：给 `-6.0f` 第二段加一个“距目标 0.8cm 的末端区”，首次进入时清积分，再切一组更软的末端 PID，同时把最终保持判定从 `-5.5` 对齐到 `-6.0`。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:37Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:30:51Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:06Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:10Z)**_
+
+局部补丁已经写进去了：只对 `-6.0f` 生效，离目标 `0.8cm` 进入软着陆区，首次进入时清 `pidY/pidY_Speed` 积分，再切到一组更软的 `pid_apply_segment_profile(...)`。我再做一次编译检查，确认这段没引入语法或状态切换问题。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:18Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware project
+
+`cmake --build d:/File/2026diansaiH/Code_of_ZDT/build`
+
+```text
+Exit code 1
+Error: could not load cache
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting repository structure for build directories**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:27Z)**_
+
+编译命令没跑起来，不是代码报错，是当前我指的 `build` 目录没有现成的 CMake cache。我先定位这个工程实际用的构建目录，再补一遍编译验证。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:27Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Glob"><details>
+<summary>Tool use: **Glob**</summary>
+ path `./` pattern `**/CMakeCache.txt`
+
+```text
+build\Debug\CMakeCache.txt
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:27Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Glob"><details>
+<summary>Tool use: **Glob**</summary>
+ path `./` pattern `**/build.ninja`
+
+```text
+build\Debug\build.ninja
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:31Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Show working tree status
+
+`git -C /d/File/2026diansaiH/Code_of_ZDT status --short`
+
+```text
+ M .specstory/history/2026-08-02_19-09-18Z-hash-include-bt-tune.md
+ M .specstory/statistics.json
+ M Core/Src/pid.c
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:34Z)**_
+
+找到实际构建目录了，在 `build/Debug`。我用那个目录做一遍增量编译。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:31:44Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware in Debug directory
+
+`cmake --build /d/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37736 B         1 MB      3.60%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:32:01Z)**_
+
+已经按你的要求写了，而且只动了 `-6.0` 这个停止点附近的逻辑。
+
+改动在 [Core/Src/pid.c](Core/Src/pid.c)：
+
+- 第二段主参数仍然保留你这句格式：
+  [Core/Src/pid.c:773](Core/Src/pid.c#L773)
+
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+- 新增了一个**只针对 `-6.0f` 的软着陆区**：
+  [Core/Src/pid.c:809-835](Core/Src/pid.c#L809-L835)
+
+逻辑是：
+
+1. 第二段目标是 `-6.0f`
+2. 当离目标还剩 `0.8cm` 时进入近端区
+3. **第一次进入近端区先清积分**
+   - `pidY.iout = 0`
+   - `pidY_Speed.iout = 0`
+4. 然后切到一组更软的末端 PID：
+```c
+pid_apply_segment_profile(-6.0f, 0.400f, 0.0f, 0.0f, 1.00f, 0.02f, 0.0f);
+```
+5. 如果又离开这 `0.8cm` 近端区，会恢复远场那组：
+```c
+pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+```
+
+另外我顺手把第二段完成判定从原来的 `-5.5` 对齐到了 `-6.0`：
+[Core/Src/pid.c:779-785](Core/Src/pid.c#L779-L785)
+
+也就是现在进入最终保持时，判断的是靠近 `-6.0`，不再是 `-5.5`。
+
+编译我也过了一遍，`build/Debug` 下已经成功：
+- `FLASH: 37736 B`
+- `RAM: 3496 B`
+
+你现在可以直接测这一版。重点看两件事：
+
+- 到 `-6.0` 附近后，`ch4` 是否不再大幅来回抽动
+- `ch3` 在接近目标前是否先变得更平缓，而不是一路猛顶到终点
+
+如果这一版还是有轻微来回摆，下一步就只需要再微调这组末端 PID，不需要再改主控制结构。
+
+---
+
+_**User (2026-08-03 04:36:59Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+29,0,-28,-175,198
+-168,-529,0,-28,-175,198
+-123,-529,510,-28,-129,148
+-123,-529,510,-28,-129,148
+-224,-512,502,-34,-305,311
+-224,-512,502,-34,-305,311
+-326,-504,501,-38,-343,338
+-326,-504,0,-38,-343,338
+-258,-504,0,-38,-264,254
+-258,-504,0,-38,-264,254
+-202,-504,0,-38,-205,190
+-202,-504,502,-38,-205,190
+-269,-496,0,-41,-272,247
+-269,-496,0,-41,-272,247
+-314,-487,501,-44,-325,290
+-314,-487,501,-44,-325,290
+-247,-487,0,-44,-258,218
+-247,-487,0,-44,-258,218
+-202,-487,0,-44,-207,163
+-202,-487,505,-44,-207,163
+-269,-479,505,-48,-280,227
+-269,-479,0,-48,-280,227
+-224,-479,0,-48,-228,170
+-224,-479,0,-48,-228,170
+-179,-479,0,-48,-188,128
+-179,-479,0,-48,-188,128
+-269,-470,502,-51,-270,201
+-269,-470,0,-51,-270,201
+-213,-470,0,-51,-224,150
+-213,-470,510,-51,-224,150
+-292,-462,510,-55,-300,218
+-292,-462,0,-55,-300,218
+-247,-462,0,-55,-250,163
+-247,-462,498,-55,-250,163
+-314,-454,0,-58,-323,227
+-314,-454,0,-58,-323,227
+-269,-454,0,-58,-270,170
+-269,-454,0,-58,-270,170
+-224,-454,0,-58,-231,128
+-224,-454,0,-58,-231,128
+-202,-454,0,-58,-203,96
+-202,-454,0,-58,-203,96
+-179,-454,0,-58,-181,72
+-179,-454,499,-58,-181,72
+-269,-445,0,-61,-276,159
+-269,-445,0,-61,-276,159
+-236,-445,0,-61,-240,119
+-236,-445,0,-61,-240,119
+-202,-445,0,-61,-213,89
+-202,-445,0,-61,-213,89
+-191,-445,0,-61,-193,67
+-191,-445,0,-61,-193,67
+-168,-445,0,-61,-179,50
+-168,-445,0,-61,-179,50
+-157,-445,0,-61,-168,37
+-157,-445,0,-61,-168,37
+-157,-445,0,-61,-160,28
+-157,-445,0,-61,-160,28
+-146,-445,0,-61,-155,21
+-146,-445,0,-61,-155,21
+-146,-445,0,-61,-151,15
+-146,-445,0,-61,-151,15
+-146,-445,0,-61,-149,11
+-146,-445,0,-61,-149,11
+-146,-445,0,-61,-147,8
+-146,-445,0,-61,-147,8
+-44,-454,-501,-58,-36,-98
+-44,-454,-501,-58,-36,-98
+-56,-454,0,-58,-60,-73
+-56,-454,0,-58,-60,-73
+-78,-454,0,-58,-79,-55
+-78,-454,0,-58,-79,-55
+-89,-454,0,-58,-93,-41
+-89,-454,0,-58,-93,-41
+-101,-454,0,-58,-104,-31
+-101,-454,0,-58,-104,-31
+-112,-454,-502,-58,-112,-23
+-112,-454,-502,-58,-112,-23
+-11,-462,0,-55,-8,-122
+-11,-462,0,-55,-8,-122
+-33,-462,0,-55,-38,-91
+-33,-462,0,-55,-38,-91
+-56,-462,0,-55,-61,-68
+-56,-462,0,-55,-61,-68
+-67,-462,0,-55,-78,-51
+-67,-462,0,-55,-78,-51
+-89,-462,0,-55,-91,-38
+-89,-462,0,-55,-91,-38
+-101,-462,0,-55,-102,-29
+-101,-462,0,-55,-102,-29
+-101,-462,0,-55,-109,-21
+-101,-462,0,-55,-109,-21
+-112,-462,0,-55,-116,-16
+-112,-462,508,-55,-116,-16
+-213,-454,508,-58,-231,92
+-213,-454,0,-58,-231,92
+-202,-454,0,-58,-211,69
+-202,-454,0,-58,-211,69
+-191,-454,0,-58,-195,52
+-191,-454,0,-58,-195,52
+-179,-454,0,-58,-184,39
+-179,-454,0,-58,-184,39
+-168,-454,0,-58,-176,29
+-168,-454,0,-58,-176,29
+-168,-454,0,-58,-170,22
+-168,-454,504,-58,-170,22
+-269,-445,0,-61,-277,121
+-269,-445,0,-61,-277,121
+-247,-445,0,-61,-250,91
+-247,-445,0,-61,-250,91
+-224,-445,0,-61,-230,68
+-224,-445,0,-61,-230,68
+-213,-445,0,-61,-215,51
+-213,-445,0,-61,-215,51
+-202,-445,0,-61,-204,38
+-202,-445,0,-61,-204,38
+-191,-445,0,-61,-196,28
+-191,-445,0,-61,-196,28
+-179,-445,0,-61,-191,21
+-179,-445,0,-61,-191,21
+-179,-445,0,-61,-187,16
+-179,-445,0,-61,-187,16
+-179,-445,0,-61,-184,12
+-179,-445,0,-61,-184,12
+-179,-445,0,-61,-182,9
+-179,-445,0,-61,-182,9
+-179,-445,0,-61,-182,6
+-179,-445,0,-61,-182,6
+-179,-445,0,-61,-181,5
+-179,-445,0,-61,-181,5
+-179,-445,0,-61,-181,3
+-179,-445,0,-61,-181,3
+-179,-445,0,-61,-182,2
+-179,-445,0,-61,-182,2
+-179,-445,0,-61,-182,2
+-179,-445,0,-61,-182,2
+-179,-445,0,-61,-183,1
+-179,-445,0,-61,-183,1
+-179,-445,0,-61,-184,1
+-179,-445,0,-61,-184,1
+-179,-445,0,-61,-185,0
+-179,-445,0,-61,-185,0
+-179,-445,0,-61,-186,0
+-179,-445,0,-61,-186,0
+-179,-445,0,-61,-187,0
+-179,-445,0,-61,-187,0
+-179,-445,0,-61,-188,0
+-179,-445,0,-61,-188,0
+-179,-445,0,-61,-189,0
+-179,-445,0,-61,-189,0
+-179,-445,0,-61,-190,0
+-179,-445,0,-61,-190,0
+-191,-445,0,-61,-191,0
+-191,-445,0,-61,-191,0
+-191,-445,0,-61,-193,0
+-191,-445,0,-61,-193,0
+-191,-445,0,-61,-194,0
+-191,-445,0,-61,-194,0
+-191,-445,0,-61,-195,0
+-191,-445,0,-61,-195,0
+-191,-445,0,-61,-196,0
+-191,-445,0,-61,-196,0
+-191,-445,0,-61,-197,0
+-191,-445,0,-61,-197,0
+-191,-445,0,-61,-199,0
+-191,-445,0,-61,-199,0
+-191,-445,0,-61,-200,0
+-191,-445,0,-61,-200,0
+-191,-445,0,-61,-201,0
+-191,-445,0,-61,-201,0
+-202,-445,0,-61,-202,0
+-202,-445,0,-61,-202,0
+-202,-445,0,-61,-204,0
+-202,-445,0,-61,-204,0
+-202,-445,0,-61,-205,0
+-202,-445,0,-61,-205,0
+-202,-445,0,-61,-206,0
+-202,-445,0,-61,-206,0
+-202,-445,0,-61,-207,0
+-202,-445,0,-61,-207,0
+-202,-445,0,-61,-209,0
+-202,-445,0,-61,-209,0
+-202,-445,0,-61,-210,0
+-202,-445,0,-61,-210,0
+-202,-445,0,-61,-211,0
+-202,-445,0,-61,-211,0
+-202,-445,0,-61,-212,0
+-202,-445,0,-61,-212,0
+-213,-445,0,-61,-213,0
+-213,-445,0,-61,-213,0
+-213,-445,0,-61,-215,0
+-213,-445,0,-61,-215,0
+-213,-445,0,-61,-216,0
+-213,-445,0,-61,-216,0
+-213,-445,0,-61,-217,0
+-213,-445,0,-61,-217,0
+-213,-445,0,-61,-218,0
+-213,-445,0,-61,-218,0
+-213,-445,0,-61,-220,0
+-213,-445,0,-61,-220,0
+-213,-445,0,-61,-221,0
+-213,-445,0,-61,-221,0
+-213,-445,0,-61,-222,0
+-213,-445,0,-61,-222,0
+-213,-445,0,-61,-223,0
+-213,-445,0,-61,-223,0
+-224,-445,0,-61,-225,0
+-224,-445,0,-61,-225,0
+-224,-445,0,-61,-226,0
+-224,-445,0,-61,-226,0
+-224,-445,0,-61,-227,0
+-224,-445,0,-61,-227,0
+-224,-445,0,-61,-228,0
+-224,-445,0,-61,-228,0
+-224,-445,0,-61,-230,0
+-224,-445,0,-61,-230,0
+-224,-445,0,-61,-231,0
+-224,-445,0,-61,-231,0
+-224,-445,0,-61,-232,0
+-224,-445,0,-61,-232,0
+-224,-445,0,-61,-233,0
+-224,-445,0,-61,-233,0
+-224,-445,0,-61,-234,0
+-224,-445,0,-61,-234,0
+-224,-445,0,-61,-236,0
+-224,-445,0,-61,-236,0
+-236,-445,0,-61,-237,0
+-236,-445,0,-61,-237,0
+-236,-445,0,-61,-238,0
+-236,-445,0,-61,-238,0
+-236,-445,0,-61,-239,0
+-236,-445,0,-61,-239,0
+-236,-445,0,-61,-241,0
+-236,-445,0,-61,-241,0
+-236,-445,0,-61,-242,0
+-236,-445,0,-61,-242,0
+-236,-445,0,-61,-243,0
+-236,-445,0,-61,-243,0
+-236,-445,0,-61,-244,0
+-236,-445,0,-61,-244,0
+-236,-445,0,-61,-246,0
+-236,-445,0,-61,-246,0
+-236,-445,0,-61,-247,0
+-236,-445,0,-61,-247,0
+-247,-445,0,-61,-248,0
+-247,-445,0,-61,-248,0
+-247,-445,0,-61,-249,0
+-247,-445,0,-61,-249,0
+-247,-445,0,-61,-251,0
+-247,-445,0,-61,-251,0
+-247,-445,0,-61,-252,0
+-247,-445,0,-61,-252,0
+-247,-445,0,-61,-253,0
+-247,-445,0,-61,-253,0
+-247,-445,0,-61,-254,0
+-247,-445,0,-61,-254,0
+-247,-445,0,-61,-255,0
+-247,-445,0,-61,-255,0
+-247,-445,0,-61,-257,0
+-247,-445,0,-61,-257,0
+-247,-445,0,-61,-258,0
+-247,-445,0,-61,-258,0
+-258,-445,0,-61,-259,0
+-258,-445,0,-61,-259,0
+-258,-445,0,-61,-260,0
+-258,-445,0,-61,-260,0
+-258,-445,0,-61,-262,0
+-258,-445,0,-61,-262,0
+-258,-445,0,-61,-263,0
+-258,-445,0,-61,-263,0
+-258,-445,0,-61,-264,0
+-258,-445,0,-61,-264,0
+-258,-445,0,-61,-265,0
+-258,-445,0,-61,-265,0
+-258,-445,0,-61,-267,0
+-258,-445,0,-61,-267,0
+-258,-445,0,-61,-268,0
+-258,-445,0,-61,-268,0
+-258,-445,0,-61,-269,0
+-258,-445,0,-61,-269,0
+-269,-445,0,-61,-270,0
+-269,-445,0,-61,-270,0
+-269,-445,0,-61,-271,0
+-269,-445,0,-61,-271,0
+-269,-445,0,-61,-273,0
+-269,-445,0,-61,-273,0
+-269,-445,0,-61,-274,0
+-269,-445,0,-61,-274,0
+-269,-445,0,-61,-275,0
+-269,-445,0,-61,-275,0
+-269,-445,0,-61,-276,0
+-269,-445,0,-61,-276,0
+-269,-445,0,-61,-278,0
+-269,-445,0,-61,-278,0
+-269,-445,0,-61,-279,0
+-269,-445,0,-61,-279,0
+-269,-445,0,-61,-280,0
+-269,-445,0,-61,-280,0
+-281,-445,0,-61,-281,0
+-281,-445,0,-61,-281,0
+-281,-445,0,-61,-283,0
+-281,-445,0,-61,-283,0
+-281,-445,0,-61,-284,0
+-281,-445,0,-61,-284,0
+-281,-445,0,-61,-285,0
+-281,-445,0,-61,-285,0
+-281,-445,0,-61,-286,0
+-281,-445,0,-61,-286,0
+-281,-445,0,-61,-288,0
+-281,-445,0,-61,-288,0
+-281,-445,0,-61,-289,0
+-281,-445,0,-61,-289,0
+-281,-445,0,-61,-290,0
+-281,-445,0,-61,-290,0
+-281,-445,0,-61,-291,0
+-281,-445,0,-61,-291,0
+-292,-445,0,-61,-292,0
+-292,-445,0,-61,-292,0
+-292,-445,0,-61,-294,0
+-292,-445,0,-61,-294,0
+-292,-445,0,-61,-295,0
+-292,-445,0,-61,-295,0
+-292,-445,0,-61,-296,0
+-292,-445,0,-61,-296,0
+-292,-445,0,-61,-297,0
+-292,-445,0,-61,-297,0
+-292,-445,0,-61,-299,0
+-292,-445,0,-61,-299,0
+-292,-445,0,-61,-300,0
+-292,-445,0,-61,-300,0
+-292,-445,0,-61,-301,0
+-292,-445,0,-61,-301,0
+-292,-445,0,-61,-302,0
+-292,-445,0,-61,-302,0
+-303,-445,0,-61,-304,0
+-303,-445,0,-61,-304,0
+-303,-445,0,-61,-305,0
+-303,-445,0,-61,-305,0
+-303,-445,0,-61,-306,0
+-303,-445,0,-61,-306,0
+-303,-445,0,-61,-307,0
+-303,-445,0,-61,-307,0
+-303,-445,0,-61,-309,0
+-303,-445,0,-61,-309,0
+-303,-445,0,-61,-310,0
+-303,-445,0,-61,-310,0
+-202,-454,-661,-58,-200,-105
+-202,-454,-661,-58,-200,-105
+-224,-454,0,-58,-226,-78
+-224,-454,0,-58,-226,-78
+-236,-454,0,-58,-246,-59
+-236,-454,0,-58,-246,-59
+-258,-454,0,-58,-261,-44
+-258,-454,0,-58,-261,-44
+-269,-454,0,-58,-273,-33
+-269,-454,0,-58,-273,-33
+-281,-454,0,-58,-282,-24
+-281,-454,0,-58,-282,-24
+-281,-454,0,-58,-289,-18
+-281,-454,536,-58,-289,-18
+-382,-445,536,-61,-402,90
+-382,-445,0,-61,-402,90
+-371,-445,0,-61,-379,68
+-371,-445,0,-61,-379,68
+-359,-445,0,-61,-362,51
+-359,-445,0,-61,-362,51
+-348,-445,0,-61,-350,38
+-348,-445,0,-61,-350,38
+-337,-445,0,-61,-340,28
+-337,-445,0,-61,-340,28
+-326,-445,0,-61,-333,21
+-326,-445,0,-61,-333,21
+-326,-445,0,-61,-327,16
+-326,-445,0,-61,-327,16
+-314,-445,0,-61,-323,12
+-314,-445,0,-61,-323,12
+-314,-445,0,-61,-320,9
+-314,-445,0,-61,-320,9
+-314,-445,0,-61,-318,6
+-314,-445,0,-61,-318,6
+-314,-445,0,-61,-316,5
+-314,-445,0,-61,-316,5
+-314,-445,0,-61,-315,3
+-314,-445,0,-61,-315,3
+-303,-445,0,-61,-314,2
+-303,-445,0,-61,-314,2
+-303,-445,0,-61,-313,2
+-303,-445,0,-61,-313,2
+-303,-445,0,-61,-313,1
+-303,-445,0,-61,-313,1
+-303,-445,0,-61,-312,1
+-303,-445,0,-61,-312,1
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-312,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+-303,-445,0,-61,-311,0
+
+第一组
+
+第二组
+4
+449,-546,-486,-21,402,-384
+348,-546,0,-21,311,-288
+348,-546,0,-21,311,-288
+258,-546,0,-21,243,-216
+258,-546,0,-21,243,-216
+191,-546,0,-21,191,-162
+191,-546,0,-21,191,-162
+146,-546,0,-21,153,-121
+146,-546,0,-21,153,-121
+123,-546,0,-21,124,-91
+123,-546,0,-21,124,-91
+101,-546,0,-21,102,-68
+101,-546,0,-21,102,-68
+78,-546,0,-21,85,-51
+78,-546,0,-21,85,-51
+67,-546,0,-21,73,-38
+67,-546,681,-21,73,-38
+-22,-538,681,-24,-46,76
+-22,-538,0,-24,-46,76
+-22,-538,548,-24,-29,57
+-22,-538,548,-24,-29,57
+-123,-529,0,-28,-126,147
+-123,-529,0,-28,-126,147
+-89,-529,0,-28,-92,110
+-89,-529,498,-28,-92,110
+-168,-521,498,-31,-177,188
+-168,-521,501,-31,-177,188
+-269,-512,501,-65,-576,246
+-269,-512,0,-65,-576,246
+-371,-512,553,-65,-493,184
+-371,-512,553,-65,-493,184
+-472,-504,0,-71,-639,243
+-472,-504,0,-71,-639,243
+-551,-504,0,-71,-558,182
+-551,-504,0,-71,-558,182
+-494,-504,0,-71,-499,136
+-494,-504,502,-71,-499,136
+-596,-496,502,-78,-662,207
+-596,-496,0,-78,-662,207
+-584,-496,561,-78,-595,155
+-584,-496,561,-78,-595,155
+-686,-487,0,-84,-752,221
+-686,-487,0,-84,-752,221
+-787,-479,458,-90,-883,271
+-787,-479,0,-90,-883,271
+-753,-479,0,-90,-764,203
+-753,-479,452,-90,-764,203
+-854,-470,452,-96,-870,257
+-854,-470,0,-96,-870,257
+-753,-470,0,-96,-757,193
+-753,-470,0,-96,-757,193
+-663,-470,0,-96,-673,144
+-663,-470,0,-96,-673,144
+-764,-462,513,-103,-804,213
+-764,-462,0,-103,-804,213
+-708,-462,0,-103,-711,160
+-708,-462,0,-103,-711,160
+-629,-462,0,-103,-640,120
+-629,-462,509,-103,-640,120
+-731,-454,0,-109,-783,195
+-731,-454,0,-109,-783,195
+-697,-454,0,-109,-697,146
+-697,-454,0,-109,-697,146
+-596,-462,-502,-103,-438,4
+-596,-462,-502,-103,-438,4
+-494,-462,0,-103,-436,3
+-494,-462,-508,-103,-436,3
+-393,-470,-508,-96,-239,-102
+-393,-470,0,-96,-239,-102
+-292,-470,0,-96,-285,-76
+-292,-470,0,-96,-285,-76
+-314,-470,0,-96,-318,-57
+-314,-470,0,-96,-318,-57
+-213,-479,-500,-90,-143,-148
+-213,-479,-500,-90,-143,-148
+-202,-479,0,-90,-206,-111
+-202,-479,-517,-90,-206,-111
+-101,-487,-517,-84,-49,-188
+-101,-487,0,-84,-49,-188
+-123,-487,0,-84,-126,-141
+-123,-487,-496,-84,-126,-141
+-22,-496,0,-78,19,-210
+-22,-496,0,-78,19,-210
+67,-504,-501,-71,141,-263
+67,-504,-501,-71,141,-263
+33,-504,0,-71,38,-197
+33,-504,-515,-71,38,-197
+134,-512,-515,-65,166,-253
+134,-512,-500,-65,166,-253
+236,-521,-500,-31,268,-294
+236,-521,0,-31,268,-294
+191,-521,-503,-31,198,-221
+191,-521,-503,-31,198,-221
+247,-529,0,-28,256,-270
+247,-529,0,-28,256,-270
+292,-538,-503,-24,302,-308
+292,-538,-503,-24,302,-308
+337,-546,-503,-21,340,-336
+337,-546,0,-21,340,-336
+258,-546,0,-21,261,-252
+258,-546,0,-21,261,-252
+191,-546,-499,-21,201,-189
+191,-546,-499,-21,201,-189
+258,-554,0,-18,267,-246
+258,-554,0,-18,267,-246
+202,-554,0,-18,208,-185
+202,-554,-499,-18,208,-185
+269,-563,-499,-14,275,-243
+269,-563,0,-14,275,-243
+213,-563,0,-14,217,-182
+213,-563,0,-14,217,-182
+168,-563,0,-14,174,-137
+168,-563,0,-14,174,-137
+134,-563,0,-14,142,-102
+134,-563,0,-14,142,-102
+112,-563,0,-14,117,-77
+112,-563,0,-14,117,-77
+89,-563,0,-14,99,-57
+89,-563,0,-14,99,-57
+78,-563,0,-14,85,-43
+78,-563,0,-14,85,-43
+67,-563,0,-14,74,-32
+67,-563,0,-14,74,-32
+56,-563,0,-14,66,-24
+56,-563,0,-14,66,-24
+56,-563,0,-14,60,-18
+56,-563,0,-14,60,-18
+44,-563,0,-14,56,-13
+44,-563,0,-14,56,-13
+44,-563,0,-14,52,-10
+44,-563,0,-14,52,-10
+44,-563,492,-14,49,-7
+44,-563,492,-14,49,-7
+-44,-554,0,-18,-62,99
+-44,-554,0,-18,-62,99
+-33,-554,0,-18,-39,74
+-33,-554,0,-18,-39,74
+-22,-554,0,-18,-22,55
+-22,-554,499,-18,-22,55
+-112,-546,499,-21,-120,146
+-112,-546,0,-21,-120,146
+-78,-546,0,-21,-86,110
+-78,-546,0,-21,-86,110
+-56,-546,521,-21,-60,82
+-56,-546,521,-21,-60,82
+-146,-538,0,-24,-152,166
+-146,-538,0,-24,-152,166
+-112,-538,0,-24,-113,125
+-112,-538,499,-24,-113,125
+-191,-529,499,-28,-195,198
+-191,-529,0,-28,-195,198
+-146,-529,0,-28,-149,149
+-146,-529,0,-28,-149,149
+-112,-529,503,-28,-114,111
+-112,-529,503,-28,-114,111
+-191,-521,0,-31,-199,188
+-191,-521,0,-31,-199,188
+-292,-512,511,-65,-577,246
+-292,-512,0,-65,-577,246
+-393,-512,0,-65,-494,185
+-393,-512,504,-65,-494,185
+-494,-504,504,-71,-639,243
+-494,-504,0,-71,-639,243
+-551,-504,0,-71,-558,182
+-551,-504,0,-71,-558,182
+-494,-504,0,-71,-499,137
+-494,-504,0,-71,-499,137
+-596,-496,503,-78,-662,207
+-596,-496,0,-78,-662,207
+-584,-496,0,-78,-595,155
+-584,-496,0,-78,-595,155
+-539,-496,0,-78,-546,116
+-539,-496,512,-78,-546,116
+-641,-487,0,-84,-718,192
+-641,-487,0,-84,-718,192
+-641,-487,0,-84,-650,144
+-641,-487,0,-84,-650,144
+-584,-487,0,-84,-587,108
+-584,-487,496,-84,-587,108
+-686,-479,496,-90,-734,186
+-686,-479,0,-90,-734,186
+-652,-479,0,-90,-653,139
+-652,-479,0,-90,-653,139
+-584,-479,0,-90,-591,104
+-584,-479,0,-90,-591,104
+-539,-479,0,-90,-546,78
+-539,-479,0,-90,-546,78
+-506,-479,0,-90,-511,58
+-506,-479,0,-90,-511,58
+-483,-479,0,-90,-485,44
+-483,-479,0,-90,-485,44
+-461,-479,0,-90,-466,33
+-461,-479,0,-90,-466,33
+-449,-479,0,-90,-452,24
+-449,-479,0,-90,-452,24
+-438,-479,0,-90,-441,18
+-438,-479,0,-90,-441,18
+-337,-487,-491,-84,-237,-91
+-337,-487,0,-84,-237,-91
+-269,-487,0,-84,-278,-68
+-269,-487,0,-84,-278,-68
+-303,-487,0,-84,-307,-51
+-303,-487,0,-84,-307,-51
+-326,-487,0,-84,-330,-38
+-326,-487,0,-84,-330,-38
+-224,-496,-485,-78,-146,-133
+-224,-496,-485,-78,-146,-133
+-202,-496,0,-78,-203,-100
+-202,-496,-486,-78,-203,-100
+-101,-504,-486,-71,-41,-180
+-101,-504,0,-71,-41,-180
+-112,-504,0,-71,-113,-135
+-112,-504,0,-71,-113,-135
+-168,-504,0,-71,-170,-101
+-168,-504,0,-71,-170,-101
+-67,-512,-511,-65,-8,-181
+-67,-512,-511,-65,-8,-181
+-78,-512,0,-65,-80,-135
+-78,-512,-501,-65,-80,-135
+11,-521,-501,-31,178,-206
+11,-521,0,-31,178,-206
+112,-521,0,-31,129,-155
+112,-521,-504,-31,129,-155
+202,-529,0,-28,203,-221
+202,-529,0,-28,203,-221
+258,-538,-503,-24,260,-271
+258,-538,-503,-24,260,-271
+191,-538,0,-24,196,-203
+191,-538,0,-24,196,-203
+258,-546,-492,-21,259,-257
+258,-546,0,-21,259,-257
+191,-546,0,-21,198,-193
+191,-546,-645,-21,198,-193
+258,-554,-645,-18,262,-249
+258,-554,0,-18,262,-249
+202,-554,0,-18,203,-187
+202,-554,0,-18,203,-187
+157,-554,-500,-18,159,-140
+157,-554,-500,-18,159,-140
+236,-563,0,-14,236,-210
+236,-563,0,-14,236,-210
+179,-563,0,-14,186,-157
+179,-563,0,-14,186,-157
+146,-563,0,-14,149,-118
+146,-563,-501,-14,149,-118
+224,-571,0,-11,231,-193
+224,-571,0,-11,231,-193
+179,-571,0,-11,186,-145
+179,-571,0,-11,186,-145
+146,-571,0,-11,151,-108
+146,-571,0,-11,151,-108
+123,-571,0,-11,125,-81
+123,-571,0,-11,125,-81
+101,-571,0,-11,106,-61
+101,-571,-509,-11,106,-61
+89,-580,-509,-7,95,-45
+89,-580,0,-7,95,-45
+78,-580,0,-7,84,-34
+78,-580,0,-7,84,-34
+67,-580,0,-7,76,-25
+67,-580,0,-7,76,-25
+67,-580,0,-7,69,-19
+67,-580,501,-7,69,-19
+-22,-571,501,-11,-45,90
+-22,-571,0,-11,-45,90
+-22,-571,0,-11,-24,67
+-22,-571,0,-11,-24,67
+0,-571,0,-11,-8,50
+0,-571,0,-11,-8,50
+0,-571,0,-11,2,38
+0,-571,0,-11,2,38
+11,-571,0,-11,11,28
+11,-571,0,-11,11,28
+11,-571,0,-11,18,21
+11,-571,0,-11,18,21
+22,-571,0,-11,23,16
+22,-571,0,-11,23,16
+22,-571,0,-11,26,12
+22,-571,0,-11,26,12
+22,-571,0,-11,29,9
+22,-571,0,-11,29,9
+22,-571,0,-11,31,6
+22,-571,0,-11,31,6
+22,-571,0,-11,32,5
+22,-571,482,-11,32,5
+-67,-563,482,-14,-77,108
+-67,-563,0,-14,-77,108
+-44,-563,0,-14,-51,81
+-44,-563,0,-14,-51,81
+-134,-554,548,-18,-143,166
+-134,-554,548,-18,-143,166
+-101,-554,0,-18,-104,124
+-101,-554,0,-18,-104,124
+-67,-554,0,-18,-75,93
+-67,-554,0,-18,-75,93
+-44,-554,0,-18,-54,70
+-44,-554,0,-18,-54,70
+-33,-554,0,-18,-38,52
+-33,-554,0,-18,-38,52
+-22,-554,0,-18,-26,39
+-22,-554,0,-18,-26,39
+-11,-554,0,-18,-17,29
+-11,-554,513,-18,-17,29
+-112,-546,513,-21,-121,127
+-112,-546,0,-21,-121,127
+-89,-546,0,-21,-91,95
+-89,-546,0,-21,-91,95
+-67,-546,0,-21,-69,71
+-67,-546,0,-21,-69,71
+-44,-546,0,-21,-53,53
+-44,-546,0,-21,-53,53
+-33,-546,0,-21,-41,40
+-33,-546,0,-21,-41,40
+-22,-546,0,-21,-32,30
+-22,-546,0,-21,-32,30
+-22,-546,0,-21,-25,22
+-22,-546,494,-21,-25,22
+-123,-538,494,-24,-131,121
+-123,-538,0,-24,-131,121
+-202,-529,546,-28,-213,196
+-202,-529,546,-28,-213,196
+-157,-529,0,-28,-167,147
+-157,-529,0,-28,-167,147
+-123,-529,0,-28,-133,110
+-123,-529,0,-28,-133,110
+-101,-529,0,-28,-108,82
+-101,-529,498,-28,-108,82
+-191,-521,498,-31,-199,167
+-191,-521,0,-31,-199,167
+-157,-521,0,-31,-161,125
+-157,-521,0,-31,-161,125
+-236,-512,504,-34,-242,199
+-236,-512,0,-34,-242,199
+-191,-512,0,-34,-196,149
+-191,-512,0,-34,-196,149
+-157,-512,0,-34,-162,111
+-157,-512,655,-34,-162,111
+-236,-504,655,-38,-247,188
+-236,-504,0,-38,-247,188
+-202,-504,0,-38,-203,141
+-202,-504,0,-38,-203,141
+-168,-504,0,-38,-171,106
+-168,-504,0,-38,-171,106
+-146,-504,0,-38,-147,79
+-146,-504,0,-38,-147,79
+-123,-504,0,-38,-129,59
+-123,-504,515,-38,-129,59
+-224,-496,515,-41,-226,149
+-224,-496,0,-41,-226,149
+-191,-496,0,-41,-191,112
+-191,-496,0,-41,-191,112
+-157,-496,506,-41,-166,84
+-157,-496,506,-41,-166,84
+-247,-487,0,-44,-257,168
+-247,-487,0,-44,-257,168
+-213,-487,0,-44,-219,126
+-213,-487,0,-44,-219,126
+-179,-487,0,-44,-190,94
+-179,-487,0,-44,-190,94
+-168,-487,0,-44,-169,70
+-168,-487,0,-44,-169,70
+-146,-487,0,-44,-153,53
+-146,-487,0,-44,-153,53
+-134,-487,0,-44,-141,39
+-134,-487,0,-44,-141,39
+-123,-487,0,-44,-133,29
+-123,-487,0,-44,-133,29
+-123,-487,0,-44,-127,22
+-123,-487,0,-44,-127,22
+-112,-487,0,-44,-122,16
+-112,-487,0,-44,-122,16
+-112,-487,0,-44,-119,12
+-112,-487,0,-44,-119,12
+-112,-487,0,-44,-117,9
+-112,-487,0,-44,-117,9
+-112,-487,0,-44,-116,7
+-112,-487,0,-44,-116,7
+-112,-487,0,-44,-115,5
+-112,-487,502,-44,-115,5
+-213,-479,502,-48,-225,108
+-213,-479,0,-48,-225,108
+-191,-479,0,-48,-201,81
+-191,-479,0,-48,-201,81
+-179,-479,0,-48,-182,61
+-179,-479,0,-48,-182,61
+-269,-470,503,-51,-279,150
+-269,-470,0,-51,-279,150
+-236,-470,0,-51,-245,113
+-236,-470,0,-51,-245,113
+-213,-470,0,-51,-219,84
+-213,-470,497,-51,-219,84
+-303,-462,0,-55,-311,168
+-303,-462,0,-55,-311,168
+-269,-462,0,-55,-272,126
+-269,-462,0,-55,-272,126
+-236,-462,0,-55,-244,94
+-236,-462,0,-55,-244,94
+-213,-462,0,-55,-223,71
+-213,-462,0,-55,-223,71
+-202,-462,0,-55,-207,53
+-202,-462,0,-55,-207,53
+-191,-462,0,-55,-196,40
+-191,-462,0,-55,-196,40
+-179,-462,0,-55,-187,30
+-179,-462,0,-55,-187,30
+-179,-462,0,-55,-181,22
+-179,-462,0,-55,-181,22
+-168,-462,0,-55,-177,16
+-168,-462,-494,-55,-177,16
+-67,-470,-494,-51,-64,-92
+-67,-470,0,-51,-64,-92
+-78,-470,0,-51,-86,-69
+-78,-470,0,-51,-86,-69
+-179,-462,495,-55,-214,53
+-179,-462,495,-55,-214,53
+-202,-462,0,-55,-203,39
+-202,-462,0,-55,-203,39
+-191,-462,0,-55,-195,29
+-191,-462,0,-55,-195,29
+-179,-462,0,-55,-189,22
+-179,-462,0,-55,-189,22
+-179,-462,-510,-55,-185,16
+-179,-462,-510,-55,-185,16
+-78,-470,0,-51,-71,-92
+-78,-470,0,-51,-71,-92
+-89,-470,0,-51,-94,-69
+-89,-470,0,-51,-94,-69
+-101,-470,0,-51,-111,-51
+-101,-470,0,-51,-111,-51
+-123,-470,0,-51,-125,-38
+-123,-470,0,-51,-125,-38
+-134,-470,0,-51,-135,-29
+-134,-470,0,-51,-135,-29
+-134,-470,0,-51,-143,-21
+-134,-470,0,-51,-143,-21
+-146,-470,0,-51,-149,-16
+-146,-470,0,-51,-149,-16
+-146,-470,0,-51,-154,-12
+-146,-470,-492,-51,-154,-12
+-44,-479,-492,-48,-47,-114
+-44,-479,0,-48,-47,-114
+-67,-479,0,-48,-75,-85
+-67,-479,0,-48,-75,-85
+-89,-479,0,-48,-96,-64
+-89,-479,0,-48,-96,-64
+-112,-479,0,-48,-112,-48
+-112,-479,0,-48,-112,-48
+-123,-479,0,-48,-124,-36
+-123,-479,0,-48,-124,-36
+-123,-479,0,-48,-134,-27
+-123,-479,0,-48,-134,-27
+-134,-479,0,-48,-141,-20
+-134,-479,0,-48,-141,-20
+-146,-479,0,-48,-147,-15
+-146,-479,0,-48,-147,-15
+-146,-479,0,-48,-152,-11
+-146,-479,0,-48,-152,-11
+-146,-479,0,-48,-155,-8
+-146,-479,480,-48,-155,-8
+-247,-470,480,-51,-269,98
+-247,-470,0,-51,-269,98
+-236,-470,0,-51,-247,73
+-236,-470,0,-51,-247,73
+-224,-470,0,-51,-230,55
+-224,-470,0,-51,-230,55
+-213,-470,0,-51,-218,41
+-213,-470,0,-51,-218,41
+-202,-470,0,-51,-209,31
+-202,-470,491,-51,-209,31
+-303,-462,491,-55,-314,128
+-303,-462,0,-55,-314,128
+-281,-462,0,-55,-285,96
+-281,-462,0,-55,-285,96
+在目标位置点还是停不住并且经常偏到-4左右的坐标
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:13Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing hold activation mismatch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying soft-landing mode latch issue**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing soft landing parameter logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying hold segment parameter bug**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning fix for persistent soft params**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:31Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning bug fix for position drift**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:32Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Extending soft landing logic across segments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:32Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming state bug causing PID issue**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:34Z)**_
+
+我找到问题根上了，不是单纯 PID 不够，而是我前面那段 `-6.0` 局部逻辑有个状态漏洞：球一旦进过近端软着陆区，后面就算又漂回 `-4.4 / -4.6`，仍然可能继续用“软 PID”。这个从你数据里能直接算出来。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:37:55Z)**_
+
+我把这个漏洞补上了：现在只要还没真正 `hold` 住，且又漂离 `-6.0` 超过 `0.8cm`，就会立刻恢复远场那组 PID，不会再拿软参数在 `-4.x` 这种位置慢慢拖。再编译确认一下。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:38:03Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild firmware after pid fix
+
+`cmake --build /d/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37752 B         1 MB      3.60%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:38:28Z)**_
+
+这组数据已经把问题说明白了：
+
+**现在不是“在 `-6.0` 点刹不住”这么简单，而是球一旦被弹回到 `-4.x`，控制器还在用末端软参数慢慢拖，所以就经常停在 `-4.4 / -4.5` 一带。**
+
+你这组里最典型的是这一长段：
+
+```text
+-179,-445,0,-61,-181,5
+...
+-303,-445,0,-61,-311,0
+...
+-303,-445,0,-61,-311,0
+```
+
+按通道解释：
+
+- `ch1 = -445`，球在 `-4.45cm`
+- 目标还是 `-6.0cm`
+- 误差已经有 `1.55cm`
+- `ch3 = -61`，外环目标速度只有 `-0.61cm/s`
+- `ch4 = -3.11°`
+- `ch5 = 0`
+
+这里最关键的不是“有没有输出”，而是：
+
+**到了 `-4.45` 这种离目标还很远的位置，系统居然还在用一套很软的末端逻辑做慢拖。**
+
+这和我前面给你加的 `-6.0` 局部补丁有关，我刚刚已经把这个状态漏洞补掉了。
+
+---
+
+## 我刚改了什么
+
+改动还在 [Core/Src/pid.c](Core/Src/pid.c) 的 `-6.0` 局部软着陆逻辑里。
+
+之前的问题是：
+
+- 一旦进入过 `0.8cm` 近端区
+- 切了软 PID
+- 后面如果球又弹回去，甚至退到 `-4.x`
+- 软 PID 没有及时恢复远场参数
+
+结果就是：
+
+- 还离目标很远
+- 却用末端软参数慢慢拖
+- 所以你就看到了停在 `-4` 左右、收不回去
+
+我现在改成了：
+
+- 只要目标是 `-6.0`
+- 且**还没有真正 hold 住**
+- 如果又漂离 `0.8cm` 近端区外
+- 就**立刻恢复远场 PID**
+- 不再继续拿软参数拖
+
+这个修正在 [Core/Src/pid.c](Core/Src/pid.c) 已经写好了，并且编译通过了。
+
+---
+
+## 这组数据怎么解读
+
+### 第一组
+你发的第一组里，`ch1` 长时间挂在 `-445`，同时：
+
+- `ch3=-61`
+- `ch4≈-311`
+- `ch5≈0`
+
+这说明系统在一个“静摩擦平衡点”上卡住了。  
+也就是：
+
+- 外环知道还没到目标
+- 内环也在给负角
+- 但这个角度不足以把球重新拉回 `-6.0`
+
+如果此时还在用末端软 PID，那就更容易卡住。  
+这正是我刚修掉的点。
+
+### 第二组
+第二组明显比第一组更像“能来回跑，但终点附近还是会弹开”。  
+比如：
+
+- 到 `-5.8` 附近会有几次不错的接近
+- 但又被反弹回 `-5.5 / -5.4 / -5.3`
+- 再重新拉回去
+
+这说明结构方向是对的，但末端还没有真正“收住能量”。
+
+---
+
+## 当前结论
+
+现在可以明确分成两层：
+
+### 1. 已修掉的 bug
+**软着陆 PID 没有在漂离近端区后及时退出。**
+
+这会直接导致：
+
+- 球被弹回 `-4.x`
+- 但控制器还用软 PID
+- 最后收不回去
+
+这个我已经改了。
+
+### 2. 还剩的调参问题
+即使修完上面这个状态问题，你后面大概率还会看到：
+
+- `-6.0` 附近不够稳
+- 会在 `-5.6 ~ -5.9` 一带来回摆
+
+这个才是纯调参层面的事。
+
+---
+
+## 我建议你接下来这样看新数据
+
+刷这版固件后，重点看两件事：
+
+### 1. 还会不会再长时间卡在 `-4.4 / -4.5`
+如果这版修正生效，这种现象应该明显减少。  
+因为一旦退到那么远，控制器会重新切回远场参数把球拉回来。
+
+### 2. 回到 `-6.0` 附近后，是否只是小范围振荡
+如果后面只剩 `-5.7 ~ -5.9` 这种小摆动，那就说明现在剩下的是“末端参数还能再压一压”，而不是逻辑错了。
+
+---
+
+## 我现在对这套局部补丁的判断
+
+方向没错，但前一版少了一个关键条件：
+
+- **进入近端要切软**
+- **离开近端也必须恢复硬一点的远场参数**
+
+这个闭环现在补完整了。
+
+这次编译也过了：
+
+- `FLASH: 37752 B`
+- `RAM: 3496 B`
+
+你先测这一版。  
+这一版之后，如果球不再经常挂在 `-4.x`，那下一步就只需要继续压末端参数，不需要再改大逻辑。
+
+---
+
+_**User (2026-08-03 04:50:14Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+现在球去到+5.6有没有加这套补丁
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:50:29Z)**_
+
+没有。
+
+我现在加的这套补丁**只对第二段目标 `-6.0f` 生效**，`+5.6` 那一段完全没加。
+
+判断条件就在 [Core/Src/pid.c](Core/Src/pid.c) 里这段局部逻辑，核心限制是：
+
+- `target_y == -6.0f`
+- 且在第二段 / 第二段保持前后才会进这套逻辑
+
+所以第一段 `0 -> +5.6` 仍然只是这句原始参数在跑：
+
+[Core/Src/pid.c:760](Core/Src/pid.c#L760)
+
+```c
+pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+```
+
+而到 `+5.6` 后，当前代码是：
+
+[Core/Src/pid.c:771-778](Core/Src/pid.c#L771-L778)
+
+```c
+if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+    if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+        pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+        g_pid_segment = PID_SEGMENT_TO_NEG_55;
+        ...
+    }
+}
+```
+
+也就是说：
+
+- `+5.6` 只作为**切段触发点**
+- 一到 `+5.6 ± 窗口`，就直接切到第二段去追 `-6.0`
+- **不会在 `+5.6` 单独进入那套软着陆补丁**
+
+如果你现在怀疑第一段到 `+5.6` 也存在“冲过头再折返”或者“切段瞬间太猛”的问题，那需要给 `+5.6` 再单独做一套局部补丁。  
+但目前代码里没有。
+
+---
+
+_**User (2026-08-03 04:53:32Z)**_
+
+-157,528,502,54,-159,306
+-78,528,502,54,-85,229
+-78,528,-515,54,-85,229
+11,-471,-515,1000,1000,-27
+11,-471,-489,1000,1000,-27
+112,-1310,-489,1000,1000,-220
+112,-1310,-489,1000,1000,-220
+213,-1310,-489,1000,1000,-165
+213,-1310,-489,1000,1000,-165
+303,-310,512,1000,1000,75
+303,-310,487,1000,1000,75
+213,562,487,-871,-1000,56
+213,562,0,-871,-1000,56
+112,562,0,-871,-1000,42
+112,562,499,-871,-1000,42
+11,570,0,-878,-1000,136
+11,570,0,-878,-1000,136
+-78,570,512,-878,-1000,102
+-78,570,512,-878,-1000,102
+-179,587,523,-890,-1000,277
+-179,587,0,-890,-1000,277
+-281,587,0,-890,-1000,207
+-281,587,0,-890,-1000,207
+-382,587,0,-890,-1000,155
+-382,587,0,-890,-1000,155
+-483,587,0,-890,-1000,116
+-483,587,459,-890,-1000,116
+-584,596,0,-897,-1000,192
+-584,596,0,-897,-1000,192
+-674,596,0,-897,-1000,144
+-674,596,0,-897,-1000,144
+-776,596,0,-897,-1000,108
+-776,596,-490,-897,-1000,108
+-674,-404,-490,-147,-52,-118
+-674,-404,-514,-147,-52,-118
+-584,-1310,-514,533,1000,-289
+-584,-1310,0,533,1000,-289
+-483,-1310,0,533,1000,-216
+-483,-1310,0,533,1000,-216
+-382,-1310,0,533,1000,-162
+-382,-1310,487,533,1000,-162
+-483,-310,487,-216,-548,78
+-483,-310,526,-216,-548,78
+-584,612,526,-909,-1000,258
+-584,612,494,-909,-1000,258
+-674,621,494,-915,-1000,298
+-674,621,0,-915,-1000,298
+-776,621,0,-915,-1000,224
+-776,621,0,-915,-1000,224
+-877,621,0,-915,-1000,168
+-877,621,0,-915,-1000,168
+-978,621,0,-915,-1000,126
+-978,621,0,-915,-1000,126
+-989,621,0,-915,-1000,94
+-989,621,0,-915,-1000,94
+-989,621,0,-915,-1000,70
+-989,621,0,-915,-1000,70
+-989,621,0,-915,-1000,53
+-989,621,0,-915,-1000,53
+-989,612,504,-909,-1000,-65
+-989,612,499,-909,-1000,-65
+-989,621,499,-915,-1000,56
+-989,621,0,-915,-1000,56
+-989,621,0,-915,-1000,42
+-989,621,0,-915,-1000,42
+-989,621,0,-915,-1000,31
+-989,621,-473,-915,-1000,31
+-989,612,0,-909,-1000,-81
+-989,612,0,-909,-1000,-81
+-989,612,0,-909,-1000,-60
+-989,612,0,-909,-1000,-60
+-989,612,0,-909,-1000,-45
+-989,612,-501,-909,-1000,-45
+-989,604,-501,-903,-1000,-139
+-989,604,0,-903,-1000,-139
+-989,604,0,-903,-1000,-104
+-989,604,-473,-903,-1000,-104
+-989,596,0,-897,-1000,-183
+-989,596,0,-897,-1000,-183
+-989,587,-513,-890,-1000,-242
+-989,587,-513,-890,-1000,-242
+-989,587,0,-890,-1000,-181
+-989,587,-504,-890,-1000,-181
+-989,579,-504,-884,-1000,-241
+-989,579,0,-884,-1000,-241
+-989,579,0,-884,-1000,-181
+-989,579,-480,-884,-1000,-181
+-989,570,-537,-878,-1000,-240
+-989,570,-537,-878,-1000,-240
+-989,562,0,-871,-1000,-285
+-989,562,0,-871,-1000,-285
+-989,554,-501,-865,-1000,-319
+-989,554,-489,-865,-1000,-319
+-989,545,-489,-859,-1000,-344
+-989,545,-511,-859,-1000,-344
+-989,537,-511,-852,-1000,-363
+-989,537,-471,-852,-1000,-363
+-989,528,-540,-846,-1000,-377
+-989,528,-540,-846,-1000,-377
+-899,512,-499,-834,-836,-483
+-899,512,-499,-834,-836,-483
+-798,486,-1487,-815,-690,-562
+-798,486,-504,-815,-690,-562
+-742,478,-504,-808,-743,-526
+-742,478,0,-808,-743,-526
+-832,478,0,-808,-974,-395
+-832,478,-477,-808,-974,-395
+-933,469,-2705,-802,-952,-401
+-933,469,-2705,-802,-952,-401
+-832,419,-503,-764,-711,-500
+-832,419,-503,-764,-711,-500
+-742,411,-500,-758,-735,-480
+-742,411,-1509,-758,-735,-480
+-641,386,-1509,-739,-563,-560
+-641,386,-493,-739,-563,-560
+-607,377,-493,-733,-613,-525
+-607,377,-484,-733,-613,-525
+-641,369,-2009,-726,-648,-499
+-641,369,-2009,-726,-648,-499
+-539,327,-503,-695,-461,-574
+-539,327,-503,-695,-461,-574
+-438,302,-1504,-676,-330,-630
+-438,302,-1504,-676,-330,-630
+-404,293,-446,-670,-411,-578
+-404,293,-2014,-670,-411,-578
+-303,260,-2014,-645,-270,-633
+-303,260,-510,-645,-270,-633
+-348,251,-510,-638,-352,-580
+-348,251,-504,-638,-352,-580
+-404,243,-2513,-632,-411,-540
+-404,243,-2513,-632,-411,-540
+-303,176,-1471,-582,-207,-605
+-303,176,-1471,-582,-207,-605
+-269,167,-498,-575,-278,-558
+-269,167,-1549,-575,-278,-558
+-168,142,-1549,-556,-134,-619
+-168,142,-486,-556,-134,-619
+-202,134,-486,-550,-208,-569
+-202,134,-506,-550,-208,-569
+-258,125,-2556,-544,-263,-531
+-258,125,-2556,-544,-263,-531
+-157,75,-495,-506,-71,-598
+-157,75,-495,-506,-71,-598
+-56,33,-2531,-474,89,-649
+-56,33,-1939,-474,89,-649
+33,0,-1939,-449,223,-686
+33,0,-508,-449,223,-686
+134,-8,-508,-443,135,-620
+134,-8,-1537,-443,135,-620
+224,-34,-489,-424,270,-665
+224,-34,-489,-424,270,-665
+326,-84,-2567,-386,427,-698
+326,-84,-2567,-386,427,-698
+337,-92,-495,-380,341,-629
+337,-92,-2462,-380,341,-629
+438,-134,-2462,-348,503,-671
+438,-134,0,-348,503,-671
+337,-134,0,-348,224,-503
+337,-134,-2037,-348,224,-503
+416,-168,-2053,-323,423,-577
+416,-168,-2053,-323,423,-577
+517,-202,-498,-298,598,-633
+517,-202,-498,-298,598,-633
+618,-218,-498,-285,732,-675
+618,-218,-2567,-285,732,-675
+719,-260,-2567,-254,887,-706
+719,-260,-498,-254,887,-706
+809,-269,-498,-248,811,-634
+809,-269,-1953,-248,811,-634
+911,-302,-518,-222,973,-676
+911,-302,-518,-222,973,-676
+911,-311,-2019,-216,912,-612
+911,-311,-2019,-216,912,-612
+989,-353,-513,-185,1000,-659
+989,-353,-503,-185,1000,-659
+978,-361,-503,-178,985,-599
+978,-361,-2511,-178,985,-599
+989,-403,-2511,-147,1000,-649
+989,-403,-503,-147,1000,-649
+989,-412,-498,-141,1000,-592
+989,-412,-498,-141,1000,-592
+967,-420,-2000,-134,975,-549
+967,-420,-2000,-134,975,-549
+989,-462,-506,-103,1000,-611
+989,-462,-492,-103,1000,-611
+989,-470,-492,-96,1000,-563
+989,-470,-495,-96,1000,-563
+989,-479,-495,-90,1000,-527
+989,-479,-2068,-90,1000,-527
+989,-512,-502,-65,1000,-595
+989,-512,-502,-65,1000,-595
+899,-521,-505,-31,114,-551
+899,-521,-505,-31,114,-551
+798,-538,-503,-24,140,-613
+798,-538,-503,-24,140,-613
+697,-546,-503,-21,141,-565
+697,-546,-499,-21,141,-565
+596,-554,-499,-18,145,-529
+596,-554,-1010,-18,145,-529
+494,-571,-1010,-11,172,-596
+494,-571,-501,-11,172,-596
+393,-580,-498,-7,151,-447
+393,-580,-498,-7,151,-447
+292,-596,-507,-1,181,-535
+292,-596,-507,-1,181,-535
+191,-605,-498,2,186,-506
+191,-605,0,2,186,-506
+168,-605,0,2,168,-380
+168,-605,-505,2,168,-380
+168,-613,-505,5,179,-390
+168,-613,-494,5,179,-390
+179,-622,0,8,189,-397
+179,-622,0,8,189,-397
+168,-622,0,8,175,-298
+168,-622,0,8,175,-298
+179,-630,-501,12,189,-328
+179,-630,0,12,189,-328
+168,-630,0,12,178,-246
+168,-630,-502,12,178,-246
+191,-638,-502,15,193,-289
+191,-638,0,15,193,-289
+179,-638,0,15,183,-217
+179,-638,0,15,183,-217
+168,-638,0,15,176,-163
+168,-638,0,15,176,-163
+191,-647,-501,18,194,-227
+191,-647,0,18,194,-227
+179,-647,0,18,187,-170
+179,-647,0,18,187,-170
+179,-647,0,18,181,-127
+179,-647,-4035,18,181,-127
+281,-1319,-4035,539,1000,-295
+281,-1319,-4035,539,1000,-295
+371,-1319,-4035,539,1000,-221
+371,-1319,-4035,539,1000,-221
+472,-1319,-4035,539,1000,-166
+472,-1319,3961,539,1000,-166
+371,-655,3961,22,-11,75
+371,-655,0,22,-11,75
+281,-655,0,22,-8,56
+281,-655,0,22,-8,56
+179,-655,0,22,-6,42
+179,-655,0,22,-6,42
+78,-655,0,22,-4,31
+78,-655,0,22,-4,31
+0,-655,0,22,-2,23
+0,-655,0,22,-2,23
+0,-655,0,22,-1,17
+0,-655,510,22,-1,17
+-22,-647,510,18,-24,118
+-22,-647,0,18,-24,118
+-11,-647,0,18,-19,88
+-11,-647,0,18,-19,88
+-11,-647,0,18,-16,66
+-11,-647,0,18,-16,66
+-11,-647,0,18,-13,49
+-11,-647,498,18,-13,49
+-33,-638,498,15,-35,142
+-33,-638,0,15,-35,142
+-22,-638,0,15,-29,106
+-22,-638,0,15,-29,106
+-22,-638,0,15,-25,80
+-22,-638,0,15,-25,80
+-22,-638,502,15,-22,60
+-22,-638,502,15,-22,60
+-33,-630,0,12,-44,150
+-33,-630,0,12,-44,150
+-33,-630,0,12,-38,112
+-33,-630,511,12,-38,112
+-56,-622,511,8,-58,189
+-56,-622,0,8,-58,189
+-44,-622,0,8,-51,142
+-44,-622,0,8,-51,142
+-44,-622,0,8,-46,106
+-44,-622,0,8,-46,106
+-33,-622,0,8,-42,79
+-33,-622,0,8,-42,79
+-56,-613,491,5,-63,164
+-56,-613,0,5,-63,164
+-56,-613,0,5,-57,123
+-56,-613,502,5,-57,123
+-67,-605,502,2,-76,197
+-67,-605,0,2,-76,197
+-67,-605,0,2,-69,148
+-67,-605,0,2,-69,148
+-56,-605,0,2,-64,111
+-56,-605,0,2,-64,111
+-78,-596,500,-1,-84,188
+-78,-596,0,-1,-84,188
+-67,-596,0,-1,-77,141
+-67,-596,0,-1,-77,141
+-67,-596,0,-1,-73,105
+-67,-596,501,-1,-73,105
+-89,-588,0,-4,-93,184
+-89,-588,0,-4,-93,184
+-101,-580,499,-7,-110,243
+-101,-580,499,-7,-110,243
+-101,-580,0,-7,-102,182
+-101,-580,0,-7,-102,182
+-89,-580,0,-7,-96,136
+-89,-580,0,-7,-96,136
+-89,-580,0,-7,-91,102
+-89,-580,501,-7,-91,102
+-101,-571,501,-11,-111,182
+-101,-571,0,-11,-111,182
+-101,-571,0,-11,-105,136
+-101,-571,0,-11,-105,136
+-123,-563,536,-14,-124,207
+-123,-563,536,-14,-124,207
+-112,-563,0,-14,-118,155
+-112,-563,0,-14,-118,155
+-112,-563,0,-14,-112,116
+-112,-563,514,-14,-112,116
+-123,-554,514,-18,-132,192
+-123,-554,0,-18,-132,192
+-123,-554,0,-18,-126,144
+-123,-554,0,-18,-126,144
+-112,-554,0,-18,-121,108
+-112,-554,0,-18,-121,108
+-112,-554,0,-18,-118,81
+-112,-554,0,-18,-118,81
+-112,-554,0,-18,-115,60
+-112,-554,0,-18,-115,60
+-112,-554,0,-18,-114,45
+-112,-554,0,-18,-114,45
+-112,-554,0,-18,-112,34
+-112,-554,0,-18,-112,34
+-101,-554,0,-18,-112,25
+-101,-554,0,-18,-112,25
+-101,-554,0,-18,-111,19
+-101,-554,0,-18,-111,19
+-101,-554,0,-18,-111,14
+-101,-554,0,-18,-111,14
+-101,-554,0,-18,-111,10
+-101,-554,0,-18,-111,10
+-101,-554,0,-18,-111,8
+-101,-554,453,-18,-111,8
+-134,-546,0,-21,-135,111
+-134,-546,0,-21,-135,111
+-123,-546,0,-21,-131,83
+-123,-546,0,-21,-131,83
+-123,-546,0,-21,-129,62
+-123,-546,0,-21,-129,62
+-123,-546,0,-21,-127,46
+-123,-546,0,-21,-127,46
+-123,-546,0,-21,-126,35
+-123,-546,0,-21,-126,35
+-123,-546,0,-21,-125,26
+-123,-546,0,-21,-125,26
+-123,-546,0,-21,-124,19
+-123,-546,0,-21,-124,19
+-123,-546,0,-21,-124,14
+-123,-546,0,-21,-124,14
+-123,-546,0,-21,-124,11
+-123,-546,0,-21,-124,11
+-123,-546,0,-21,-124,8
+-123,-546,0,-21,-124,8
+-123,-546,0,-21,-124,6
+-123,-546,0,-21,-124,6
+-123,-546,0,-21,-124,4
+-123,-546,0,-21,-124,4
+-123,-546,0,-21,-125,3
+-123,-546,0,-21,-125,3
+-123,-546,0,-21,-125,2
+-123,-546,0,-21,-125,2
+-123,-546,0,-21,-125,1
+-123,-546,0,-21,-125,1
+-123,-546,0,-21,-126,1
+-123,-546,0,-21,-126,1
+-123,-546,0,-21,-126,1
+-123,-546,0,-21,-126,1
+-123,-546,0,-21,-126,0
+-123,-546,0,-21,-126,0
+-123,-546,0,-21,-127,0
+-123,-546,0,-21,-127,0
+-123,-546,0,-21,-127,0
+-123,-546,0,-21,-127,0
+-123,-546,0,-21,-128,0
+-123,-546,0,-21,-128,0
+-123,-546,0,-21,-128,0
+-123,-546,0,-21,-128,0
+-123,-546,0,-21,-128,0
+-123,-546,0,-21,-128,0
+-123,-546,0,-21,-129,0
+-123,-546,0,-21,-129,0
+-123,-546,0,-21,-129,0
+-123,-546,0,-21,-129,0
+-123,-546,0,-21,-130,0
+-123,-546,0,-21,-130,0
+-123,-546,0,-21,-130,0
+-123,-546,0,-21,-130,0
+-123,-546,0,-21,-131,0
+-123,-546,0,-21,-131,0
+-123,-546,0,-21,-131,0
+-123,-546,0,-21,-131,0
+-123,-546,0,-21,-131,0
+
+
+我现在觉得到-6这个点先不要再分段pid，另外做一个补丁，让球能稳定落在-6这个点，先分析一下
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:53:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing PID stabilization and channel anomalies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:53:56Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying PID reset causing control discontinuities**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:01Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing local terminal capture mode**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:01Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning stable terminal mode separate from segmented PID**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:02Z)**_
+
+我先把现在 `-6.0` 附近那段局部补丁的代码再对一眼，确认这次分析是基于你当前实际跑的逻辑，不靠记忆猜。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:02Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+800			target_y_last = target_y;
+801			control_initialized = true;
+802		}
+803	
+804		float position_delta = relative_y - relative_y_last;
+805		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+806	
+807		/* 内环速度反馈改为本地位置差分速度。
+808		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+809		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+810		 */
+811		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+812		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+813		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+814	
+815		/* -6.0cm 终点单独做软着陆：距目标 0.8cm 时先清积分，再切软 PID，
+816		 * 避免远场阶段累积的速度环积分把终点区搅成来回穿越。
+817		 * 软着陆逻辑在 -6.0 目标的整个末段都生效（含 HOLD 段尚未真正锁定前），
+818		 * 一旦又漂出 0.8cm 外，必须立刻恢复远场 PID，不能继续拿软参数硬拖。 */
+819		if((g_pid_segment == PID_SEGMENT_TO_NEG_55 || g_pid_segment == PID_SEGMENT_HOLD_NEG_55) &&
+820		   target_y == -6.0f && !target_hold_active) {
+821			if(abs_relative_y <= 0.8f) {
+822				if(!neg6_soft_landing_active) {
+823					pidY.iout = 0.0f;
+824					pidY_Speed.iout = 0.0f;
+825					pid_apply_segment_profile(-6.0f, 0.400f, 0.0f, 0.0f, 0.20f, 0.02f, 0.0f);
+826					target_hold_settle_ticks = 0u;
+827					neg6_soft_landing_active = true;
+828				}
+829			} else if(neg6_soft_landing_active) {
+830				pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+831				neg6_soft_landing_active = false;
+832			}
+833		} else {
+834			neg6_soft_landing_active = false;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+838		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+839		 *
+840		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+841		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+842		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+843			if(target_hold_active) {
+844				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+845					target_hold_active = false;
+846					target_hold_settle_ticks = 0u;
+847				}
+848			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+849			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+850				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+851					target_hold_settle_ticks++;
+852				}
+853				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+854					target_hold_active = true;
+855				}
+856			} else {
+857				target_hold_settle_ticks = 0u;
+858			}
+859		} else {
+860			target_hold_active = false;
+861			target_hold_settle_ticks = 0u;
+862		}
+863	
+864		if(target_hold_active) {
+865			/* 进入误差保持区后，只停止位置环继续推球：
+866			 *   1) 外环目标速度稍后压到 0；
+867			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+868		}
+869
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:15Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing dataset anomalies and saturation effects**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Proposing capture mode patch for stable -6 point**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:24Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing docking hold control logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:27Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying sensor noise causing control saturation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming measurement errors at endpoint**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:33Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing observation gate logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning hysteresis and bias hold logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:37Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Explaining friction impact on control**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:54:37Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing sensor spike rejection logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:05Z)**_
+
+是，**现在到 `-6.0` 这个点，继续再分一套 PID 不是最优先的事**。  
+你这组数据里暴露出来的主问题，已经不是“某组 PID 稍微不合适”，而是：
+
+**`-6.0` 附近的观测值会突然跳变，导致位置环和速度环同时被假数据打爆。**
+
+这比 PID 参数本身更致命。
+
+关键代码在 [Core/Src/pid.c:765](Core/Src/pid.c#L765) 和 [Core/Src/pid.c:804-813](Core/Src/pid.c#L804-L813)：
+
+- `Y = ball_error;` 直接拿视觉位置做控制
+- `estimated_velocity = position_delta / 0.02f;` 又直接用相邻位置差分算速度
+
+所以只要 `Y` 某一帧跳了，两个环都会一起出问题：
+- 外环 `pidY.now = relative_y`
+- 内环 `pidY_Speed.now = pidY_filtered_velocity`
+
+---
+
+## 这组数据里最明显的异常
+
+比如前面这一段：
+
+```text
+-78,528,-515,54,-85,229
+11,-471,-515,1000,1000,-27
+112,-1310,-489,1000,1000,-220
+303,-310,512,1000,1000,75
+213,562,487,-871,-1000,56
+```
+
+这几帧如果按 20ms 控制周期理解，意味着球在极短时间内：
+
+- 从 `+5.28cm` 瞬间跳到 `-4.71cm`
+- 再跳到 `-13.10cm`
+- 再跳到 `-3.10cm`
+- 再跳到 `+5.62cm`
+
+这个不可能是球真实运动。  
+这只能是：
+
+1. 视觉识别丢目标/串点
+2. 坐标偶发翻转
+3. 目标点附近图像抖动后输出了错误位置
+
+而控制器把这些都当真了，所以你看到：
+
+- `ch3 = 1000 / -871 / -890 ...`
+- `ch4 = 1000 / -1000 ...`
+
+也就是位置环、速度环都直接打满。
+
+---
+
+## 所以现在 `-6.0` 点最该加的，不是“再分一套 PID”，而是一个**终点补丁逻辑**
+
+我建议只针对 `-6.0` 做一个局部补丁，分三层。
+
+---
+
+## 1. 先做“终点观测保护”
+这是最重要的。
+
+只在目标是 `-6.0f`、且已经进入终点附近时生效。  
+比如在 `|relative_y| <= 1.2cm` 范围内，加一个规则：
+
+**如果当前帧位置相对上一帧跳得离谱，就不采信这一帧。**
+
+例如：
+
+- `|Y - Y_last| > 0.8cm` 或 `1.0cm`
+- 并且方向还突然翻转
+- 就把这帧当异常帧，继续用上一帧位置或上一次有效位置
+
+原因很简单：  
+球不可能在 20ms 里跳 5cm、10cm、15cm。  
+这些是假数据，不应该喂进 PID。
+
+这是当前最值钱的补丁。
+
+---
+
+## 2. 到 `-6.0` 附近后，不再“继续分段 PID”，而是把外环目标速度做局部限速
+不是换 PID 参数，而是**对 `pidY.out` 做终点限速**。
+
+比如只在 `-6.0` 附近：
+
+- `|relative_y| <= 0.8cm` 时
+- 把 `pidY.out` 限到一个更小范围，例如 `±1.0 ~ ±1.5 cm/s`
+
+这和“再切一组 PID”不一样。  
+它只是说：
+
+- 远处你怎么追都行
+- 到终点附近，外环别再下大速度命令
+
+这样会比切一套新 PID 更稳，也更符合你“不要再分段 PID”的意思。
+
+---
+
+## 3. 真正落在 `-6.0` 后，用一个小的“锁点补丁”替代纯零输出
+你现在的保持逻辑本质是：
+
+- 进窗后把 `pidY.out = 0`
+- 速度环继续做 `目标速度 = 0`
+
+这对理想系统可以，但对你这种有静摩擦、零偏、视觉噪声的系统，容易出现两种情况：
+
+1. 小球停在 `-5.46 / -5.54` 一类偏点
+2. 小球来回轻微漂，速度环一直纠偏
+
+所以对 `-6.0` 点，我更建议一个**小范围锁点逻辑**，不是纯 PID：
+
+- 当 `|error| <= 0.2cm` 且速度很小，进入锁点区
+- 锁点区里不是让外环完全归零，而是加一个很小的偏置保持
+
+例如这种思路：
+
+- 如果球在 `-6.0` 右边超过 `0.15cm`，给一个固定很小负保持量
+- 如果球在 `-6.0` 左边超过 `0.15cm`，给一个固定很小正保持量
+- 在中间小死区内给 0
+
+这本质上是一个**终点微补偿 / 小回差保持**，很适合克服静摩擦和零偏。  
+它比在终点附近硬靠线性 PID 输出那点小量更可靠。
+
+---
+
+## 为什么我现在不建议继续把重点放在 PID 数字上
+因为你这份数据里最刺眼的问题不是“收敛形状差一点”，而是：
+
+- 位置观测在 `-6.0` 附近会偶发大跳
+- 一跳就把外环和内环一起打满
+
+这种情况下：
+
+- 再换一组 `P/I`
+- 再软一点、再硬一点
+
+都治不到根上。
+
+---
+
+## 结论
+
+你现在这个判断是对的：
+
+**到 `-6.0` 先不要再分段 PID 了，应该单独做一个终点补丁。**
+
+而且这个补丁优先级应该是：
+
+1. **终点附近异常观测剔除**
+2. **终点附近外环目标速度局部限速**
+3. **落点后的小回差锁点补偿**
+
+不是再去堆一套新的 `pid_apply_segment_profile(...)`。
+
+一句话概括：
+
+**`-6.0` 现在更像是“终点落点控制问题”，不是“再分一段 PID 就能彻底解决”的问题。**
+
+---
+
+_**User (2026-08-03 04:55:12Z)**_
+
+现在修改
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:20Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning local patch for -6 stop**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:20Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting control logic for -6 patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:24Z)**_
+
+我现在直接改 `pid.c`，把 `-6.0` 这段从“再切一组软 PID”改成“终点局部补丁”。重点会放在三件事：近端异常观测保护、近端目标速度限速、锁点后的微小保持，不去再分一段新的 PID。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:24Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758		static bool neg6_soft_landing_active = false;
+759	
+760		if(!g_pid_segment_initialized) {
+761			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+762			g_pid_segment = PID_SEGMENT_TO_POS_56;
+763			g_pid_segment_initialized = true;
+764		}
+765	
+766		Y = ball_error;  // 视觉小球绝对位置
+767	
+768		/* 分段状态机：
+769		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+770		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+771		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+772		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+773			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+774				pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+775				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+776				control_initialized = false;
+777				target_hold_active = false;
+778				target_hold_settle_ticks = 0u;
+779				neg6_soft_landing_active = false;
+780			}
+781		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+782			if(pid_absf(Y + 6.0f) <= TARGET_HOLD_POSITION_ENTER) {
+783				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+784				control_initialized = false;
+785				target_hold_active = false;
+786				target_hold_settle_ticks = 0u;
+787			}
+788		}
+789	
+790		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+791		float target_y = ball_target_get();
+792		float relative_y = Y - target_y;
+793		bool target_changed = !control_initialized || target_y != target_y_last;
+794	
+795		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+796		if(target_changed) {
+797			target_hold_active = false;
+798			target_hold_settle_ticks = 0u;
+799			relative_y_last = relative_y;
+800			target_y_last = target_y;
+801			control_initialized = true;
+802		}
+803	
+804		float position_delta = relative_y - relative_y_last;
+805		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+806	
+807		/* 内环速度反馈改为本地位置差分速度。
+808		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+809		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+810		 */
+811		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+812		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+813		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+814	
+815		/* -6.0cm 终点单独做软着陆：距目标 0.8cm 时先清积分，再切软 PID，
+816		 * 避免远场阶段累积的速度环积分把终点区搅成来回穿越。
+817		 * 软着陆逻辑在 -6.0 目标的整个末段都生效（含 HOLD 段尚未真正锁定前），
+818		 * 一旦又漂出 0.8cm 外，必须立刻恢复远场 PID，不能继续拿软参数硬拖。 */
+819		if((g_pid_segment == PID_SEGMENT_TO_NEG_55 || g_pid_segment == PID_SEGMENT_HOLD_NEG_55) &&
+820		   target_y == -6.0f && !target_hold_active) {
+821			if(abs_relative_y <= 0.8f) {
+822				if(!neg6_soft_landing_active) {
+823					pidY.iout = 0.0f;
+824					pidY_Speed.iout = 0.0f;
+825					pid_apply_segment_profile(-6.0f, 0.400f, 0.0f, 0.0f, 0.20f, 0.02f, 0.0f);
+826					target_hold_settle_ticks = 0u;
+827					neg6_soft_landing_active = true;
+828				}
+829			} else if(neg6_soft_landing_active) {
+830				pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+831				neg6_soft_landing_active = false;
+832			}
+833		} else {
+834			neg6_soft_landing_active = false;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+838		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+839		 *
+840		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+841		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+842		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+843			if(target_hold_active) {
+844				if(abs_relative_y >= TARGET_HOLD_POSITION_EXIT) {
+845					target_hold_active = false;
+846					target_hold_settle_ticks = 0u;
+847				}
+848			} else if(abs_relative_y <= TARGET_HOLD_POSITION_ENTER &&
+849			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+850				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+851					target_hold_settle_ticks++;
+852				}
+853				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+854					target_hold_active = true;
+855				}
+856			} else {
+857				target_hold_settle_ticks = 0u;
+858			}
+859		} else {
+860			target_hold_active = false;
+861			target_hold_settle_ticks = 0u;
+862		}
+863	
+864		if(target_hold_active) {
+865			/* 进入误差保持区后，只停止位置环继续推球：
+866			 *   1) 外环目标速度稍后压到 0；
+867			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+868		}
+869	
+870		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+871		pidY.target = 0.0f;
+872		pidY.now = relative_y;
+873		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+874		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+875		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+876		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+877		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+878		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+879		                POS_LOOP_I_LIMIT);
+880		if(target_hold_active) {
+881			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+882			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+883			 */
+884			pidY.out = 0.0f;
+885		}
+886	
+887		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+888		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+889		 */
+890		float control_velocity = estimated_velocity;
+891		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+892			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+893		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+894			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+895		}
+896		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+897		                         (control_velocity - pidY_filtered_velocity);
+898	
+899	#if POSITION_LOOP_DIRECT_DRIVE
+900		/* 单环调试模式：位置环直接输出平台倾角。
+901		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+902		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+903		pidY_velocity_damping = 0.0f;
+904		pidY_Speed.target = 0.0f;
+905		pidY_Speed.now = pidY_filtered_velocity;
+906		pidY_Speed.out = 0.0f;
+907		pidY_Speed.pout = 0.0f;
+908		pidY_Speed.iout = 0.0f;
+909		pidY_Speed.dout = 0.0f;
+910	
+911		float cmd_angle = pidY.out;
+912		#else
+913			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+914			pidY_Speed.target = pidY.out;
+915			pidY_Speed.now = pidY_filtered_velocity;
+916			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+917			                SPEED_LOOP_I_LIMIT);
+918			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+919			float cmd_angle = pidY_velocity_damping;
+920		#endif
+921	
+922		// 负方向（下降）机构补偿 ×1.2。
+923		if(cmd_angle < 0.0f) {
+924			cmd_angle *= 1.0f;
+925		}
+926	
+927		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+928		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+929		static float cmd_angle_last = 0.0f;
+930		{
+931			float delta = cmd_angle - cmd_angle_last;
+932			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+933			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+934			cmd_angle = cmd_angle_last + delta;
+935			cmd_angle_last = cmd_angle;
+936		}
+937		motor_set_angle(cmd_angle);
+938	
+939		relative_y_last = relative_y;
+940		Y_last = Y;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:24Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `neg6_soft_landing_active|target_hold_active|pidY.out = 0.0f|pidY.target = 0.0f`
+
+```text
+756:	static bool target_hold_active = false;
+758:	static bool neg6_soft_landing_active = false;
+777:			target_hold_active = false;
+779:			neg6_soft_landing_active = false;
+785:			target_hold_active = false;
+797:		target_hold_active = false;
+820:	   target_y == -6.0f && !target_hold_active) {
+822:			if(!neg6_soft_landing_active) {
+827:				neg6_soft_landing_active = true;
+829:		} else if(neg6_soft_landing_active) {
+831:			neg6_soft_landing_active = false;
+834:		neg6_soft_landing_active = false;
+843:		if(target_hold_active) {
+845:				target_hold_active = false;
+854:				target_hold_active = true;
+860:		target_hold_active = false;
+864:	if(target_hold_active) {
+871:	pidY.target = 0.0f;
+880:	if(target_hold_active) {
+884:		pidY.out = 0.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:29Z)**_
+
+我要把之前那套 `neg6_soft_landing_active` 的“再切一组软 PID”去掉，改成你刚才说的真正局部补丁：仅对 `-6.0` 做近端观测保护、外环速度限幅、以及保持区的小偏置锁点。编辑范围会控制在 [Core/Src/pid.c](Core/Src/pid.c) 这一处函数里。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:33Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:55:47Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:56:08Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:56:22Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:56:26Z)**_
+
+补丁已经换成“局部落点控制”了，不再在 `-6.0` 近端切一组新 PID。现在是：近端先做观测毛刺抑制，再把外环目标速度压小，进入保持后对 `-6.0` 单独给一个带回差的小偏置锁点。接着我编译确认。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:56:37Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after -6 landing patch
+
+`cmake --build /d/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37936 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:56:52Z)**_
+
+已经改完了，且只针对 `-6.0` 这个落点，不再额外分一段新的 PID。
+
+这次改动都在 [Core/Src/pid.c](Core/Src/pid.c) 的 `pid_control__26Y()` 里，核心变化有三件：
+
+1. **去掉了之前那套 `-6.0` 近端再切软 PID 的逻辑**
+2. **改成 `-6.0` 近端观测保护**
+   - 在 `|error| <= 1.2cm` 时，如果单帧位置跳变超过 `1.0cm`，就把它当成视觉毛刺，本周期继续沿用上一帧位置
+   - 同时对 `-6.0` 的相对误差做了一阶低通，避免差分速度被异常帧放大
+3. **改成 `-6.0` 终点局部落点补丁**
+   - 在 `|error| <= 0.8cm` 时，把外环目标速度限到 `±1.2 cm/s`
+   - 真正进入保持后，不再一刀切 `pidY.out = 0`
+   - 对 `-6.0` 单独加了一个带回差的小偏置锁点：
+     - `error > 0.12cm` 给 `-0.18 cm/s`
+     - `error < -0.12cm` 给 `+0.18 cm/s`
+     - 中间死区给 `0`
+
+关键位置在这里：
+
+- 近端观测保护：[Core/Src/pid.c:811-828](Core/Src/pid.c#L811-L828)
+- `-6.0` 近端限速与锁点补丁：[Core/Src/pid.c:878-895](Core/Src/pid.c#L878-L895)
+
+编译也已经过了：
+
+- `FLASH: 37936 B`
+- `RAM: 3496 B`
+
+你现在测这一版，重点看三件事：
+
+- `-6.0` 附近是否还会出现那种一帧跳到 `-13`、下一帧又跳回来的离谱冲击
+- `ch3` 在 `-6.0` 附近是否不再经常直接顶到大值
+- 小球是否会更容易停在 `-6.0` 附近，而不是滑回 `-5.4 / -4.x`
+
+如果这版后还存在偏差，下一步就不是再分段 PID，而是只微调这三个局部常数：
+
+- 毛刺阈值 `1.0cm`
+- 近端限速 `±1.2 cm/s`
+- 锁点偏置 `0.18 cm/s` / 回差 `0.12cm`
+
+现在结构方向已经换对了。
+
+---
+
+_**User (2026-08-03 04:58:40Z)**_
+
+-168,-378,0,-159,-247,81
+-168,-378,495,-159,-247,81
+-258,-370,489,-162,-339,115
+-258,-370,489,-162,-339,115
+-359,-361,506,-166,-444,153
+-359,-361,506,-166,-444,153
+-461,-353,0,-171,-554,191
+-461,-353,495,-171,-554,191
+-562,-344,495,-176,-666,226
+-562,-344,0,-176,-666,226
+-663,-344,0,-180,-724,232
+-663,-344,492,-180,-724,232
+-764,-336,1027,-184,-801,247
+-764,-336,1027,-184,-801,247
+-866,-319,0,-190,-941,293
+-866,-319,0,-190,-941,293
+-967,-311,500,-197,-1000,326
+-967,-311,512,-197,-1000,326
+-989,-302,512,-203,-1000,351
+-989,-302,0,-203,-1000,351
+-989,-302,0,-208,-1000,343
+-989,-302,511,-208,-1000,343
+-989,-294,511,-213,-1000,343
+-989,-294,414,-213,-1000,343
+-989,-286,414,-219,-1000,348
+-989,-286,0,-219,-1000,348
+-989,-286,0,-223,-1000,329
+-989,-286,0,-223,-1000,329
+-989,-286,0,-226,-1000,298
+-989,-286,0,-226,-1000,298
+-989,-277,505,-230,-1000,288
+-989,-277,0,-230,-1000,288
+-989,-277,0,-233,-1000,264
+-989,-277,0,-233,-1000,264
+-989,-277,0,-235,-1000,234
+-989,-277,0,-235,-1000,234
+-989,-277,0,-236,-1000,203
+-989,-277,0,-236,-1000,203
+-967,-277,0,-238,-969,172
+-967,-277,0,-238,-969,172
+-911,-277,0,-239,-922,144
+-911,-277,0,-239,-922,144
+-877,-277,0,-239,-879,120
+-877,-277,0,-239,-879,120
+-832,-277,0,-240,-843,98
+-832,-277,0,-240,-843,98
+-809,-277,0,-240,-812,80
+-809,-277,0,-240,-812,80
+-776,-277,0,-240,-785,65
+-776,-277,0,-240,-785,65
+-708,-286,-502,-239,-715,26
+-708,-286,0,-239,-715,26
+-663,-286,0,-238,-672,2
+-663,-286,-561,-238,-672,2
+-596,-294,-561,-236,-598,-36
+-596,-294,0,-236,-598,-36
+-551,-294,-501,-234,-560,-56
+-551,-294,-501,-234,-560,-56
+-449,-311,-501,-229,-447,-117
+-449,-311,-501,-229,-447,-117
+-393,-311,0,-226,-395,-143
+-393,-311,-449,-226,-395,-143
+-326,-319,-449,-222,-331,-175
+-326,-319,-562,-222,-331,-175
+-258,-328,-562,-217,-265,-209
+-258,-328,-499,-217,-265,-209
+-191,-336,-513,-212,-197,-241
+-191,-336,-513,-212,-197,-241
+-123,-344,0,-207,-130,-270
+-123,-344,0,-207,-130,-270
+-56,-353,-493,-201,-66,-296
+-56,-353,-472,-201,-66,-296
+0,-361,-472,-196,-5,-318
+0,-361,-520,-196,-5,-318
+44,-370,-520,-190,52,-337
+44,-370,0,-190,52,-337
+44,-370,-497,-185,56,-326
+44,-370,-497,-185,56,-326
+123,-386,-513,-179,130,-352
+123,-386,-513,-179,130,-352
+224,-412,-1470,-169,297,-424
+224,-412,-1470,-169,297,-424
+326,-412,0,-162,361,-437
+326,-412,-528,-162,361,-437
+404,-420,-528,-155,414,-444
+404,-420,0,-155,414,-444
+404,-420,-509,-150,408,-420
+404,-420,-509,-150,408,-420
+416,-428,-497,-144,420,-406
+416,-428,-497,-144,420,-406
+438,-437,0,-139,444,-400
+438,-437,0,-139,444,-400
+472,-445,-484,-133,476,-397
+472,-445,-520,-133,476,-397
+506,-454,-520,-127,514,-397
+506,-454,-503,-127,514,-397
+551,-462,-510,-121,554,-398
+551,-462,-510,-121,554,-398
+596,-470,-498,-115,597,-400
+596,-470,-498,-115,597,-400
+641,-479,0,-109,642,-403
+641,-479,0,-109,642,-403
+686,-487,-475,-102,687,-405
+686,-487,0,-102,687,-405
+674,-487,0,-98,681,-381
+674,-487,0,-98,681,-381
+641,-487,-511,-94,647,-344
+641,-487,-511,-94,647,-344
+641,-496,0,-90,650,-328
+641,-496,0,-90,650,-328
+618,-496,0,-87,619,-298
+618,-496,0,-87,619,-298
+551,-496,0,-85,561,-263
+551,-496,-532,-85,561,-263
+539,-504,-532,-81,549,-252
+539,-504,0,-81,549,-252
+506,-504,0,-79,516,-231
+506,-504,0,-79,516,-231
+472,-504,0,-77,473,-204
+472,-504,0,-77,473,-204
+416,-504,0,-75,427,-177
+416,-504,0,-75,427,-177
+371,-504,0,-74,382,-150
+371,-504,0,-74,382,-150
+337,-504,0,-74,341,-126
+337,-504,501,-74,341,-126
+247,-496,501,-75,255,-78
+247,-496,0,-75,255,-78
+191,-496,518,-75,195,-46
+191,-496,518,-75,195,-46
+101,-487,0,-77,101,0
+101,-487,0,-77,101,0
+33,-487,0,-79,42,27
+33,-487,0,-79,42,27
+-44,-479,458,-82,-46,66
+-44,-479,0,-82,-46,66
+-89,-479,0,-84,-98,84
+-89,-479,558,-84,-98,84
+-168,-470,558,-87,-178,115
+-168,-470,463,-87,-178,115
+-269,-462,0,-91,-274,152
+-269,-462,0,-91,-274,152
+-371,-454,508,-95,-375,189
+-371,-454,508,-95,-375,189
+-472,-445,497,-100,-478,224
+-472,-445,491,-100,-478,224
+-573,-437,491,-106,-580,256
+-573,-437,498,-106,-580,256
+-663,-428,498,-111,-679,285
+-663,-428,0,-111,-679,285
+-719,-428,515,-115,-723,283
+-719,-428,515,-115,-723,283
+-821,-412,490,-122,-837,316
+-821,-412,490,-122,-837,316
+-922,-403,515,-128,-939,342
+-922,-403,492,-128,-939,342
+-989,-395,492,-134,-1000,361
+-989,-395,508,-134,-1000,361
+-989,-386,508,-141,-1000,375
+-989,-386,0,-141,-1000,375
+-989,-386,493,-145,-1000,360
+-989,-386,493,-145,-1000,360
+-989,-370,511,-152,-1000,381
+-989,-370,511,-152,-1000,381
+-989,-370,0,-157,-1000,369
+-989,-370,0,-157,-1000,369
+-989,-370,0,-161,-1000,340
+-989,-370,500,-161,-1000,340
+-989,-361,500,-165,-1000,328
+-989,-361,0,-165,-1000,328
+-989,-361,0,-168,-1000,301
+-989,-361,0,-168,-1000,301
+-989,-353,496,-172,-1000,293
+-989,-353,496,-172,-1000,293
+-989,-353,0,-175,-1000,270
+-989,-353,0,-175,-1000,270
+-978,-353,0,-178,-983,240
+-978,-353,0,-178,-983,240
+-922,-353,0,-179,-930,209
+-922,-353,0,-179,-930,209
+-877,-353,0,-181,-879,178
+-877,-353,0,-181,-879,178
+-821,-353,0,-182,-830,149
+-821,-353,0,-182,-830,149
+-787,-353,0,-182,-787,124
+-787,-353,0,-182,-787,124
+-742,-353,0,-183,-749,102
+-742,-353,0,-183,-749,102
+-708,-353,0,-183,-717,83
+-708,-353,0,-183,-717,83
+-686,-353,0,-184,-690,67
+-686,-353,0,-184,-690,67
+-663,-353,0,-184,-668,54
+-663,-353,0,-184,-668,54
+-596,-361,-504,-183,-600,17
+-596,-361,0,-183,-600,17
+-551,-361,0,-181,-560,-4
+-551,-361,0,-181,-560,-4
+-528,-361,0,-181,-538,-16
+-528,-361,0,-181,-538,-16
+-517,-361,-504,-180,-527,-22
+-517,-361,-504,-180,-527,-22
+-472,-370,0,-178,-474,-50
+-472,-370,0,-178,-474,-50
+-393,-378,-501,-175,-400,-89
+-393,-378,0,-175,-400,-89
+-359,-378,0,-173,-368,-105
+-359,-378,-500,-173,-368,-105
+-303,-386,-500,-169,-312,-134
+-303,-386,-493,-169,-312,-134
+-236,-395,0,-165,-245,-168
+-236,-395,0,-165,-245,-168
+-213,-395,-493,-162,-223,-177
+-213,-395,-493,-162,-223,-177
+-168,-403,0,-158,-177,-197
+-168,-403,-503,-158,-177,-197
+-112,-412,-503,-154,-118,-222
+-112,-412,0,-154,-118,-222
+-101,-412,0,-151,-105,-222
+-101,-412,-499,-151,-105,-222
+-56,-420,-499,-146,-67,-235
+-56,-420,-501,-146,-67,-235
+-11,-428,0,-142,-15,-253
+-11,-428,0,-142,-15,-253
+33,-437,-501,-137,43,-274
+33,-437,-501,-137,43,-274
+101,-445,-504,-131,105,-295
+101,-445,0,-131,105,-295
+112,-445,0,-127,116,-288
+112,-445,-500,-127,116,-288
+146,-454,-500,-123,149,-293
+146,-454,-487,-123,149,-293
+191,-462,-497,-118,195,-303
+191,-462,-497,-118,195,-303
+247,-470,0,-112,247,-316
+247,-470,0,-112,247,-316
+303,-479,-506,-107,304,-330
+303,-479,-510,-107,304,-330
+359,-487,-510,-101,361,-343
+359,-487,0,-101,361,-343
+359,-487,0,-97,368,-329
+359,-487,0,-97,368,-329
+337,-487,0,-94,344,-301
+337,-487,0,-94,344,-301
+348,-496,-508,-90,357,-292
+348,-496,-508,-90,357,-292
+337,-496,0,-87,340,-269
+337,-496,0,-87,340,-269
+303,-496,0,-84,307,-239
+303,-496,0,-84,307,-239
+258,-496,0,-83,267,-208
+258,-496,0,-83,267,-208
+213,-496,-498,-81,224,-177
+213,-496,-498,-81,224,-177
+224,-504,0,-79,235,-174
+224,-504,0,-79,235,-174
+224,-504,0,-77,225,-162
+224,-504,0,-77,225,-162
+202,-504,0,-75,205,-145
+202,-504,0,-75,205,-145
+168,-504,0,-74,179,-127
+168,-504,0,-74,179,-127
+146,-504,0,-74,152,-108
+146,-504,0,-74,152,-108
+123,-504,0,-73,125,-91
+123,-504,0,-73,125,-91
+89,-504,0,-73,99,-76
+89,-504,0,-73,99,-76
+67,-504,0,-72,75,-62
+67,-504,0,-72,75,-62
+44,-504,0,-72,53,-51
+44,-504,0,-72,53,-51
+33,-504,0,-72,33,-41
+33,-504,0,-72,33,-41
+11,-504,0,-72,16,-33
+11,-504,0,-72,16,-33
+0,-504,0,-72,0,-26
+0,-504,0,-72,0,-26
+-11,-504,0,-71,-13,-21
+-11,-504,0,-71,-13,-21
+-22,-504,0,-71,-26,-17
+-22,-504,0,-71,-26,-17
+-33,-504,0,-71,-38,-13
+-33,-504,0,-71,-38,-13
+-44,-504,0,-71,-49,-10
+-44,-504,0,-71,-49,-10
+-56,-504,0,-71,-60,-8
+-56,-504,0,-71,-60,-8
+-67,-504,0,-71,-69,-6
+-67,-504,0,-71,-69,-6
+-123,-496,541,-73,-130,20
+-123,-496,0,-73,-130,20
+-157,-496,0,-74,-168,35
+-157,-496,0,-74,-168,35
+-191,-496,0,-75,-191,41
+-191,-496,497,-75,-191,41
+-247,-487,0,-77,-257,68
+-247,-487,0,-77,-257,68
+-292,-487,0,-79,-295,78
+-292,-487,0,-79,-295,78
+-314,-487,0,-80,-315,80
+-314,-487,0,-80,-315,80
+-314,-487,0,-81,-325,75
+-314,-487,544,-81,-325,75
+-371,-479,544,-83,-380,94
+-371,-479,0,-83,-380,94
+-404,-479,0,-85,-410,99
+-404,-479,0,-85,-410,99
+-416,-479,0,-86,-424,96
+-416,-479,0,-86,-424,96
+-427,-479,0,-87,-430,88
+-427,-479,484,-87,-430,88
+-472,-470,484,-90,-482,104
+-472,-470,0,-90,-482,104
+-506,-470,0,-91,-509,107
+-506,-470,514,-91,-509,107
+-562,-462,504,-94,-573,128
+-562,-462,504,-94,-573,128
+-652,-454,0,-98,-658,158
+-652,-454,0,-98,-658,158
+-697,-454,0,-101,-702,165
+-697,-454,0,-101,-702,165
+-697,-454,0,-103,-708,158
+-697,-454,0,-103,-708,158
+-686,-454,0,-104,-687,145
+-686,-454,0,-104,-687,145
+-652,-454,0,-105,-660,128
+-652,-454,0,-105,-660,128
+-629,-454,0,-106,-631,111
+-629,-454,0,-106,-631,111
+-596,-454,0,-107,-603,94
+-596,-454,-468,-107,-603,94
+-528,-462,-468,-106,-528,52
+-528,-462,0,-106,-528,52
+-472,-462,0,-105,-480,26
+-472,-462,0,-105,-480,26
+-449,-462,0,-105,-450,9
+-449,-462,0,-105,-450,9
+-427,-462,0,-104,-432,0
+-427,-462,0,-104,-432,0
+-416,-462,0,-104,-421,-6
+-416,-462,-470,-104,-421,-6
+-359,-470,-470,-102,-367,-35
+-359,-470,0,-102,-367,-35
+-337,-470,0,-101,-340,-49
+-337,-470,0,-101,-340,-49
+-326,-470,-511,-99,-330,-54
+-326,-470,-511,-99,-330,-54
+-224,-487,-503,-96,-231,-105
+-224,-487,-503,-96,-231,-105
+-179,-487,0,-93,-183,-128
+-179,-487,0,-93,-183,-128
+-157,-487,0,-90,-167,-133
+-157,-487,-571,-90,-167,-133
+-112,-496,-571,-87,-119,-153
+-112,-496,0,-87,-119,-153
+-101,-496,0,-85,-104,-155
+-101,-496,0,-85,-104,-155
+-101,-496,0,-83,-110,-146
+-101,-496,0,-83,-110,-146
+-67,-504,-493,-80,-75,-159
+-67,-504,0,-80,-75,-159
+-67,-504,0,-78,-69,-156
+-67,-504,0,-78,-69,-156
+-78,-504,0,-76,-79,-144
+-78,-504,-488,-76,-79,-144
+-44,-512,0,-73,-47,-155
+-44,-512,0,-73,-47,-155
+0,-521,-487,-70,8,-177
+0,-521,-487,-70,8,-177
+22,-521,0,-67,27,-179
+22,-521,0,-67,27,-179
+22,-521,0,-65,23,-169
+22,-521,0,-65,23,-169
+0,-521,0,-63,6,-152
+0,-521,-490,-63,6,-152
+33,-529,0,-61,34,-160
+33,-529,0,-61,34,-160
+33,-529,-483,-58,37,-154
+33,-529,-483,-58,37,-154
+67,-538,0,-55,77,-167
+67,-538,0,-55,77,-167
+134,-546,-486,-51,138,-191
+134,-546,0,-51,138,-191
+157,-546,0,-49,160,-192
+157,-546,0,-49,160,-192
+157,-546,0,-46,157,-180
+157,-546,0,-46,157,-180
+134,-546,0,-45,141,-163
+134,-546,0,-45,141,-163
+112,-546,0,-43,118,-142
+112,-546,0,-43,118,-142
+89,-546,0,-42,92,-122
+89,-546,-522,-42,92,-122
+112,-554,-522,-40,117,-129
+112,-554,0,-40,117,-129
+112,-554,0,-39,122,-125
+112,-554,0,-39,122,-125
+112,-554,0,-37,114,-115
+112,-554,0,-37,114,-115
+89,-554,0,-36,99,-102
+89,-554,0,-36,99,-102
+78,-554,0,-36,82,-89
+78,-554,0,-36,82,-89
+56,-554,0,-35,64,-75
+56,-554,0,-35,64,-75
+44,-554,0,-35,46,-63
+44,-554,0,-35,46,-63
+22,-554,0,-34,29,-52
+22,-554,0,-34,29,-52
+11,-554,0,-34,14,-43
+11,-554,0,-34,14,-43
+0,-554,0,-34,1,-35
+0,-554,0,-34,1,-35
+0,-554,0,-34,-10,-28
+0,-554,0,-34,-10,-28
+-11,-554,0,-34,-21,-23
+-11,-554,0,-34,-21,-23
+-22,-554,0,-34,-31,-18
+-22,-554,0,-34,-31,-18
+-33,-554,0,-34,-39,-14
+-33,-554,0,-34,-39,-14
+-44,-554,0,-34,-46,-11
+-44,-554,0,-34,-46,-11
+-44,-554,0,-33,-53,-9
+-44,-554,0,-33,-53,-9
+-56,-554,0,-33,-59,-7
+-56,-554,0,-33,-59,-7
+-56,-554,0,-33,-65,-5
+-56,-554,0,-33,-65,-5
+-67,-554,0,-33,-70,-4
+-67,-554,0,-33,-70,-4
+-67,-554,0,-33,-74,-3
+-67,-554,0,-33,-74,-3
+-78,-554,0,-33,-79,-2
+-78,-554,0,-33,-79,-2
+-78,-554,0,-33,-83,-2
+-78,-554,0,-33,-83,-2
+-78,-554,0,-33,-87,-1
+-78,-554,0,-33,-87,-1
+-89,-554,0,-33,-91,-1
+-89,-554,0,-33,-91,-1
+-89,-554,0,-33,-95,-1
+-89,-554,0,-33,-95,-1
+-89,-554,0,-33,-99,0
+-89,-554,0,-33,-99,0
+-101,-554,0,-33,-102,0
+-101,-554,0,-33,-102,0
+-101,-554,0,-33,-106,0
+-101,-554,0,-33,-106,0
+-101,-554,0,-33,-109,0
+-101,-554,0,-33,-109,0
+-112,-554,0,-33,-113,0
+-112,-554,0,-33,-113,0
+-112,-554,0,-33,-116,0
+-112,-554,0,-33,-116,0
+-112,-554,0,-33,-120,0
+-112,-554,0,-33,-120,0
+-123,-554,0,-33,-123,0
+-123,-554,0,-33,-123,0
+-123,-554,0,-33,-127,0
+-123,-554,0,-33,-127,0
+-123,-554,0,-33,-130,0
+-123,-554,0,-33,-130,0
+-123,-554,0,-33,-134,0
+-123,-554,0,-33,-134,0
+-134,-554,0,-33,-137,0
+-134,-554,0,-33,-137,0
+-134,-554,0,-33,-140,0
+-134,-554,0,-33,-140,0
+-134,-554,0,-33,-144,0
+-134,-554,0,-33,-144,0
+-146,-554,0,-33,-147,0
+-146,-554,0,-33,-147,0
+-146,-554,0,-33,-151,0
+-146,-554,0,-33,-151,0
+-146,-554,0,-33,-154,0
+-146,-554,0,-33,-154,0
+-157,-554,0,-33,-157,0
+-157,-554,0,-33,-157,0
+-157,-554,0,-33,-161,0
+-157,-554,0,-33,-161,0
+-157,-554,0,-33,-164,0
+-157,-554,0,-33,-164,0
+-157,-554,0,-33,-167,0
+-157,-554,0,-33,-167,0
+-168,-554,0,-33,-171,0
+-168,-554,0,-33,-171,0
+-168,-554,0,-33,-174,0
+-168,-554,0,-33,-174,0
+-168,-554,0,-33,-178,0
+-168,-554,0,-33,-178,0
+-179,-554,0,-33,-181,0
+-179,-554,0,-33,-181,0
+-179,-554,0,-33,-184,0
+-179,-554,0,-33,-184,0
+-179,-554,0,-33,-188,0
+-179,-554,0,-33,-188,0
+-191,-554,0,-33,-191,0
+-191,-554,0,-33,-191,0
+-191,-554,0,-33,-195,0
+-191,-554,0,-33,-195,0
+-191,-554,0,-33,-198,0
+-191,-554,0,-33,-198,0
+-191,-554,0,-33,-201,0
+-191,-554,0,-33,-201,0
+-202,-554,0,-33,-205,0
+-202,-554,0,-33,-205,0
+-202,-554,0,-33,-208,0
+-202,-554,0,-33,-208,0
+-202,-554,0,-33,-212,0
+-202,-554,0,-33,-212,0
+-213,-554,0,-33,-215,0
+-213,-554,0,-33,-215,0
+-213,-554,0,-33,-218,0
+-213,-554,0,-33,-218,0
+-213,-554,0,-33,-222,0
+-213,-554,0,-33,-222,0
+-224,-554,0,-33,-225,0
+-224,-554,0,-33,-225,0
+-224,-554,0,-33,-229,0
+-224,-554,0,-33,-229,0
+-224,-554,0,-33,-232,0
+-224,-554,0,-33,-232,0
+-224,-554,0,-33,-235,0
+-224,-554,0,-33,-235,0
+-236,-554,0,-33,-239,0
+-236,-554,0,-33,-239,0
+-236,-554,0,-33,-242,0
+-236,-554,0,-33,-242,0
+-236,-554,0,-33,-245,0
+-236,-554,0,-33,-245,0
+-247,-554,0,-33,-249,0
+-247,-554,0,-33,-249,0
+-247,-554,0,-33,-252,0
+-247,-554,0,-33,-252,0
+-247,-554,0,-33,-256,0
+-247,-554,0,-33,-256,0
+-258,-554,0,-33,-259,0
+-258,-554,0,-33,-259,0
+-258,-554,0,-33,-262,0
+-258,-554,0,-33,-262,0
+
+效果还不是不太理想，收敛得慢，还是有震荡
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:00Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing slow convergence and oscillation causes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:00Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Tracing channel data to diagnose slow convergence**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:03Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming insufficient hold activation slows convergence**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:09Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Assessing pid.c threshold and spike handling**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Proposing local filter and parameter adjustments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:12Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing piecewise terminal patch for PID**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining hold engagement thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:19Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning tighter hold logic for target -6**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preparing local pid.c modifications**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refactoring hold threshold logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adding PID output clamping near target -6**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:30Z)**_
+
+问题已经更具体了：这版不是“完全失控”，而是 `-6.0` 附近**收得太软、hold 又进得太早**。从你后面这一长段 `Y=-5.54`、`ch3≈-0.33`、`ch4≈-1.5°` 可以直接看出，外环在终点前给的目标速度太小，所以它会慢慢磨、然后带着残余能量再摆。
+
+_**Agent (claude-opus-4-8 2026-08-03 04:59:48Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:00:00Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:00:22Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:01:01Z)**_
+
+我把这版补丁往“更快收、但别太早 hold”方向推了一步：`-6.0` 的保持窗现在比全局更窄，近端滤波更快，外环限速改成了分档，而不是一上来就死压在 `±1.2`。这样最后一厘米不会磨太久。再编译确认。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:01:07Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild firmware after tuning -6 landing patch
+
+`cmake --build /d/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       37992 B         1 MB      3.62%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:01:29Z)**_
+
+这版我已经按你这组现象继续收了一次，方向是：
+
+**减少 `-6.0` 附近“拖很久才进去”的问题，同时把 hold 触发收紧，避免还没真正到点就提前锁住。**
+
+改动还都只在 [Core/Src/pid.c](Core/Src/pid.c) 里，对全局别的点没动。
+
+这次具体改了三件事：
+
+1. **`-6.0` 的保持窗单独收紧**
+   - 不再用全局 `0.5 / 0.6`
+   - 改成：
+     - `enter = 0.18cm`
+     - `exit = 0.28cm`
+   - 这样不会在 `-5.54` 这种位置就过早进入 hold
+
+2. **`-6.0` 近端滤波加快**
+   - 原来低通系数是 `0.25`
+   - 现在改成 `0.45`
+   - 目的是减少末端相位滞后，不让它因为“看得太慢”而拖尾
+
+3. **`-6.0` 近端外环限速改成分档**
+   - 原来近端一律压到 `±1.2 cm/s`
+   - 现在改成：
+     - `|error| <= 0.35cm` 时限到 `±0.70`
+     - `0.35 < |error| <= 0.8cm` 时限到 `±1.80`
+   - 这样最后一小段还能快点收，不会整个末端都磨
+
+同时，`hold` 之后的 `-6.0` 小偏置保持也收紧了：
+
+- 回差从 `0.12cm` 改成 `0.08cm`
+- 偏置从 `0.18` 改成 `0.22`
+
+目的是让它真正停住后更愿意贴着 `-6.0`，而不是停在边上晃。
+
+编译已经过了：
+
+- `FLASH: 37992 B`
+- `RAM: 3496 B`
+
+从你刚才那组数据看，主要问题确实就是两点：
+
+- `-6.0` 附近外环被压得太软，最后一段拖得久
+- 保持区过早接手，导致还没真收住就开始锁
+
+这版就是针对这两个点下手的。  
+你现在再跑一组，重点看：
+
+- `ch1` 到 `-5.8 ~ -6.0` 这一段是否明显更快靠近
+- `ch3` 是否不再长期挂在 `-0.33 / -0.34` 这种很小的值慢磨
+- 进入 hold 后是否还会频繁从 `-6.0` 两侧来回出窗
+
+如果这版后还剩轻微震荡，下一步就不该再大改结构了，而是只调这四个局部数字：
+
+- `0.18 / 0.28`
+- `0.70 / 1.80`
+- `0.08`
+- `0.22`
+
+现在已经是局部落点调校阶段，不是大逻辑阶段了。
+
+---
+
+_**User (2026-08-03 05:08:17Z)**_
+
+179,495,0,112,-230,550
+-179,495,0,112,-230,550
+-89,495,488,112,-96,413
+-89,495,488,112,-96,413
+-112,503,0,97,-116,414
+-112,503,509,97,-116,414
+-134,512,509,83,-135,416
+-134,512,0,83,-135,416
+-33,512,0,83,-34,312
+-33,512,550,83,-34,312
+-67,520,0,68,-78,339
+-67,520,0,68,-78,339
+0,520,490,68,3,254
+0,520,490,68,3,254
+-89,537,508,-383,-692,-9
+-89,537,0,-383,-692,-9
+-191,537,0,-594,-1000,193
+-191,537,464,-594,-1000,193
+-292,545,464,-713,-1000,344
+-292,545,536,-713,-1000,344
+-393,554,0,-782,-1000,458
+-393,554,0,-782,-1000,458
+-494,554,496,-819,-1000,543
+-494,554,496,-819,-1000,543
+-596,562,0,-843,-1000,607
+-596,562,497,-843,-1000,607
+-686,570,497,-858,-1000,655
+-686,570,0,-858,-1000,655
+-787,570,0,-867,-1000,636
+-787,570,536,-867,-1000,636
+-888,579,0,-875,-1000,603
+-888,579,0,-875,-1000,603
+-989,579,0,-879,-1000,522
+-989,579,0,-879,-1000,522
+-989,587,499,-884,-1000,477
+-989,587,0,-884,-1000,477
+-989,587,0,-887,-1000,405
+-989,587,465,-887,-1000,405
+-989,596,465,-891,-1000,377
+-989,596,0,-891,-1000,377
+-989,596,0,-894,-1000,322
+-989,596,0,-894,-1000,322
+-989,596,0,-895,-1000,264
+-989,596,0,-895,-1000,264
+-989,596,0,-896,-1000,210
+-989,596,0,-896,-1000,210
+-989,596,0,-896,-1000,164
+-989,596,0,-896,-1000,164
+-989,596,0,-896,-1000,127
+-989,596,0,-896,-1000,127
+-989,596,0,-896,-1000,97
+-989,596,0,-896,-1000,97
+-989,596,-497,-896,-1000,74
+-989,596,-497,-896,-1000,74
+-989,587,0,-894,-1000,8
+-989,587,0,-894,-1000,8
+-989,579,-509,-889,-1000,-66
+-989,579,0,-889,-1000,-66
+-989,579,0,-887,-1000,-89
+-989,579,-542,-887,-1000,-89
+-989,570,-542,-883,-1000,-136
+-989,570,0,-883,-1000,-136
+-989,570,-497,-880,-1000,-140
+-989,570,-497,-880,-1000,-140
+-989,554,-501,-873,-1000,-220
+-989,554,-501,-873,-1000,-220
+-989,545,-502,-867,-1000,-276
+-989,545,-471,-867,-1000,-276
+-989,537,-471,-860,-1000,-315
+-989,537,-1522,-860,-1000,-315
+-899,512,-1522,-848,-854,-436
+-899,512,0,-848,-854,-436
+-877,512,-512,-842,-880,-438
+-877,512,-512,-842,-880,-438
+-911,503,0,-835,-911,-436
+-911,503,0,-835,-911,-436
+-933,495,-503,-829,-941,-434
+-933,495,-503,-829,-941,-434
+-832,461,-1983,-814,-755,-525
+-832,461,-503,-814,-755,-525
+-731,453,-503,-803,-644,-577
+-731,453,-1362,-803,-644,-577
+-641,428,-1362,-788,-522,-633
+-641,428,-503,-788,-522,-633
+-539,419,-496,-777,-463,-655
+-539,419,-496,-777,-463,-655
+-438,386,-1482,-760,-370,-691
+-438,386,-1482,-760,-370,-691
+-337,377,-518,-748,-301,-718
+-337,377,-508,-748,-301,-718
+-314,369,-508,-738,-318,-699
+-314,369,-2000,-738,-318,-699
+-236,335,-2000,-722,-245,-724
+-236,335,-499,-722,-245,-724
+-179,327,-1507,-710,-188,-743
+-179,327,-1507,-710,-188,-743
+-123,293,-495,-692,-125,-757
+-123,293,-495,-692,-125,-757
+-56,260,-1922,-670,-60,-768
+-56,260,-502,-670,-60,-768
+0,251,-502,-656,-8,-776
+0,251,-533,-656,-8,-776
+0,243,-533,-645,-2,-762
+0,243,-2443,-645,-2,-762
+56,201,-506,-625,63,-771
+56,201,-506,-625,63,-771
+123,167,-1530,-603,133,-778
+123,167,-1530,-603,133,-778
+191,142,-1508,-582,198,-784
+191,142,-502,-582,198,-784
+247,134,-502,-567,252,-788
+247,134,-1502,-567,252,-788
+303,108,-1502,-551,310,-791
+303,108,-497,-551,310,-791
+348,100,-2012,-539,355,-790
+348,100,-2012,-539,355,-790
+416,58,-504,-519,423,-792
+416,58,-504,-519,423,-792
+494,24,-1976,-496,496,-794
+494,24,-508,-496,496,-794
+551,16,-508,-481,556,-796
+551,16,-1503,-481,556,-796
+618,-8,-1503,-464,621,-797
+618,-8,-505,-464,621,-797
+674,-17,-503,-451,678,-797
+674,-17,-503,-451,678,-797
+652,-25,-2511,-442,655,-756
+652,-25,-2511,-442,655,-756
+742,-76,-500,-420,747,-767
+742,-76,-496,-420,747,-767
+821,-84,-496,-405,825,-775
+821,-84,-2013,-405,825,-775
+899,-117,-2013,-385,909,-781
+899,-117,-497,-385,909,-781
+967,-126,-2056,-371,975,-786
+967,-126,-2056,-371,975,-786
+989,-160,-503,-353,1000,-789
+989,-160,-503,-353,1000,-789
+989,-176,-497,-336,1000,-792
+989,-176,-1502,-336,1000,-792
+989,-202,-1502,-319,1000,-794
+989,-202,-501,-319,1000,-794
+989,-210,-501,-307,1000,-795
+989,-210,-484,-307,1000,-795
+989,-218,-484,-297,1000,-757
+989,-218,-1561,-297,1000,-757
+989,-244,-495,-283,1000,-768
+989,-244,-495,-283,1000,-768
+989,-260,-495,-270,1000,-776
+989,-260,-495,-270,1000,-776
+989,-260,0,-263,1000,-703
+989,-260,-504,-263,1000,-703
+922,-269,-504,-256,924,-641
+922,-269,-509,-256,924,-641
+843,-277,-509,-249,847,-591
+843,-277,-506,-249,847,-591
+787,-286,-503,-243,788,-551
+787,-286,-503,-243,788,-551
+888,-319,-1484,-228,923,-613
+888,-319,-1484,-228,923,-613
+978,-328,-507,-217,996,-643
+978,-328,0,-217,996,-643
+899,-328,0,-211,902,-584
+899,-328,0,-211,902,-584
+798,-328,0,-208,749,-493
+798,-328,-500,-208,749,-493
+697,-336,0,-203,678,-448
+697,-336,0,-203,678,-448
+641,-344,-499,-198,649,-426
+641,-344,-499,-198,649,-426
+641,-353,-503,-192,642,-416
+641,-353,0,-192,642,-416
+551,-353,0,-189,558,-365
+551,-353,-491,-189,558,-365
+539,-361,-491,-184,540,-350
+539,-361,0,-184,540,-350
+461,-361,0,-181,465,-305
+461,-361,0,-181,465,-305
+371,-361,0,-180,375,-251
+371,-361,0,-180,375,-251
+281,-361,0,-179,288,-201
+281,-361,0,-179,288,-201
+202,-361,0,-179,211,-158
+202,-361,0,-179,211,-158
+134,-361,0,-179,143,-122
+134,-361,0,-179,143,-122
+78,-361,497,-178,85,-94
+78,-361,497,-178,85,-94
+-11,-353,0,-181,-57,-24
+-11,-353,0,-181,-57,-24
+-112,-353,0,-183,-133,7
+-112,-353,502,-183,-133,7
+-213,-344,502,-186,-269,66
+-213,-344,0,-186,-269,66
+-303,-344,0,-188,-330,83
+-303,-344,501,-188,-330,83
+-404,-336,0,-192,-447,128
+-404,-336,0,-192,-447,128
+-506,-328,497,-197,-584,179
+-506,-328,497,-197,-584,179
+-607,-319,508,-203,-721,227
+-607,-319,0,-203,-721,227
+-708,-319,0,-206,-759,222
+-708,-319,0,-206,-759,222
+-753,-319,0,-208,-755,194
+-753,-319,498,-208,-755,194
+-821,-311,0,-211,-828,208
+-821,-311,0,-211,-828,208
+-922,-302,503,-216,-934,238
+-922,-302,503,-216,-934,238
+-956,-302,0,-219,-957,223
+-956,-302,0,-219,-957,223
+-944,-302,0,-221,-946,192
+-944,-302,0,-221,-946,192
+-911,-302,0,-221,-914,158
+-911,-302,0,-221,-914,158
+-854,-302,514,-222,-859,125
+-854,-302,514,-222,-859,125
+-888,-294,0,-225,-899,145
+-888,-294,0,-225,-899,145
+-877,-294,0,-227,-888,137
+-877,-294,0,-227,-888,137
+-854,-294,0,-228,-856,118
+-854,-294,0,-228,-856,118
+-809,-294,0,-228,-820,97
+-809,-294,0,-228,-820,97
+-776,-294,0,-228,-786,77
+-776,-294,0,-228,-786,77
+-753,-294,0,-229,-757,61
+-753,-294,0,-229,-757,61
+-731,-294,0,-229,-733,47
+-731,-294,0,-229,-733,47
+-708,-294,0,-229,-714,36
+-708,-294,0,-229,-714,36
+-697,-294,0,-229,-699,27
+-697,-294,0,-229,-699,27
+-686,-294,0,-229,-687,20
+-686,-294,-501,-229,-687,20
+-584,-302,0,-226,-591,-31
+-584,-302,0,-226,-591,-31
+-483,-311,-504,-221,-469,-96
+-483,-311,-504,-221,-469,-96
+-427,-311,0,-219,-436,-112
+-427,-311,0,-219,-436,-112
+-348,-319,-502,-215,-357,-153
+-348,-319,0,-215,-357,-153
+-348,-319,0,-213,-354,-153
+-348,-319,0,-213,-354,-153
+-371,-319,0,-211,-382,-136
+-371,-319,-545,-211,-382,-136
+-326,-328,-496,-208,-332,-160
+-326,-328,-496,-208,-332,-160
+-247,-336,0,-203,-255,-200
+-247,-336,0,-203,-255,-200
+-168,-344,-497,-198,-170,-241
+-168,-344,0,-198,-170,-241
+-168,-344,0,-195,-179,-231
+-168,-344,-467,-195,-179,-231
+-134,-353,-467,-190,-135,-248
+-134,-353,-549,-190,-135,-248
+-67,-361,0,-185,-71,-274
+-67,-361,0,-185,-71,-274
+0,-370,-504,-179,-1,-301
+0,-370,-504,-179,-1,-301
+56,-378,-504,-173,67,-326
+56,-378,-496,-173,67,-326
+123,-386,-496,-167,132,-346
+123,-386,-468,-167,132,-346
+191,-395,-468,-161,192,-363
+191,-395,-553,-161,192,-363
+247,-403,0,-154,248,-376
+247,-403,0,-154,248,-376
+292,-412,-503,-148,301,-387
+292,-412,-503,-148,301,-387
+258,-412,0,-145,259,-347
+258,-412,-486,-145,259,-347
+269,-420,-486,-140,273,-339
+269,-420,0,-140,273,-339
+213,-420,0,-137,221,-298
+213,-420,-545,-137,221,-298
+236,-428,0,-133,238,-294
+236,-428,0,-133,238,-294
+281,-437,-504,-128,287,-307
+281,-437,-504,-128,287,-307
+247,-437,0,-125,256,-278
+247,-437,-490,-125,256,-278
+281,-445,-490,-121,287,-281
+281,-445,0,-121,287,-281
+247,-445,0,-118,252,-251
+247,-445,-552,-118,252,-251
+281,-454,-493,-114,285,-258
+281,-454,-493,-114,285,-258
+337,-462,0,-109,347,-279
+337,-462,0,-109,347,-279
+416,-470,-506,-103,420,-303
+416,-470,0,-103,420,-303
+393,-470,0,-100,401,-279
+393,-470,0,-100,401,-279
+337,-470,0,-98,345,-238
+337,-470,0,-98,345,-238
+269,-470,0,-98,280,-194
+269,-470,0,-98,280,-194
+213,-470,0,-97,217,-154
+213,-470,0,-97,217,-154
+157,-470,0,-97,160,-120
+157,-470,0,-97,160,-120
+101,-470,0,-97,112,-92
+101,-470,0,-97,112,-92
+67,-470,0,-97,71,-71
+67,-470,0,-97,71,-71
+33,-470,0,-96,37,-54
+33,-470,0,-96,37,-54
+0,-470,0,-96,9,-41
+0,-470,0,-96,9,-41
+-11,-470,0,-96,-14,-31
+-11,-470,495,-96,-14,-31
+-112,-462,495,-99,-128,23
+-112,-462,0,-99,-128,23
+-179,-462,0,-101,-180,43
+-179,-462,540,-101,-180,43
+-269,-454,0,-104,-295,94
+-269,-454,0,-104,-295,94
+-337,-454,504,-107,-337,104
+-337,-454,504,-107,-337,104
+-427,-445,0,-110,-439,144
+-427,-445,0,-110,-439,144
+-461,-445,0,-113,-469,144
+-461,-445,470,-113,-469,144
+-551,-437,470,-117,-560,175
+-551,-437,0,-117,-560,175
+-573,-437,0,-119,-580,168
+-573,-437,0,-119,-580,168
+-562,-437,0,-120,-571,146
+-562,-437,0,-120,-571,146
+-551,-437,0,-121,-552,121
+-551,-437,0,-121,-552,121
+-528,-437,0,-121,-532,97
+-528,-437,0,-121,-532,97
+-506,-437,0,-121,-516,76
+-506,-437,0,-121,-516,76
+-494,-437,0,-121,-504,58
+-494,-437,0,-121,-504,58
+-494,-437,0,-122,-497,45
+-494,-437,0,-122,-497,45
+-483,-437,0,-122,-493,34
+-483,-437,0,-122,-493,34
+-483,-437,0,-122,-494,26
+-483,-437,0,-122,-494,26
+-494,-437,0,-122,-497,19
+-494,-437,0,-122,-497,19
+-483,-437,0,-122,-489,14
+-483,-437,0,-122,-489,14
+-472,-437,0,-122,-483,11
+-472,-437,0,-122,-483,11
+-472,-437,0,-122,-478,8
+-472,-437,0,-122,-478,8
+-472,-437,0,-122,-474,6
+-472,-437,0,-122,-474,6
+-461,-437,0,-122,-472,4
+-461,-437,0,-122,-472,4
+-461,-437,0,-122,-469,3
+-461,-437,0,-122,-469,3
+-461,-437,0,-122,-468,2
+-461,-437,-501,-122,-468,2
+-371,-445,0,-119,-379,-45
+-371,-445,0,-119,-379,-45
+-348,-445,0,-117,-351,-59
+-348,-445,0,-117,-351,-59
+-258,-454,-499,-114,-263,-106
+-258,-454,0,-114,-263,-106
+-236,-454,0,-111,-246,-113
+-236,-454,0,-111,-246,-113
+-258,-454,0,-110,-262,-103
+-258,-454,-502,-110,-262,-103
+-191,-462,0,-107,-198,-135
+-191,-462,0,-107,-198,-135
+-101,-470,-502,-102,-103,-180
+-101,-470,-502,-102,-103,-180
+-89,-470,0,-100,-93,-178
+-89,-470,-500,-100,-93,-178
+-22,-479,-500,-95,-29,-205
+-22,-479,-500,-95,-29,-205
+-33,-479,-500,-93,-36,-192
+-33,-479,-500,-93,-36,-192
+-67,-479,0,-92,-73,-166
+-67,-479,0,-92,-73,-166
+-22,-487,-500,-88,-27,-183
+-22,-487,-500,-88,-27,-183
+-33,-487,0,-86,-39,-170
+-33,-487,-503,-86,-39,-170
+11,-496,-503,-82,18,-192
+11,-496,0,-82,18,-192
+0,-496,0,-80,10,-180
+0,-496,-497,-80,10,-180
+67,-504,0,-76,68,-202
+67,-504,0,-76,68,-202
+56,-504,0,-74,59,-188
+56,-504,0,-74,59,-188
+22,-504,0,-73,23,-161
+22,-504,0,-73,23,-161
+-11,-504,0,-72,-20,-132
+-11,-504,-500,-72,-20,-132
+22,-512,-500,-69,28,-152
+22,-512,0,-69,28,-152
+22,-512,-502,-67,23,-143
+22,-512,-502,-67,23,-143
+78,-521,0,-63,89,-171
+78,-521,0,-63,89,-171
+78,-521,0,-61,89,-163
+78,-521,-507,-61,89,-163
+146,-529,-507,-57,154,-188
+146,-529,0,-57,154,-188
+146,-529,0,-55,151,-178
+146,-529,0,-55,151,-178
+112,-529,0,-54,120,-153
+112,-529,0,-54,120,-153
+78,-529,-502,-53,81,-126
+78,-529,-502,-53,81,-126
+123,-538,0,-50,134,-148
+123,-538,0,-50,134,-148
+123,-538,0,-48,133,-140
+123,-538,0,-48,133,-140
+101,-538,0,-47,109,-121
+101,-538,0,-47,109,-121
+67,-538,0,-47,77,-99
+67,-538,0,-47,77,-99
+44,-538,0,-46,46,-79
+44,-538,0,-46,46,-79
+11,-538,0,-46,18,-62
+11,-538,0,-46,18,-62
+0,-538,0,-46,-6,-48
+0,-538,0,-46,-6,-48
+-22,-538,0,-46,-26,-37
+-22,-538,0,-46,-26,-37
+-33,-538,0,-46,-44,-28
+-33,-538,0,-46,-44,-28
+-56,-538,502,-46,-58,-21
+-56,-538,502,-46,-58,-21
+-157,-529,0,-49,-163,31
+-157,-529,0,-49,-163,31
+-202,-529,0,-50,-207,49
+-202,-529,509,-50,-207,49
+-303,-521,509,-54,-315,98
+-303,-521,509,-54,-315,98
+-348,-521,509,-56,-351,107
+-348,-521,509,-56,-351,107
+-348,-521,509,-57,-355,99
+-348,-521,509,-57,-355,99
+-337,-521,0,-58,-344,84
+-337,-521,0,-58,-344,84
+-326,-521,0,-58,-331,69
+-326,-521,0,-58,-331,69
+-314,-521,0,-58,-317,54
+-314,-521,0,-58,-317,54
+-303,-521,0,-58,-307,42
+-303,-521,0,-58,-307,42
+-292,-521,125,-59,-299,33
+-292,-521,125,-59,-299,33
+-382,-512,0,-61,-386,72
+-382,-512,0,-61,-386,72
+-416,-512,0,-63,-418,80
+-416,-512,0,-63,-418,80
+-416,-512,0,-64,-423,74
+-416,-512,0,-64,-423,74
+-416,-512,0,-64,-418,64
+-416,-512,0,-64,-418,64
+-404,-512,0,-65,-410,52
+-404,-512,0,-65,-410,52
+-393,-512,0,-65,-402,41
+-393,-512,0,-65,-402,41
+-393,-512,0,-65,-396,32
+-393,-512,0,-65,-396,32
+-382,-512,0,-65,-392,25
+-382,-512,0,-65,-392,25
+-382,-512,0,-65,-390,19
+-382,-512,0,-65,-390,19
+-382,-512,0,-65,-390,14
+-382,-512,0,-65,-390,14
+-382,-512,0,-65,-383,11
+-382,-512,0,-65,-383,11
+-371,-512,0,-65,-379,8
+-371,-512,0,-65,-379,8
+-371,-512,0,-65,-375,6
+-371,-512,0,-65,-375,6
+-371,-512,0,-65,-372,4
+-371,-512,0,-65,-372,4
+-359,-512,0,-65,-370,3
+-359,-512,0,-65,-370,3
+-359,-512,0,-65,-369,2
+-359,-512,0,-65,-369,2
+-359,-512,0,-65,-368,2
+-359,-512,0,-65,-368,2
+-359,-512,0,-65,-367,1
+-359,-512,0,-65,-367,1
+-359,-512,0,-65,-366,1
+-359,-512,0,-65,-366,1
+-359,-512,-502,-65,-365,0
+-359,-512,-502,-65,-365,0
+-269,-521,0,-62,-277,-46
+-269,-521,0,-62,-277,-46
+-247,-521,0,-61,-250,-60
+-247,-521,0,-61,-250,-60
+-157,-529,-508,-57,-157,-107
+-157,-529,0,-57,-157,-107
+-134,-529,0,-55,-135,-114
+-134,-529,-503,-55,-135,-114
+-44,-538,-503,-51,-53,-151
+-44,-538,0,-51,-53,-151
+-33,-538,0,-49,-42,-149
+-33,-538,0,-49,-42,-149
+-56,-538,0,-47,-62,-132
+-56,-538,0,-47,-62,-132
+0,-546,-502,-44,-1,-157
+0,-546,-502,-44,-1,-157
+0,-546,0,-42,0,-150
+0,-546,0,-42,0,-150
+-22,-546,0,-41,-24,-130
+-22,-546,0,-41,-24,-130
+-56,-546,0,-40,-56,-107
+-56,-546,-527,-40,-56,-107
+0,-554,0,-37,3,-133
+0,-554,0,-37,3,-133
+0,-554,0,-36,8,-128
+0,-554,0,-36,8,-128
+0,-554,0,-35,-11,-112
+0,-554,0,-35,-11,-112
+-33,-554,0,-34,-38,-93
+-33,-554,0,-34,-38,-93
+-56,-554,0,-34,-65,-74
+-56,-554,0,-34,-65,-74
+-89,-554,0,-34,-91,-58
+-89,-554,0,-34,-91,-58
+-112,-554,0,-34,-113,-45
+-112,-554,0,-34,-113,-45
+-123,-554,0,-33,-131,-34
+-123,-554,0,-33,-131,-34
+-146,-554,0,-33,-146,-26
+-146,-554,0,-33,-146,-26
+-157,-554,0,-33,-159,-20
+-157,-554,0,-33,-159,-20
+-168,-554,0,-33,-169,-15
+-168,-554,0,-33,-169,-15
+-168,-554,0,-33,-178,-11
+-168,-554,0,-33,-178,-11
+-179,-554,0,-33,-185,-8
+-179,-554,0,-33,-185,-8
+-191,-554,0,-33,-192,-6
+-191,-554,468,-33,-192,-6
+-281,-546,468,-36,-290,42
+-281,-546,0,-36,-290,42
+-326,-546,0,-38,-329,57
+-326,-546,0,-38,-329,57
+-337,-546,0,-39,-340,57
+-337,-546,0,-39,-340,57
+-337,-546,0,-39,-339,51
+-337,-546,0,-39,-339,51
+-326,-546,0,-39,-333,42
+-326,-546,0,-39,-333,42
+-326,-546,0,-40,-326,34
+-326,-546,0,-40,-326,34
+-314,-546,0,-40,-320,27
+-314,-546,0,-40,-320,27
+-404,-538,522,-42,-408,68
+-404,-538,522,-42,-408,68
+-438,-538,0,-44,-440,77
+-438,-538,0,-44,-440,77
+-438,-538,0,-45,-444,72
+-438,-538,472,-45,-444,72
+-517,-529,472,-48,-527,109
+-517,-529,0,-48,-527,109
+-528,-529,0,-50,-535,112
+-528,-529,0,-50,-535,112
+-506,-529,0,-51,-517,101
+-506,-529,0,-51,-517,101
+-573,-521,495,-54,-577,132
+-573,-521,0,-54,-577,132
+-573,-521,0,-56,-577,130
+-573,-521,0,-56,-577,130
+-551,-521,0,-57,-552,114
+-551,-521,0,-57,-552,114
+-517,-521,257,-58,-519,95
+-517,-521,257,-58,-519,95
+-573,-512,0,-61,-574,124
+-573,-512,0,-61,-574,124
+-573,-512,0,-63,-573,121
+-573,-512,0,-63,-573,121
+-539,-512,0,-64,-550,107
+-539,-512,0,-64,-550,107
+-517,-512,0,-64,-519,89
+-517,-512,0,-64,-519,89
+-483,-512,0,-65,-489,71
+-483,-512,0,-65,-489,71
+-461,-512,0,-65,-462,56
+-461,-512,0,-65,-462,56
+-438,-512,0,-65,-440,43
+-438,-512,0,-65,-440,43
+-337,-521,-499,-62,-335,-13
+-337,-521,0,-62,-335,-13
+-292,-521,0,-60,-294,-35
+-292,-521,0,-60,-294,-35
+-281,-521,0,-60,-283,-40
+-281,-521,0,-60,-283,-40
+-281,-521,0,-59,-287,-38
+-281,-521,0,-59,-287,-38
+-292,-521,0,-59,-296,-33
+-292,-521,0,-59,-296,-33
+-213,-529,-508,-56,-216,-74
+-213,-529,-469,-56,-216,-74
+-112,-538,-469,-51,-103,-130
+-112,-538,0,-51,-103,-130
+-67,-538,0,-49,-75,-138
+-67,-538,0,-49,-75,-138
+-78,-538,0,-48,-86,-126
+-78,-538,0,-48,-86,-126
+-112,-538,0,-47,-112,-107
+-112,-538,0,-47,-112,-107
+-44,-546,-501,-44,-50,-134
+-44,-546,0,-44,-50,-134
+-44,-546,0,-42,-45,-130
+-44,-546,0,-42,-45,-130
+-56,-546,0,-41,-64,-114
+-56,-546,0,-41,-64,-114
+-89,-546,0,-40,-92,-94
+-89,-546,0,-40,-92,-94
+-112,-546,0,-40,-121,-76
+-112,-546,0,-40,-121,-76
+-146,-546,0,-40,-147,-59
+-146,-546,0,-40,-147,-59
+-168,-546,0,-40,-170,-46
+-168,-546,0,-40,-170,-46
+-179,-546,0,-40,-189,-35
+-179,-546,0,-40,-189,-35
+-202,-546,0,-40,-205,-27
+-202,-546,0,-40,-205,-27
+-213,-546,0,-40,-219,-20
+-213,-546,0,-40,-219,-20
+-224,-546,0,-40,-230,-15
+-224,-546,0,-40,-230,-15
+-236,-546,0,-40,-239,-11
+-236,-546,-505,-40,-239,-11
+-146,-554,-505,-37,-155,-56
+-146,-554,0,-37,-155,-56
+-123,-554,0,-35,-128,-68
+-123,-554,0,-35,-128,-68
+-123,-554,0,-34,-128,-65
+-123,-554,0,-34,-128,-65
+-134,-554,0,-34,-140,-56
+-134,-554,0,-34,-140,-56
+-146,-554,0,-34,-156,-47
+-146,-554,0,-34,-156,-47
+-168,-554,0,-34,-171,-37
+-168,-554,0,-34,-171,-37
+-179,-554,0,-33,-186,-29
+-179,-554,0,-33,-186,-29
+-191,-554,0,-33,-198,-22
+-191,-554,0,-33,-198,-22
+-202,-554,0,-33,-209,-17
+-202,-554,0,-33,-209,-17
+-213,-554,0,-33,-219,-13
+
+根据这组数据，我觉得球刹车太早了，优化一下从+方向往-方向这段代码
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:33Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing segment data for optimization**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Diagnosing early braking near midpoint**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:37Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning asymmetric target speed logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:42Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing velocity sign conventions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:44Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning region-based target speed floor**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:46Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing conditional near-end speed clamp**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:52Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Assessing early braking region**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning adaptive speed enforcement**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:08:55Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying overshoot behavior near target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:02Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing speed loop saturation effects**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:02Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning phase-specific cruise speed adjustment**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:05Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Formulating negative cruise speed patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:09Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting braking thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:09Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Implementing piecewise braking thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:11Z)**_
+
+这组里确实能看到“中途收油太早”：离 `-6.0` 还远的时候，`ch3` 已经掉到 `-1.8 ~ -2.4` 一档了，球在 `-3 ~ -5` 区间就开始明显减速。我要在第二段 `-6.0` 目标上加一个**回程巡航底速**，只在离目标还远时托住外环目标速度，最后 `1.2cm` 内还是交给现有落点补丁细收。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:25Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:31Z)**_
+
+我只动了“从正方向回到 `-6.0` 这一段”的外环目标速度，不碰你后面 `-6.0` 落点补丁。现在离目标还远时会强制维持一个最低负目标速度，避免在 `-3 ~ -5` 中途就开始明显刹车。编译确认一下。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:39Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild firmware after return-path speed tweak
+
+`cmake --build /d/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38128 B         1 MB      3.64%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:09:55Z)**_
+
+这组数据的判断我同意：**从 `+` 方向往 `-6.0` 回来的这段，外环收油太早了。**
+
+你日志里很明显能看到：
+
+- 球还在 `-3.0 ~ -5.0` 区间
+- `ch3` 已经掉到 `-1.8 ~ -2.4` 这种量级
+- 然后平台开始提前刹，导致后程拖长
+
+所以我刚刚只改了这一段“回程”的外环逻辑，不碰 `-6.0` 附近的落点补丁。
+
+改动位置还是 [Core/Src/pid.c](Core/Src/pid.c) 里 `pidY.out` 生成后那一段。
+
+## 这次改了什么
+
+对目标 `-6.0` 且还没进入 `hold` 的情况，增加了一个**回程巡航底速**：
+
+- 当 `relative_y > 2.0cm` 时  
+  如果外环目标速度还没到 `-3.2 cm/s`，就直接托到 `-3.2`
+
+- 当 `1.2cm < relative_y <= 2.0cm` 时  
+  如果外环目标速度还没到 `-2.2 cm/s`，就托到 `-2.2`
+
+- 进入最后 `1.2cm` 后  
+  还是交给你现有的 `-6.0` 终点补丁细收，不强推
+
+也就是说现在策略变成：
+
+1. **远处先保持一定回程速度，不要中途就刹**
+2. **最后 1.2cm 再开始认真做落点**
+
+这比单纯继续拉大 `Pos_P` 更可控，因为它只改“回程中段”的行为，不直接放大终点附近的冲击。
+
+## 为什么这样改
+
+你这组数据说明的问题不是“到不了负方向”，而是：
+
+- 中途目标速度掉得太快
+- 球还没到 `-6`，就已经开始明显减速
+- 最后整段靠慢磨和补偿去走，既慢又容易带振荡
+
+所以这次不是改刹车，而是**把中段巡航速度托住**。
+
+## 编译状态
+
+已经通过：
+
+- `FLASH: 38128 B`
+- `RAM: 3496 B`
+
+你现在再看下一组数据，重点看这三个现象：
+
+1. 从 `+5.6` 回负方向时，`ch3` 是否不再那么早掉到很小
+2. `ch1` 在 `-3 ~ -5` 区间是否跑得更利索
+3. 到 `-6.0` 附近后，是否仍然还能被现有落点补丁收住，而不是直接冲过头
+
+如果这版之后中段顺了，但终点又开始偏冲，那下一步就只需要再调这两个巡航底速值：
+
+- `-3.2`
+- `-2.2`
+
+现在这次改动是有针对性的，只修你说的“回正到回负这段刹太早”。
+
+---
+
+_**User (2026-08-03 05:12:11Z)**_
+
+-877,512,-1483,-841,-883,-472
+-776,478,-508,-826,-726,-554
+-776,478,-508,-826,-726,-554
+-674,469,-504,-815,-633,-596
+-674,469,-505,-815,-633,-596
+-618,461,-505,-806,-621,-594
+-618,461,-1991,-806,-621,-594
+-517,428,-1991,-790,-503,-645
+-517,428,-504,-790,-503,-645
+-416,419,-486,-779,-423,-679
+-416,419,-486,-779,-423,-679
+-326,377,-2012,-758,-334,-709
+-326,377,-2012,-758,-334,-709
+-269,369,-507,-744,-270,-732
+-269,369,-512,-744,-270,-732
+-258,360,-512,-733,-262,-726
+-258,360,-1506,-733,-262,-726
+-191,335,-1506,-719,-202,-744
+-191,335,-484,-719,-202,-744
+-191,327,-2083,-708,-193,-737
+-191,327,-2083,-708,-193,-737
+-123,293,-486,-691,-130,-753
+-123,293,-486,-691,-130,-753
+-56,251,-2006,-667,-58,-764
+-56,251,-522,-667,-58,-764
+0,243,-522,-651,-3,-773
+0,243,-1994,-651,-3,-773
+56,209,-1994,-631,58,-780
+56,209,-504,-631,58,-780
+101,201,-501,-617,107,-785
+101,201,-501,-617,107,-785
+168,159,-2014,-596,171,-788
+168,159,-2014,-596,171,-788
+224,134,-1427,-575,234,-791
+224,134,-531,-575,234,-791
+281,125,-531,-561,285,-793
+281,125,-1474,-561,285,-793
+337,100,-1474,-545,342,-795
+337,100,-510,-545,342,-795
+382,92,-2003,-533,384,-792
+382,92,-2003,-533,384,-792
+438,58,-506,-515,446,-794
+438,58,-506,-515,446,-794
+517,16,-2003,-491,521,-795
+517,16,-505,-491,521,-795
+573,8,-505,-475,583,-796
+573,8,-494,-475,583,-796
+618,0,-494,-463,627,-791
+618,0,-2011,-463,627,-791
+686,-34,-2011,-446,696,-793
+686,-34,-497,-446,696,-793
+753,-42,-512,-433,757,-795
+753,-42,-512,-433,757,-795
+832,-92,-2509,-409,840,-796
+832,-92,-505,-409,840,-796
+899,-101,-505,-393,910,-797
+899,-101,-486,-393,910,-797
+956,-109,-486,-382,961,-791
+956,-109,-503,-382,961,-791
+899,-117,-503,-372,906,-747
+899,-117,-2009,-372,906,-747
+956,-151,-504,-356,957,-760
+956,-151,-504,-356,957,-760
+989,-185,-1523,-335,1000,-770
+989,-185,-1523,-335,1000,-770
+989,-193,-494,-321,1000,-778
+989,-193,-502,-321,1000,-778
+989,-202,-502,-320,1000,-759
+989,-202,-1505,-320,1000,-759
+989,-227,-1505,-320,1000,-769
+989,-227,-494,-320,1000,-769
+989,-235,-519,-320,1000,-755
+989,-235,-519,-320,1000,-755
+989,-252,-488,-320,1000,-759
+989,-252,-488,-320,1000,-759
+944,-260,-504,-320,954,-722
+944,-260,0,-320,954,-722
+843,-260,0,-320,786,-626
+843,-260,-498,-320,786,-626
+753,-269,-498,-320,675,-563
+753,-269,-521,-320,675,-563
+652,-277,-503,-320,602,-521
+652,-277,-503,-320,602,-521
+629,-294,-487,-320,634,-539
+629,-294,-487,-320,634,-539
+539,-294,0,-320,541,-486
+539,-294,-501,-320,541,-486
+483,-302,-501,-320,490,-457
+483,-302,-503,-320,490,-457
+461,-311,-503,-320,461,-440
+461,-311,0,-320,461,-440
+359,-311,0,-320,363,-384
+359,-311,0,-320,363,-384
+258,-311,0,-320,246,-318
+258,-311,0,-320,246,-318
+213,-319,-511,-320,216,-302
+213,-319,0,-320,216,-302
+134,-319,0,-320,139,-261
+134,-319,-498,-320,139,-261
+134,-328,-498,-320,136,-262
+134,-328,0,-320,136,-262
+67,-328,0,-320,76,-233
+67,-328,0,-320,76,-233
+0,-328,0,-320,-2,-195
+0,-328,0,-320,-2,-195
+-78,-328,0,-320,-85,-157
+-78,-328,0,-320,-85,-157
+-157,-328,0,-320,-163,-124
+-157,-328,0,-320,-163,-124
+-224,-328,0,-320,-233,-96
+-224,-328,0,-320,-233,-96
+-292,-328,498,-320,-297,-74
+-292,-328,498,-320,-297,-74
+-393,-319,0,-320,-442,-9
+-393,-319,0,-320,-442,-9
+-494,-319,0,-320,-524,18
+-494,-319,0,-320,-524,18
+-573,-319,0,-320,-575,27
+-573,-319,0,-320,-575,27
+-607,-319,0,-320,-611,28
+-607,-319,0,-320,-611,28
+-641,-319,0,-320,-641,25
+-641,-319,0,-320,-641,25
+-663,-319,0,-320,-668,21
+-663,-319,0,-320,-668,21
+-764,-311,501,-320,-782,64
+-764,-311,0,-320,-782,64
+-832,-311,0,-320,-840,75
+-832,-311,0,-320,-840,75
+-776,-319,-498,-320,-784,23
+-776,-319,0,-320,-784,23
+-764,-319,0,-320,-774,0
+-764,-319,0,-320,-774,0
+-787,-319,0,-320,-788,-9
+-787,-319,0,-320,-788,-9
+-787,-319,-468,-320,-787,-12
+-787,-319,-468,-320,-787,-12
+-697,-328,0,-320,-705,-59
+-697,-328,0,-320,-705,-59
+-674,-328,0,-320,-683,-72
+-674,-328,-500,-320,-683,-72
+-596,-336,-500,-320,-605,-116
+-596,-336,-500,-320,-605,-116
+-596,-336,-500,-320,-596,-121
+-596,-336,0,-320,-596,-121
+-607,-336,0,-320,-616,-110
+-607,-336,0,-320,-616,-110
+-641,-336,0,-320,-646,-93
+-641,-336,0,-320,-646,-93
+-584,-344,-166,-320,-595,-122
+-584,-344,-502,-320,-595,-122
+-506,-353,-502,-320,-515,-168
+-506,-353,0,-320,-515,-168
+-506,-353,0,-320,-515,-168
+-506,-353,0,-320,-515,-168
+-539,-353,0,-320,-548,-149
+-539,-353,0,-320,-548,-149
+-584,-353,0,-320,-591,-124
+-584,-353,0,-320,-591,-124
+-483,-386,-502,-320,-303,-289
+-483,-386,-490,-320,-303,-289
+-382,-395,-490,-320,-153,-372
+-382,-395,0,-320,-153,-372
+-281,-395,0,-320,-162,-364
+-281,-395,-503,-320,-162,-364
+-191,-403,-464,-320,-152,-367
+-191,-403,-464,-320,-152,-367
+-89,-412,0,-220,50,-374
+-89,-412,0,-220,50,-374
+0,-420,-497,-220,80,-382
+0,-420,-501,-220,80,-382
+101,-428,-501,-220,111,-390
+101,-428,-500,-220,111,-390
+134,-437,-500,-220,140,-396
+134,-437,-505,-220,140,-396
+157,-445,-505,-220,167,-401
+157,-445,-448,-220,167,-401
+258,-462,-569,-220,280,-453
+258,-462,-569,-220,280,-453
+326,-470,-498,-220,336,-470
+326,-470,-509,-220,336,-470
+359,-479,-509,-220,364,-472
+359,-479,-501,-220,364,-472
+371,-487,-501,-220,379,-467
+371,-487,-503,-220,379,-467
+472,-496,-472,-86,638,-459
+472,-496,-472,-86,638,-459
+573,-504,0,-79,673,-452
+573,-504,0,-79,673,-452
+674,-512,-498,-73,710,-445
+674,-512,-504,-73,710,-445
+742,-521,-504,-66,749,-439
+742,-521,-502,-66,749,-439
+787,-529,-502,-60,789,-435
+787,-529,-507,-60,789,-435
+821,-538,-507,-54,832,-431
+821,-538,0,-54,832,-431
+866,-546,-547,-47,876,-428
+866,-546,-547,-47,876,-428
+821,-546,0,-44,829,-379
+821,-546,-488,-44,829,-379
+809,-554,-488,-39,816,-363
+809,-554,0,-39,816,-363
+731,-554,0,-37,738,-316
+731,-554,-505,-37,738,-316
+731,-563,-505,-32,732,-308
+731,-563,0,-32,732,-308
+663,-563,0,-30,669,-270
+663,-563,0,-30,669,-270
+584,-563,0,-29,591,-224
+584,-563,0,-29,591,-224
+506,-563,0,-28,515,-180
+506,-563,0,-28,515,-180
+438,-563,0,-28,448,-141
+438,-563,0,-28,448,-141
+382,-563,0,-27,393,-109
+382,-563,0,-27,393,-109
+348,-563,0,-27,348,-84
+348,-563,0,-27,348,-84
+303,-563,0,-27,314,-64
+303,-563,0,-27,314,-64
+281,-563,0,-27,287,-48
+281,-563,514,-27,287,-48
+179,-554,514,-30,174,10
+179,-554,0,-30,174,10
+123,-554,0,-32,124,33
+123,-554,0,-32,124,33
+101,-554,0,-32,105,39
+101,-554,0,-32,105,39
+0,-546,512,-36,8,84
+0,-546,512,-36,8,84
+-22,-546,0,-37,-23,93
+-22,-546,501,-37,-23,93
+-112,-538,501,-41,-118,134
+-112,-538,0,-41,-118,134
+-134,-538,0,-43,-143,135
+-134,-538,1429,-43,-143,135
+-236,-512,0,-53,-414,262
+-236,-512,0,-53,-414,262
+-337,-512,0,-58,-497,285
+-337,-512,0,-58,-497,285
+-438,-512,0,-61,-495,263
+-438,-512,500,-61,-495,263
+-539,-504,500,-66,-551,271
+-539,-504,504,-66,-551,271
+-629,-496,504,-71,-632,291
+-629,-496,0,-71,-632,291
+-618,-496,0,-74,-629,267
+-618,-496,459,-74,-629,267
+-674,-487,0,-78,-684,274
+-674,-487,0,-78,-684,274
+-764,-479,501,-84,-765,293
+-764,-479,501,-84,-765,293
+-843,-470,461,-89,-854,315
+-843,-470,506,-89,-854,315
+-944,-462,506,-220,-1000,336
+-944,-462,0,-220,-1000,336
+-989,-462,0,-220,-1000,307
+-989,-462,0,-220,-1000,307
+-989,-462,252,-220,-1000,260
+-989,-462,252,-220,-1000,260
+-989,-445,502,-220,-1000,306
+-989,-445,502,-220,-1000,306
+-989,-445,0,-220,-1000,291
+-989,-445,502,-220,-1000,291
+-989,-437,502,-220,-1000,299
+-989,-437,0,-220,-1000,299
+-989,-437,0,-220,-1000,268
+-989,-437,0,-220,-1000,268
+-989,-437,501,-220,-1000,226
+-989,-437,501,-220,-1000,226
+-989,-428,0,-220,-1000,230
+-989,-428,0,-220,-1000,230
+-989,-428,0,-220,-995,206
+-989,-428,0,-220,-995,206
+-933,-428,0,-220,-937,172
+-933,-428,0,-220,-937,172
+-877,-428,0,-220,-879,139
+-877,-428,0,-220,-879,139
+-821,-428,0,-220,-828,110
+-821,-428,0,-220,-828,110
+-776,-428,0,-220,-785,85
+-776,-428,0,-220,-785,85
+-742,-428,0,-220,-750,66
+-742,-428,0,-220,-750,66
+-719,-428,0,-220,-723,50
+-719,-428,0,-220,-723,50
+-697,-428,0,-220,-702,38
+-697,-428,-509,-220,-702,38
+-596,-437,-504,-220,-603,-18
+-596,-437,-504,-220,-603,-18
+-494,-445,0,-220,-483,-86
+-494,-445,0,-220,-483,-86
+-393,-454,-500,-220,-368,-152
+-393,-454,-506,-220,-368,-152
+-292,-462,-506,-220,-267,-209
+-292,-462,0,-220,-267,-209
+-258,-462,0,-220,-267,-209
+-258,-462,-501,-220,-267,-209
+-224,-470,0,-220,-225,-233
+-224,-470,0,-220,-225,-233
+-157,-479,-501,-220,-167,-264
+-157,-479,-501,-220,-167,-264
+-101,-487,-505,-220,-106,-294
+-101,-487,-503,-220,-106,-294
+0,-496,-503,-85,199,-320
+0,-496,0,-85,199,-320
+89,-496,0,-82,182,-295
+89,-496,0,-82,182,-295
+123,-496,-1005,-80,126,-252
+123,-496,-1005,-80,126,-252
+224,-529,0,-67,419,-389
+224,-529,0,-67,419,-389
+326,-538,-512,-58,586,-452
+326,-538,0,-58,586,-452
+416,-538,0,-52,589,-427
+416,-538,-502,-52,589,-427
+517,-546,-502,-47,617,-416
+517,-546,-482,-47,617,-416
+618,-554,0,-41,657,-412
+618,-554,0,-41,657,-412
+697,-563,-503,-35,704,-411
+697,-563,-503,-35,704,-411
+652,-563,0,-31,661,-364
+652,-563,-491,-31,661,-364
+674,-571,-491,-27,679,-351
+674,-571,-509,-27,679,-351
+573,-580,-509,-21,355,-153
+573,-580,-501,-21,355,-153
+483,-588,-503,-15,487,-211
+483,-588,-503,-15,487,-211
+584,-596,-504,-9,606,-259
+584,-596,-504,-9,606,-259
+686,-605,0,-3,712,-297
+686,-605,-494,-3,712,-297
+787,-613,-494,2,807,-326
+787,-613,0,2,807,-326
+787,-613,0,6,788,-301
+787,-613,0,6,788,-301
+708,-613,0,7,714,-257
+708,-613,-493,7,714,-257
+719,-622,0,11,721,-257
+719,-622,0,11,721,-257
+663,-622,0,13,674,-228
+663,-622,0,13,674,-228
+607,-622,0,15,610,-191
+607,-622,-489,15,610,-191
+629,-630,-489,18,634,-201
+629,-630,0,18,634,-201
+596,-630,0,20,605,-182
+596,-630,0,20,605,-182
+551,-630,0,21,558,-154
+551,-630,0,21,558,-154
+506,-630,0,22,508,-125
+506,-630,0,22,508,-125
+461,-630,0,22,463,-99
+461,-630,0,22,463,-99
+416,-630,0,22,425,-77
+416,-630,0,22,425,-77
+393,-630,0,22,394,-59
+393,-630,501,22,394,-59
+292,-622,0,19,282,1
+292,-622,0,19,282,1
+224,-622,0,18,234,26
+224,-622,0,18,234,26
+213,-622,0,17,218,34
+213,-622,0,17,218,34
+213,-622,0,17,217,33
+213,-622,0,17,217,33
+213,-622,0,16,223,29
+213,-622,515,16,223,29
+134,-613,0,13,138,71
+134,-613,0,13,138,71
+33,-605,500,9,19,128
+33,-605,500,9,19,128
+-11,-605,0,6,-13,137
+-11,-605,502,6,-13,137
+-89,-596,502,2,-100,172
+-89,-596,499,2,-100,172
+-191,-588,499,-2,-205,215
+-191,-588,0,-2,-205,215
+-213,-588,498,-5,-219,208
+-213,-588,498,-5,-219,208
+-281,-580,0,-9,-288,229
+-281,-580,0,-9,-288,229
+-371,-571,505,-14,-377,259
+-371,-571,0,-14,-377,259
+-371,-571,0,-17,-379,242
+-371,-571,496,-17,-379,242
+-427,-563,496,-22,-437,255
+-427,-563,0,-22,-437,255
+-416,-563,0,-24,-426,232
+-416,-563,0,-24,-426,232
+-472,-554,504,-28,-481,243
+-472,-554,504,-28,-481,243
+-562,-546,500,-33,-563,268
+-562,-546,501,-33,-563,268
+-652,-538,501,-39,-654,295
+-652,-538,0,-39,-654,295
+-652,-538,0,-42,-653,273
+-652,-538,490,-42,-653,273
+-697,-529,0,-47,-706,280
+-697,-529,0,-47,-706,280
+-686,-529,0,-49,-691,252
+-686,-529,0,-49,-691,252
+-641,-529,0,-51,-649,212
+-641,-529,0,-51,-649,212
+-596,-529,0,-51,-602,171
+-596,-529,493,-51,-602,171
+-641,-521,493,-55,-651,182
+-641,-521,0,-55,-651,182
+-641,-521,502,-56,-641,167
+-641,-521,502,-56,-641,167
+-686,-512,502,-60,-686,188
+-686,-512,502,-60,-686,188
+-663,-512,502,-62,-669,176
+-663,-512,502,-62,-669,176
+-618,-512,502,-63,-627,151
+-618,-512,502,-63,-627,151
+-573,-512,0,-64,-580,124
+-573,-512,0,-64,-580,124
+-528,-512,0,-64,-537,99
+-528,-512,0,-64,-537,99
+-494,-512,0,-65,-499,77
+-494,-512,0,-65,-499,77
+-461,-512,0,-65,-469,59
+-461,-512,0,-65,-469,59
+-438,-512,0,-65,-444,45
+-438,-512,0,-65,-444,45
+-416,-512,0,-65,-425,34
+-416,-512,0,-65,-425,34
+-404,-512,0,-65,-410,26
+-404,-512,0,-65,-410,26
+-393,-512,0,-65,-399,20
+-393,-512,0,-65,-399,20
+-382,-512,0,-65,-390,15
+-382,-512,0,-65,-390,15
+-382,-512,0,-65,-384,11
+-382,-512,0,-65,-384,11
+-371,-512,0,-65,-379,8
+-371,-512,0,-65,-379,8
+-371,-512,0,-65,-375,6
+-371,-512,0,-65,-375,6
+-371,-512,0,-65,-372,4
+-371,-512,0,-65,-372,4
+-359,-512,0,-65,-370,3
+-359,-512,0,-65,-370,3
+-359,-512,0,-65,-369,2
+-359,-512,0,-65,-369,2
+-359,-512,0,-65,-368,2
+-359,-512,0,-65,-368,2
+-359,-512,0,-65,-367,1
+-359,-512,0,-65,-367,1
+-359,-512,0,-65,-366,1
+-359,-512,0,-65,-366,1
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-365,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-364,0
+-359,-512,0,-65,-3
+
+还是有刹太早的情况，你继续根据这组数据优化代码或者调一下pid什么的
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:25Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing pid.c channel data**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Diagnosing early braking with velocity data**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating reducing speed loop PID gains**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting second stage speed loop parameters**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Raising cruise speed floor for smoother braking**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:35Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Reviewing target_is_neg6 floor snippet**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:37Z)**_
+
+这组比上一组更明确：问题不在 `-6.0` 落点本身，而是在**回程巡航目标速度仍然偏小**。你日志里一大段 `ch3 = -320`，但 `ch5` 已经到 `-7.x`，于是速度环很早就转成正角强刹。我这次不再碰落点补丁，直接把“从 + 到 -6 的巡航段”再放开一档。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:37Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+870		pidY.target = 0.0f;
+871		pidY.now = relative_y;
+872		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+873		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+874		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+875		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+876		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+877		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+878		                POS_LOOP_I_LIMIT);
+879		if(target_is_neg6 && !target_hold_active) {
+880			/* 从 +5.6 回到 -6.0 的这段，位置环纯按误差线性减速会在中途过早收油，
+881			 * 导致球在 -3~-5 区间明显掉速。离目标还远时给一个最小负目标速度，
+882			 * 直到最后 1.2cm 再交给终点补丁细收。 */
+883			if(relative_y > 2.0f) {
+884				if(pidY.out > -3.2f) pidY.out = -3.2f;
+885			} else if(relative_y > 1.2f) {
+886				if(pidY.out > -2.2f) pidY.out = -2.2f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 终点附近不再把外环压得过软：
+891			 *   - 近端允许稍大的目标速度，缩短最后 1cm 的拖尾；
+892			 *   - 越靠近目标，目标速度再自动收小，兼顾收敛和不冲点。 */
+893			if(abs_relative_y <= 0.8f) {
+894				float neg6_speed_limit = (abs_relative_y <= 0.35f) ? 0.70f : 1.80f;
+895				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+896				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+897			}
+898		}
+899		if(target_hold_active) {
+900			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+901			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+902			 * 对 -6.0 终点再加一个更紧的回差保持，减少停住后的反复出窗。 */
+903			if(target_is_neg6) {
+904				if(relative_y > 0.08f) pidY.out = -0.22f;
+905				else if(relative_y < -0.08f) pidY.out = 0.22f;
+906				else pidY.out = 0.0f;
+907			} else {
+908				pidY.out = 0.0f;
+909			}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:43Z)**_
+
+我只改这一小段巡航底速，不动别的逻辑：把 `-3.2/-2.2` 两档再抬高，并把中档区间拉宽，减少回程中段的提前刹车。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:52Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:12:57Z)**_
+
+这次是非常窄的调整：只把回程巡航底速从 `-3.2/-2.2` 提到 `-4.2/-3.0`，并把高底速区间扩到 `>2.6cm`。这样 `ch3` 不会那么早掉到 `-320` 一条线。编译确认一下。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:13:03Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Rebuild firmware after stronger return cruise tweak
+
+`cmake --build /d/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38128 B         1 MB      3.64%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:13:16Z)**_
+
+我继续按你这组数据把“刹太早”往前修了一步，而且这次仍然只动了回程中段，不碰 `-6.0` 附近的落点补丁。
+
+问题非常明确：  
+你这组里大量出现
+
+- `ch3 = -320`
+- 但 `ch5` 已经到 `-5 ~ -7`
+
+这意味着外环目标速度太小，球实际已经滚得比目标快很多，于是速度环很早就开始给正角刹车。结果就是：
+
+- 从 `+5.6` 往 `-6.0` 回来
+- 还没到中后段
+- 就已经明显开始收油
+
+所以这次我把回程巡航底速再抬了一档。
+
+改动在 [Core/Src/pid.c:879-888](Core/Src/pid.c#L879-L888)：
+
+现在变成：
+
+- `relative_y > 2.6cm` 时，外环目标速度至少保持 `-4.2 cm/s`
+- `1.2cm < relative_y <= 2.6cm` 时，外环目标速度至少保持 `-3.0 cm/s`
+
+也就是把你之前那两个底速：
+
+- `-3.2`
+- `-2.2`
+
+改成了：
+
+- `-4.2`
+- `-3.0`
+
+同时把高巡航区间从 `>2.0cm` 扩到 `>2.6cm`。
+
+这意味着：
+
+- 回程中段不那么容易过早掉速
+- `ch3` 不会太早被压到 `-320`
+- 速度环就不会那么早进入“我已经超速了，开始强刹”的状态
+
+编译也过了：
+
+- `FLASH: 38128 B`
+- `RAM: 3496 B`
+
+你下一组重点看这三个量：
+
+1. `ch3` 在 `Y = -3 ~ -5` 这一段是否明显比之前更负
+2. `ch4` 是否不再那么早翻成大正角刹车
+3. `ch1` 从 `+5.6` 回 `-6.0` 的中段是否更顺、更快
+
+如果这版之后中段顺了，但 `-6.0` 附近又开始冲得偏多，那下一步就只缩最后那段近端限速，不再动回程巡航段。现在这个方向是对的。
+
+---
+
+_**User (2026-08-03 05:16:26Z)**_
+
+9,-252,-1657,-419,815,-743
+809,-252,-458,-419,815,-743
+832,-260,-458,-419,832,-753
+832,-260,0,-419,832,-753
+731,-260,0,-419,691,-672
+731,-260,-523,-419,691,-672
+629,-269,-511,-419,583,-610
+629,-269,-511,-419,583,-610
+573,-286,-484,-419,584,-611
+573,-286,-669,-419,584,-611
+539,-294,-669,-419,546,-589
+539,-294,-378,-419,546,-589
+494,-302,-378,-419,498,-561
+494,-302,-2234,-419,498,-561
+596,-328,-501,-419,602,-621
+596,-328,-501,-419,602,-621
+607,-336,0,-419,612,-627
+607,-336,0,-419,612,-627
+506,-336,0,-419,493,-559
+506,-336,0,-419,493,-559
+416,-344,-501,-419,417,-515
+416,-344,0,-419,417,-515
+314,-344,0,-419,284,-439
+314,-344,-564,-419,284,-439
+416,-353,-564,-300,435,-405
+416,-353,0,-300,435,-405
+326,-353,-500,-300,331,-346
+326,-353,-500,-300,331,-346
+292,-361,0,-300,302,-330
+292,-361,0,-300,302,-330
+303,-370,-513,-300,308,-333
+303,-370,0,-300,308,-333
+236,-370,0,-300,245,-297
+236,-370,0,-300,245,-297
+146,-370,0,-300,155,-249
+146,-370,-499,-300,155,-249
+146,-378,0,-300,149,-248
+146,-378,0,-300,149,-248
+89,-378,0,-300,91,-220
+89,-378,0,-300,91,-220
+11,-378,0,-300,16,-183
+11,-378,0,-300,16,-183
+-56,-378,0,-300,-61,-148
+-56,-378,0,-300,-61,-148
+-123,-378,0,-300,-134,-116
+-123,-378,0,-300,-134,-116
+-191,-378,0,-300,-201,-90
+-191,-378,0,-300,-201,-90
+-258,-378,0,-300,-260,-69
+-258,-378,0,-300,-260,-69
+-303,-378,0,-300,-314,-53
+-303,-378,0,-300,-314,-53
+-359,-378,0,-300,-362,-40
+-359,-378,570,-300,-362,-40
+-461,-370,570,-300,-494,16
+-461,-370,0,-300,-494,16
+-562,-370,0,-300,-565,38
+-562,-370,0,-300,-565,38
+-607,-370,0,-300,-608,42
+-607,-370,0,-300,-608,42
+-629,-370,0,-300,-637,40
+-629,-370,0,-300,-637,40
+-652,-370,0,-300,-660,34
+-652,-370,530,-300,-660,34
+-753,-361,530,-300,-769,75
+-753,-361,0,-300,-769,75
+-821,-361,0,-300,-823,83
+-821,-361,0,-300,-823,83
+-843,-361,0,-300,-850,77
+-843,-361,0,-300,-850,77
+-866,-361,0,-300,-867,66
+-866,-361,0,-300,-867,66
+-866,-361,0,-300,-870,54
+-866,-361,0,-300,-870,54
+-843,-361,0,-300,-850,43
+-843,-361,0,-300,-850,43
+-832,-361,0,-300,-834,33
+-832,-361,0,-300,-834,33
+-809,-361,0,-300,-820,26
+-809,-361,0,-300,-820,26
+-719,-370,-502,-300,-727,-27
+-719,-370,0,-300,-727,-27
+-686,-370,0,-300,-694,-46
+-686,-370,0,-300,-694,-46
+-686,-370,0,-300,-689,-48
+-686,-370,0,-300,-689,-48
+-686,-370,-503,-300,-697,-44
+-686,-370,-503,-300,-697,-44
+-618,-378,0,-300,-626,-84
+-618,-378,0,-300,-626,-84
+-528,-386,-500,-300,-531,-139
+-528,-386,-500,-300,-531,-139
+-517,-386,0,-300,-519,-145
+-517,-386,-535,-300,-519,-145
+-449,-395,-535,-300,-460,-179
+-449,-395,0,-300,-460,-179
+-461,-395,0,-300,-471,-173
+-461,-395,0,-300,-471,-173
+-506,-395,-755,-300,-510,-151
+-506,-395,-755,-300,-510,-151
+-404,-428,-476,-300,-225,-313
+-404,-428,-476,-300,-225,-313
+-303,-437,-484,-300,-77,-392
+-303,-437,0,-300,-77,-392
+-202,-437,0,-300,-89,-381
+-202,-437,-521,-300,-89,-381
+-101,-445,-521,-300,-81,-380
+-101,-445,-482,-300,-81,-380
+-56,-454,0,-300,-65,-385
+-56,-454,0,-300,-65,-385
+33,-470,-1001,-300,40,-438
+33,-470,-1001,-300,40,-438
+89,-479,-429,-300,91,-457
+89,-479,0,-300,91,-457
+22,-479,0,-300,26,-414
+22,-479,-577,-300,26,-414
+0,-487,-577,-300,6,-397
+0,-487,-503,-300,6,-397
+101,-496,-503,-84,405,-392
+101,-496,-503,-84,405,-392
+202,-512,-487,-76,542,-441
+202,-512,-487,-76,542,-441
+303,-538,-1525,-62,769,-530
+303,-538,0,-62,769,-530
+404,-538,0,-55,810,-520
+404,-538,-506,-55,810,-520
+506,-546,-506,-48,840,-504
+506,-546,0,-48,840,-504
+596,-546,-489,-44,776,-441
+596,-546,-489,-44,776,-441
+697,-554,0,-39,772,-413
+697,-554,0,-39,772,-413
+798,-571,-1000,-31,892,-449
+798,-571,0,-31,892,-449
+866,-571,0,-26,876,-413
+866,-571,-502,-26,876,-413
+776,-580,-502,-21,531,-200
+776,-580,-494,-21,531,-200
+674,-588,0,-15,645,-247
+674,-588,0,-15,645,-247
+731,-596,-503,-9,732,-285
+731,-596,-503,-9,732,-285
+708,-596,0,-6,710,-269
+708,-596,-504,-6,710,-269
+731,-605,-504,-1,736,-279
+731,-605,-450,-1,736,-279
+776,-613,-450,3,780,-299
+776,-613,0,3,780,-299
+731,-613,0,6,741,-274
+731,-613,0,6,741,-274
+663,-613,0,8,671,-232
+663,-613,0,8,671,-232
+596,-613,0,9,597,-189
+596,-613,0,9,597,-189
+528,-613,0,9,530,-150
+528,-613,0,9,530,-150
+472,-613,0,9,472,-117
+472,-613,0,9,472,-117
+416,-613,0,10,425,-90
+416,-613,0,10,425,-90
+382,-613,0,10,388,-69
+382,-613,0,10,388,-69
+281,-605,497,7,272,-5
+281,-605,497,7,272,-5
+179,-596,504,2,128,68
+179,-596,492,2,128,68
+78,-588,492,-2,-17,138
+78,-588,0,-2,-17,138
+0,-588,0,-5,-61,152
+0,-588,509,-5,-61,152
+-101,-580,496,-9,-151,187
+-101,-580,496,-9,-151,187
+-202,-571,0,-14,-256,228
+-202,-571,0,-14,-256,228
+-303,-563,513,-20,-362,266
+-303,-563,502,-20,-362,266
+-404,-554,502,-26,-463,300
+-404,-554,0,-26,-463,300
+-461,-554,0,-29,-464,279
+-461,-554,509,-29,-464,279
+-517,-546,511,-34,-518,287
+-517,-546,511,-34,-518,287
+-607,-521,997,-45,-779,399
+-607,-521,997,-45,-779,399
+-708,-521,0,-51,-837,401
+-708,-521,502,-51,-837,401
+-809,-512,502,-57,-899,403
+-809,-512,0,-57,-899,403
+-866,-512,0,-61,-869,359
+-866,-512,0,-61,-869,359
+-798,-512,497,-63,-806,300
+-798,-512,497,-63,-806,300
+-821,-504,0,-66,-830,290
+-821,-504,0,-66,-830,290
+-798,-504,0,-69,-801,252
+-798,-504,496,-69,-801,252
+-821,-496,496,-73,-826,256
+-821,-496,0,-73,-826,256
+-776,-496,0,-75,-782,229
+-776,-496,500,-75,-782,229
+-798,-487,484,-79,-807,239
+-798,-487,484,-79,-807,239
+-854,-479,0,-84,-859,263
+-854,-479,0,-84,-859,263
+-821,-479,0,-87,-829,244
+-821,-479,502,-87,-829,244
+-922,-470,502,-300,-1000,255
+-922,-470,0,-300,-1000,255
+-989,-470,0,-300,-1000,231
+-989,-470,503,-300,-1000,231
+-989,-462,0,-300,-1000,243
+-989,-462,0,-300,-1000,243
+-989,-462,0,-300,-1000,220
+-989,-462,0,-300,-1000,220
+-989,-462,0,-300,-1000,186
+-989,-462,0,-300,-1000,186
+-989,-462,0,-300,-1000,151
+-989,-462,0,-300,-1000,151
+-978,-462,0,-300,-984,119
+-978,-462,0,-300,-984,119
+-933,-462,0,-300,-938,93
+-933,-462,0,-300,-938,93
+-899,-462,0,-300,-900,71
+-899,-462,0,-300,-900,71
+-866,-462,0,-300,-871,54
+-866,-462,0,-300,-871,54
+-843,-462,0,-300,-848,41
+-843,-462,-513,-300,-848,41
+-742,-470,-513,-300,-747,-15
+-742,-470,0,-300,-747,-15
+-708,-470,0,-300,-709,-37
+-708,-470,-504,-300,-709,-37
+-607,-479,0,-300,-618,-89
+-607,-479,0,-300,-618,-89
+-517,-487,-500,-300,-515,-148
+-517,-487,-500,-300,-515,-148
+-416,-496,-503,-84,-31,-202
+-416,-496,0,-84,-31,-202
+-314,-496,0,-81,-14,-202
+-314,-496,-501,-81,-14,-202
+-213,-504,-501,-77,51,-227
+-213,-504,-491,-77,51,-227
+-112,-512,0,-71,134,-258
+-112,-512,0,-71,134,-258
+-11,-521,-493,-66,221,-290
+-11,-521,-493,-66,221,-290
+78,-529,-508,-60,306,-317
+78,-529,-503,-60,306,-317
+179,-538,-503,-53,385,-340
+179,-538,-492,-53,385,-340
+281,-546,-492,-47,459,-358
+281,-546,-520,-47,459,-358
+371,-554,-1484,-41,529,-373
+371,-554,-1484,-41,529,-373
+472,-588,-509,-26,787,-479
+472,-588,-509,-26,787,-479
+573,-596,-501,-15,968,-542
+573,-596,0,-15,968,-542
+674,-596,0,-9,967,-507
+674,-596,-996,-9,967,-507
+776,-613,-996,0,1000,-530
+776,-613,0,0,1000,-530
+877,-613,-503,4,992,-480
+877,-613,-503,4,992,-480
+978,-630,-502,12,1000,-499
+978,-630,-502,12,1000,-499
+989,-638,-492,19,1000,-499
+989,-638,-1513,19,1000,-499
+989,-664,-1513,32,1000,-574
+989,-664,-482,32,1000,-574
+989,-672,-482,42,1000,-593
+989,-672,0,42,1000,-593
+989,-672,0,47,1000,-534
+989,-672,0,47,1000,-534
+989,-680,-512,53,1000,-497
+989,-680,-512,53,1000,-497
+989,-689,-514,59,1000,-473
+989,-689,0,59,1000,-473
+989,-689,0,62,1000,-410
+989,-689,0,62,1000,-410
+933,-689,0,64,937,-338
+933,-689,0,64,937,-338
+832,-689,0,65,837,-270
+832,-689,0,65,837,-270
+731,-689,0,66,736,-211
+731,-689,0,66,736,-211
+652,-689,0,66,653,-163
+652,-689,0,66,653,-163
+584,-689,0,66,586,-125
+584,-689,0,66,586,-125
+528,-689,0,66,534,-95
+528,-689,0,66,534,-95
+483,-689,0,66,494,-72
+483,-689,404,66,494,-72
+393,-680,404,64,375,-7
+393,-680,0,64,375,-7
+314,-680,0,62,324,19
+314,-680,0,62,324,19
+213,-672,520,58,217,76
+213,-672,503,58,217,76
+123,-664,503,53,92,138
+123,-664,636,53,92,138
+22,-655,0,48,-32,195
+22,-655,0,48,-32,195
+-44,-655,500,45,-55,197
+-44,-655,500,45,-55,197
+-123,-647,411,40,-126,222
+-123,-647,411,40,-126,222
+-213,-638,0,35,-215,255
+-213,-638,505,35,-215,255
+-303,-630,505,29,-307,287
+-303,-630,456,29,-307,287
+-393,-622,456,23,-396,315
+-393,-622,557,23,-396,315
+-472,-613,557,17,-479,339
+-472,-613,491,17,-479,339
+-551,-605,510,11,-558,357
+-551,-605,510,11,-558,357
+-652,-588,495,2,-724,419
+-652,-588,495,2,-724,419
+-731,-588,0,-2,-735,398
+-731,-588,463,-2,-735,398
+-764,-580,463,-8,-773,391
+-764,-580,1601,-8,-773,391
+-866,-554,1601,-19,-1000,486
+-866,-554,0,-19,-1000,486
+-967,-554,520,-26,-1000,471
+-967,-554,520,-26,-1000,471
+-989,-538,488,-35,-1000,506
+-989,-538,488,-35,-1000,506
+-989,-529,499,-43,-1000,510
+-989,-529,0,-43,-1000,510
+-989,-529,0,-47,-1000,455
+-989,-529,532,-47,-1000,455
+-989,-521,532,-52,-1000,428
+-989,-521,0,-52,-1000,428
+-956,-521,0,-55,-960,369
+-956,-521,0,-55,-960,369
+-967,-512,494,-60,-968,350
+-967,-512,494,-60,-968,350
+-888,-512,0,-62,-890,303
+-888,-512,0,-62,-890,303
+-798,-512,0,-63,-798,249
+-798,-512,0,-63,-798,249
+-708,-512,0,-64,-712,199
+-708,-512,0,-64,-712,199
+-629,-512,513,-64,-637,156
+-629,-512,513,-64,-637,156
+-652,-504,0,-67,-663,168
+-652,-504,0,-67,-663,168
+-641,-504,0,-69,-641,154
+-641,-504,0,-69,-641,154
+-596,-504,0,-70,-602,131
+-596,-504,-532,-70,-602,131
+-494,-512,-532,-68,-473,59
+-494,-512,0,-68,-473,59
+-404,-512,0,-66,-408,23
+-404,-512,0,-66,-408,23
+-371,-512,0,-66,-376,5
+-371,-512,0,-66,-376,5
+-359,-512,0,-65,-361,-2
+-359,-512,-473,-65,-361,-2
+-258,-521,-473,-62,-268,-52
+-258,-521,0,-62,-268,-52
+-236,-521,0,-61,-238,-67
+-236,-521,0,-61,-238,-67
+-236,-521,-506,-60,-239,-65
+-236,-521,-506,-60,-239,-65
+-157,-529,-506,-56,-159,-105
+-157,-529,-506,-56,-159,-105
+-56,-538,-245,-52,-50,-156
+-56,-538,-245,-52,-50,-156
+33,-546,-486,-46,63,-207
+33,-546,-524,-46,63,-207
+134,-554,-524,-40,173,-252
+134,-554,0,-40,173,-252
+179,-554,-513,-37,182,-242
+179,-554,-513,-37,182,-242
+281,-571,-511,-30,333,-305
+281,-571,-511,-30,333,-305
+348,-571,0,-26,353,-297
+348,-571,0,-26,353,-297
+404,-580,-469,-21,408,-307
+404,-580,-538,-21,408,-307
+472,-588,-538,-15,479,-324
+472,-588,0,-15,479,-324
+449,-588,-505,-12,461,-295
+449,-588,-505,-12,461,-295
+494,-596,0,-7,501,-296
+494,-596,0,-7,501,-296
+562,-605,-496,-2,567,-311
+562,-605,-496,-2,567,-311
+539,-605,0,0,549,-282
+539,-605,-533,0,549,-282
+584,-613,-533,4,592,-286
+584,-613,0,4,592,-286
+562,-613,0,7,569,-255
+562,-613,0,7,569,-255
+517,-613,0,8,521,-213
+517,-613,0,8,521,-213
+551,-622,-497,12,561,-220
+551,-622,-497,12,561,-220
+539,-622,0,14,547,-197
+539,-622,0,14,547,-197
+506,-622,0,15,512,-166
+506,-622,0,15,512,-166
+472,-622,0,15,473,-134
+472,-622,0,15,473,-134
+427,-622,0,16,436,-106
+427,-622,0,16,436,-106
+326,-613,505,13,312,-35
+326,-613,505,13,312,-35
+247,-613,0,11,253,-2
+247,-613,0,11,253,-2
+224,-613,0,11,227,11
+224,-613,0,11,227,11
+213,-613,0,10,218,16
+213,-613,0,10,218,16
+213,-613,504,10,217,16
+213,-613,504,10,217,16
+123,-605,0,7,127,61
+123,-605,0,7,127,61
+22,-596,500,3,4,120
+22,-596,505,3,4,120
+-67,-588,505,-2,-124,178
+-67,-588,0,-2,-124,178
+-146,-588,0,-5,-155,182
+-146,-588,0,-5,-155,182
+-134,-588,502,-6,-141,163
+-134,-588,502,-6,-141,163
+-202,-580,0,-10,-204,184
+-202,-580,0,-10,-204,184
+-292,-571,498,-15,-298,219
+-292,-571,502,-15,-298,219
+-393,-563,502,-20,-400,256
+-393,-563,454,-20,-400,256
+-494,-554,454,-26,-501,290
+-494,-554,454,-26,-501,290
+-494,-554,454,-29,-504,271
+-494,-554,0,-29,-504,271
+-461,-554,514,-31,-466,233
+-461,-554,514,-31,-466,233
+-562,-538,499,-38,-602,285
+-562,-538,499,-38,-602,285
+-663,-529,505,-44,-714,322
+-663,-529,0,-44,-714,322
+-708,-529,0,-48,-719,301
+-708,-529,485,-48,-719,301
+-764,-521,485,-53,-771,306
+-764,-521,0,-53,-771,306
+-742,-521,0,-55,-752,273
+-742,-521,0,-55,-752,273
+-798,-512,502,-60,-798,276
+-798,-512,502,-60,-798,276
+-776,-512,0,-62,-781,246
+-776,-512,0,-62,-781,246
+-719,-512,0,-63,-723,206
+-719,-512,0,-63,-723,206
+-652,-512,0,-64,-654,166
+-652,-512,0,-64,-654,166
+-584,-512,0,-64,-594,131
+-584,-512,0,-64,-594,131
+-539,-512,0,-65,-543,102
+-539,-512,0,-65,-543,102
+-494,-512,0,-65,-502,78
+-494,-512,501,-65,-502,78
+-551,-504,501,-68,-557,107
+-551,-504,0,-68,-557,107
+-551,-504,0,-69,-559,107
+-551,-504,0,-69,-559,107
+-528,-504,0,-70,-539,94
+-528,-504,0,-70,-539,94
+-438,-512,-505,-68,-425,32
+-438,-512,-505,-68,-425,32
+-371,-512,0,-66,-371,2
+-371,-512,0,-66,-371,2
+-337,-512,0,-66,-348,-10
+-337,-512,0,-66,-348,-10
+-337,-512,0,-65,-340,-14
+-337,-512,0,-65,-340,-14
+-337,-512,0,-65,-340,-14
+-337,-512,0,-65,-340,-14
+-337,-512,0,-65,-342,-12
+-337,-512,0,-65,-342,-12
+-247,-521,-511,-62,-258,-57
+-247,-521,0,-62,-258,-57
+-224,-521,0,-61,-233,-69
+-224,-521,-494,-61,-233,-69
+-134,-529,-494,-57,-143,-114
+-134,-529,-511,-57,-143,-114
+-33,-538,0,-52,-31,-167
+-33,-538,0,-52,-31,-167
+56,-546,-496,-46,83,-217
+56,-546,-496,-46,83,-217
+146,-554,-513,-41,191,-260
+146,-554,0,-41,191,-260
+191,-554,0,-37,198,-249
+191,-554,-504,-37,198,-249
+247,-563,-504,-33,254,-263
+247,-563,0,-33,254,-263
+236,-563,-502,-30,238,-240
+236,-563,-502,-30,238,-240
+337,-580,-498,-23,379,-297
+337,-580,-498,-23,379,-297
+438,-588,-504,-16,488,-335
+438,-588,0,-16,488,-335
+483,-588,0,-13,486,-313
+483,-588,0,-13,486,-313
+427,-588,0,-11,437,-268
+427,-588,-
+现在刹车没之前那么早，但是还是有，而且现在在目标点的震荡很严重
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:16:40Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning adjustments for braking and oscillation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:16:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing speed loop data near target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:16:44Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying early speed capping to reduce oscillation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:16:51Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing multi-stage braking thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:16:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining target speed scheduling with feedback**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:16:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Assessing braking and oscillation issues**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:00Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning deceleration ramp implementation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:02Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Reevaluating target speed adjustments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning near-target damping optimization**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining midzone braking speed limits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:14Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing braking profile zones**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:19Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting target speed enforcement logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing adaptive target speed schedule**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning momentum bleed patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing oscillation reduction logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning local hold speed limit adjustment**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning minimal edits with commentary**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:33Z)**_
+
+这组数据说明现在的主要矛盾变了：回程中段已经比之前顺了，但最后 `1cm` 左右带着偏大的负速度冲进终点，所以 `-6.0` 附近来回穿，震荡重。我要保留中段巡航逻辑，单独给 `-6.0` 终点前加一个“减冲窗口”，只在最后一小段根据实际负速度提前收刹。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:34Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+840		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+841		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+842			if(target_hold_active) {
+843				if(abs_relative_y >= target_hold_exit) {
+844					target_hold_active = false;
+845					target_hold_settle_ticks = 0u;
+846				}
+847			} else if(abs_relative_y <= target_hold_enter &&
+848			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+849				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+850					target_hold_settle_ticks++;
+851				}
+852				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+853					target_hold_active = true;
+854				}
+855			} else {
+856				target_hold_settle_ticks = 0u;
+857			}
+858		} else {
+859			target_hold_active = false;
+860			target_hold_settle_ticks = 0u;
+861		}
+862	
+863		if(target_hold_active) {
+864			/* 进入误差保持区后，只停止位置环继续推球：
+865			 *   1) 外环目标速度稍后压到 0；
+866			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+867		}
+868	
+869		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+870		pidY.target = 0.0f;
+871		pidY.now = relative_y;
+872		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+873		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+874		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+875		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+876		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+877		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+878		                POS_LOOP_I_LIMIT);
+879		if(target_is_neg6 && !target_hold_active) {
+880			/* 从 +5.6 回到 -6.0 的这段，位置环纯按误差线性减速会在中途过早收油，
+881			 * 导致球在 -3~-5 区间明显掉速。离目标还远时给一个更积极的最小负目标速度，
+882			 * 把中段巡航速度托住，直到最后 1.2cm 再交给终点补丁细收。 */
+883			if(relative_y > 2.6f) {
+884				if(pidY.out > -4.2f) pidY.out = -4.2f;
+885			} else if(relative_y > 1.2f) {
+886				if(pidY.out > -3.0f) pidY.out = -3.0f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 终点附近不再把外环压得过软：
+891			 *   - 近端允许稍大的目标速度，缩短最后 1cm 的拖尾；
+892			 *   - 越靠近目标，目标速度再自动收小，兼顾收敛和不冲点。 */
+893			if(abs_relative_y <= 0.8f) {
+894				float neg6_speed_limit = (abs_relative_y <= 0.35f) ? 0.70f : 1.80f;
+895				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+896				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+897			}
+898		}
+899		if(target_hold_active) {
+900			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+901			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+902			 * 对 -6.0 终点再加一个更紧的回差保持，减少停住后的反复出窗。 */
+903			if(target_is_neg6) {
+904				if(relative_y > 0.08f) pidY.out = -0.22f;
+905				else if(relative_y < -0.08f) pidY.out = 0.22f;
+906				else pidY.out = 0.0f;
+907			} else {
+908				pidY.out = 0.0f;
+909			}
+910		}
+911	
+912		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+913		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+914		 */
+915		float control_velocity = estimated_velocity;
+916		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+917			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+918		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+919			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:17:33Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+878		                POS_LOOP_I_LIMIT);
+879		if(target_is_neg6 && !target_hold_active) {
+880			/* 从 +5.6 回到 -6.0 的这段，位置环纯按误差线性减速会在中途过早收油，
+881			 * 导致球在 -3~-5 区间明显掉速。离目标还远时给一个更积极的最小负目标速度，
+882			 * 把中段巡航速度托住，直到最后 1.2cm 再交给终点补丁细收。 */
+883			if(relative_y > 2.6f) {
+884				if(pidY.out > -4.2f) pidY.out = -4.2f;
+885			} else if(relative_y > 1.2f) {
+886				if(pidY.out > -3.0f) pidY.out = -3.0f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 终点附近不再把外环压得过软：
+891			 *   - 近端允许稍大的目标速度，缩短最后 1cm 的拖尾；
+892			 *   - 越靠近目标，目标速度再自动收小，兼顾收敛和不冲点。 */
+893			if(abs_relative_y <= 0.8f) {
+894				float neg6_speed_limit = (abs_relative_y <= 0.35f) ? 0.70f : 1.80f;
+895				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+896				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+897			}
+898		}
+899		if(target_hold_active) {
+900			/* 近目标时外环不再继续命令小球移动，而是把目标速度压到 0。
+901			 * 内环仍保持闭环，用很小的倾角持续抑制残余滚动，帮助球真正停在目标附近。
+902			 * 对 -6.0 终点再加一个更紧的回差保持，减少停住后的反复出窗。 */
+903			if(target_is_neg6) {
+904				if(relative_y > 0.08f) pidY.out = -0.22f;
+905				else if(relative_y < -0.08f) pidY.out = 0.22f;
+906				else pidY.out = 0.0f;
+907			} else {
+908				pidY.out = 0.0f;
+909			}
+910		}
+911	
+912		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+913		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+914		 */
+915		float control_velocity = estimated_velocity;
+916		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+917			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+```
+</details></tool-use>
+
+---
+
+_**User (2026-08-03 05:20:23Z)**_
+
+This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+<summary>
+1. Primary Request and Intent:
+
+- Overall project intent:
+  - STM32F407 firmware for a ball-balancing / position-control system.
+  - Vision input from MaixCAM over USART2.
+  - Stepper motor driver over UART1.
+  - VOFA telemetry over USART3.
+  - Wireless tuning over UART4 on PC10/PC11.
+- Earlier explicit requests already completed or previously investigated:
+  - add wireless tuning on PC10/PC11
+  - add `GET_0` homing command
+  - allow tuning position loop first by bypassing inner speed loop, then restore cascaded PID
+  - increase positive angle limit
+  - modify hold behavior around `±0.5 cm`
+  - implement segmented motion:
+    - `0 -> +5.6cm`
+    - then `+5.6 -> -5.5cm` initially, later changed in code to `-6.0cm`
+    - final stabilization at the negative endpoint
+  - remove all `STUCK_* / BREAKAWAY_*` logic because the user explicitly considered it unnecessary
+- After the previous compaction summary, the user’s intent focused almost entirely on the negative endpoint:
+  - analyze VOFA data around the `-6.0` endpoint
+  - explain why the ball stops early, oscillates, or parks at the wrong location
+  - decide whether PID-only tuning is sufficient
+  - then explicitly asked to implement a local patch only for `-6.0`
+  - then changed direction again: do not keep solving `-6.0` by adding yet another segmented PID; instead add a dedicated endpoint patch so the ball can land and stay at `-6.0`
+  - then repeatedly asked to optimize based on fresh VOFA logs, especially:
+    - “刹车太早”
+    - “收敛得慢”
+    - “目标点震荡很严重”
+- The most recent unresolved intent is:
+  - continue optimizing the `+5.6 -> -6.0` return path and the `-6.0` endpoint stabilization based on VOFA data
+  - current complaint: braking is less early than before, but still somewhat early, and oscillation at the target is severe
+
+2. Key Technical Concepts:
+
+- STM32F407 embedded firmware
+- HAL UART / DMA / interrupt-driven communication
+- UART4 wireless tuning
+- VOFA 6-channel telemetry
+- Cascaded PID:
+  - outer loop: position -> target speed
+  - inner loop: speed -> platform angle
+- Direct-drive mode for position-loop-only tuning:
+  - `POSITION_LOOP_DIRECT_DRIVE`
+- Segment/state-machine based motion:
+  - `PID_SEGMENT_TO_POS_56`
+  - `PID_SEGMENT_TO_NEG_55`
+  - `PID_SEGMENT_HOLD_NEG_55`
+  - enum names still reflect the older `-5.5` naming, even though current negative target in code is `-6.0f`
+- Local speed estimation by position difference:
+  - `estimated_velocity = position_delta / PID_CONTROL_PERIOD_S`
+- Conditional anti-windup:
+  - `pid_cal_clamped()`
+- Final hold gating by:
+  - position window
+  - low estimated speed
+  - settle count
+- Negative endpoint local patching:
+  - near-endpoint outlier rejection
+  - endpoint-specific LPF on `relative_y`
+  - endpoint-specific hold thresholds
+  - endpoint-specific outer-loop speed clamping
+  - endpoint-specific hold bias / lock-point compensation
+  - endpoint-specific return-path cruise floor
+- Build system:
+  - CMake / Ninja
+  - actual working build dir is `build/Debug`
+
+3. Files and Code Sections:
+
+- `Core/Src/pid.c`
+  - This is the primary file for all control logic and almost all recent work.
+  - Why important:
+    - owns the segmented state machine
+    - owns local velocity estimation
+    - owns final-hold logic
+    - owns all recent `-6.0` endpoint experiments and patches
+  - Important pre-existing/retained pattern:
+    ```c
+    static void pid_apply_segment_profile(float target_y,
+                                          float pos_p, float pos_i, float pos_d,
+                                          float spd_p, float spd_i, float spd_d)
+    {
+        pid_init(&pidY, POSITION_PID, pos_p, pos_i, pos_d, 0.0f);
+        pid_init(&pidY_Speed, POSITION_PID, spd_p, spd_i, spd_d, 0.0f);
+        ball_target_set(target_y);
+    }
+    ```
+  - Current first-stage initialization:
+    ```c
+    pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+    ```
+  - Current second-stage base profile, still preserved exactly in `pid_apply_segment_profile(...)` format as explicitly requested by the user:
+    ```c
+    pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+    ```
+  - State-machine transition still switches from `+5.6` to this second-stage base profile:
+    ```c
+    if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+        if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+            pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+            g_pid_segment = PID_SEGMENT_TO_NEG_55;
+            control_initialized = false;
+            target_hold_active = false;
+            target_hold_settle_ticks = 0u;
+            neg6_relative_y_filtered = 0.0f;
+        }
+    } else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+        if(pid_absf(Y + 6.0f) <= TARGET_HOLD_POSITION_ENTER) {
+            g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+            control_initialized = false;
+            target_hold_active = false;
+            target_hold_settle_ticks = 0u;
+        }
+    }
+    ```
+  - Earlier in this continuation, a temporary “soft landing via another PID segment” was added:
+    - added `static bool neg6_soft_landing_active = false;`
+    - when `abs_relative_y <= 0.8f`, cleared integrators and switched to:
+      ```c
+      pid_apply_segment_profile(-6.0f, 0.400f, 0.0f, 0.0f, 1.00f, 0.02f, 0.0f);
+      ```
+    - restored the base `-6.0` profile if drifting out again
+    - later the user decided `-6.0` should not keep using “another segmented PID”, so this soft-PID approach was removed/replaced conceptually by a dedicated endpoint patch
+  - Current `-6.0` endpoint patch state:
+    - static state now:
+      ```c
+      static float neg6_relative_y_filtered = 0.0f;
+      ```
+    - target-specific hold thresholds:
+      ```c
+      bool target_is_neg6 = (target_y == -6.0f);
+      float target_hold_enter = target_is_neg6 ? 0.18f : TARGET_HOLD_POSITION_ENTER;
+      float target_hold_exit = target_is_neg6 ? 0.28f : TARGET_HOLD_POSITION_EXIT;
+      ```
+    - endpoint observation protection and endpoint-only LPF:
+      ```c
+      if(target_is_neg6) {
+          float relative_y_for_control = relative_y;
+          if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+              relative_y_for_control = relative_y_last;
+          }
+          neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+          relative_y = neg6_relative_y_filtered;
+          position_delta = relative_y - relative_y_last;
+          estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+          abs_relative_y = pid_absf(relative_y);
+          abs_estimated_velocity = pid_absf(estimated_velocity);
+      } else {
+          neg6_relative_y_filtered = relative_y;
+      }
+      ```
+    - final hold logic now uses the per-target thresholds above, instead of always using the global `TARGET_HOLD_POSITION_ENTER/EXIT`
+    - current return-path cruise-floor logic for the `+5.6 -> -6.0` travel, added after repeated user complaints of “刹车太早”:
+      ```c
+      if(target_is_neg6 && !target_hold_active) {
+          if(relative_y > 2.6f) {
+              if(pidY.out > -4.2f) pidY.out = -4.2f;
+          } else if(relative_y > 1.2f) {
+              if(pidY.out > -3.0f) pidY.out = -3.0f;
+          }
+      }
+      ```
+      - This was preceded by earlier weaker versions:
+        - first attempt: `-3.2f / -2.2f`
+        - then raised to `-4.2f / -3.0f`
+    - current near-endpoint outer-loop speed limit:
+      ```c
+      if(target_is_neg6) {
+          if(abs_relative_y <= 0.8f) {
+              float neg6_speed_limit = (abs_relative_y <= 0.35f) ? 0.70f : 1.80f;
+              if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+              else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+          }
+      }
+      ```
+      - This was preceded by earlier simpler limits:
+        - first attempt: constant `±1.2`
+        - then changed to staged `±1.80` / `±0.70`
+    - current hold bias / lock-point compensation for `-6.0`:
+      ```c
+      if(target_hold_active) {
+          if(target_is_neg6) {
+              if(relative_y > 0.08f) pidY.out = -0.22f;
+              else if(relative_y < -0.08f) pidY.out = 0.22f;
+              else pidY.out = 0.0f;
+          } else {
+              pidY.out = 0.0f;
+          }
+      }
+      ```
+      - Earlier versions were looser:
+        - hold bias deadband `0.12f` with `±0.18f`
+        - then tightened to `0.08f` with `±0.22f`
+  - Current important comments in code reflect design intent:
+    - endpoint patch is local to `-6.0`
+    - do not create another segmented PID for endpoint
+    - protect against vision spikes and reduce mid-course early braking
+  - Why current state matters:
+    - this file now contains several layers of `-6.0` specific logic on top of the base cascaded PID
+    - latest unresolved issue is likely inside these constants and their interaction:
+      - cruise floor
+      - near-endpoint speed clamp
+      - hold bias
+      - observation filtering
+
+- `Core/Inc/pid.h`
+  - Important because it holds the global control constants and still provides the shared hold thresholds and speed limits.
+  - Relevant current constants include:
+    ```c
+    #define TARGET_HOLD_POSITION_ENTER  0.50f
+    #define TARGET_HOLD_POSITION_EXIT   0.60f
+    #define TARGET_HOLD_SPEED_LIMIT     0.25f
+    #define TARGET_HOLD_SETTLE_TICKS    6u
+    #define BALL_TARGET_SPEED_LIMIT     10.0f
+    #define SPEED_LOOP_ANGLE_LIMIT      10.0f
+    #define BALL_VELOCITY_FILTER_ALPHA  0.25f
+    ```
+  - Why important:
+    - current `-6.0` patch overrides the effective hold thresholds locally in `pid.c`, but global defaults still exist here
+    - earlier breakaway/stuck macro block was removed from this file by explicit user request
+
+- `Core/Src/main.c`
+  - Important because all VOFA log analysis depends on the channel definitions:
+    ```c
+    vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0
+    vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1
+    vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2
+    vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3
+    vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4
+    vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);    // ch5
+    ```
+  - Why important:
+    - all later interpretation of “刹车太早”, “震荡”, “停在 -4.x”, “target point oscillation” depends on these definitions
+
+- `Core/Src/bt_tune.c`
+  - Still important background context from earlier work:
+    - added wireless tuning
+    - supports `GETPID`
+    - supports `GET_0`
+    - can clear integrators via key/reset command
+  - Important code already present:
+    ```c
+    if(strcmp(cmd, "GET_0") == 0) {
+        pidY.iout = 0.0f;
+        pidY_Speed.iout = 0.0f;
+        motor_set_angle(0.0f);
+        Emm_V5_Origin_Trigger_Return(BT_TUNE_MOTOR_ADDR, 0, 0);
+        BT_Tune_SendOk();
+        return;
+    }
+    ```
+  - Why important:
+    - during tuning discussions, integrator clearing and endpoint behavior were repeatedly referenced
+
+- `build/Debug`
+  - Important because this is the real working build directory
+  - Why important:
+    - earlier build attempt failed because `cmake --build .../build` had no cache
+    - successful incremental builds were then run against `build/Debug`
+
+4. Errors and fixes:
+
+- Earlier history from before this continuation:
+  - `apply_patch` via Bash not found
+    - fix: switched to `Edit` and line-specific replacements
+  - several `Edit` exact-match failures due to shifting file contents
+    - fix: re-read exact blocks and perform smaller or targeted replacements
+  - Python/substring replacement path and matching failures
+    - fix: used correct absolute path and line-range replacements
+  - compile errors after removing breakaway macros because `pid.c` still referenced deleted identifiers
+    - fix: removed leftover references and rebuilt successfully
+- During this continuation:
+  - Build failure:
+    - command: `cmake --build d:/File/2026diansaiH/Code_of_ZDT/build`
+    - error: `could not load cache`
+    - fix: searched for `CMakeCache.txt` / `build.ninja`, found actual build dir at `build/Debug`, then rebuilt there successfully
+  - Logic bug in first `-6.0` soft-PID patch:
+    - initial implementation introduced a local `neg6_soft_landing_active` state and switched to a softer PID near `-6.0`
+    - user later reported the ball could drift back and park around `-4.x`
+    - analysis identified that once the system had entered the soft landing zone, it could continue using a too-soft endpoint profile even after drifting away
+    - fix: first patched the logic so if the ball drifted back outside the near-endpoint zone before real hold, the base `-6.0` profile would be restored
+    - later, after the user changed direction, the whole “soft landing via another PID segment” approach was replaced with a dedicated endpoint patch
+  - User feedback that changed direction and must be preserved:
+    - user explicitly preferred simplified local endpoint logic over piling on another segmented PID:
+      - “我现在觉得到-6这个点先不要再分段pid，另外做一个补丁，让球能稳定落在-6这个点，先分析一下”
+  - Ongoing unresolved issue:
+    - repeated tuning improved some behaviors but did not fully solve:
+      - early braking from `+5.6` back toward `-6.0`
+      - severe oscillation around the target point
+    - the most recent user feedback is that braking is improved relative to before, but still early, and target-point oscillation is now severe
+
+5. Problem Solving:
+
+- Solved / implemented before this continuation:
+  - UART4 wireless tuning
+  - `GET_0` homing command
+  - segmented motion state machine
+  - removal of unnecessary breakaway/stuck logic
+  - cascaded PID restoration after single-loop tuning
+- Solved / implemented during this continuation:
+  - analyzed why pure cascaded PID without local compensation stopped early around `-4.7/-4.8`
+  - initially added a `-6.0`-specific soft-landing-once-with-new-PID approach
+  - identified and fixed a state bug in that approach where soft logic persisted too long after drifting away
+  - then replaced the “new soft PID segment” concept with a `-6.0` local endpoint patch as requested by the user
+  - added endpoint observation protection for `-6.0`
+  - added `-6.0` endpoint-specific hold thresholds
+  - added `-6.0` near-endpoint outer-loop speed limit
+  - added `-6.0` hold bias / lock-point compensation
+  - added return-path cruise floors to reduce premature braking from `+5.6` back toward `-6.0`
+- Current troubleshooting state:
+  - the system no longer behaves exactly like the earliest versions; several issues were reduced:
+    - braking is “not as early as before”
+  - but the user’s latest report is:
+    - braking is still somewhat early
+    - oscillation at the target is severe
+  - based on the latest VOFA logs:
+    - middle return path still shows `ch3` pinned at cruise-floor values for long stretches
+    - target area still exhibits strong oscillation after arriving near `-6.0`
+    - the interaction between the cruise-floor logic and the endpoint patch is the active tuning problem
+
+6. All user messages:
+
+Messages preserved from the earlier summary:
+- “#include "bt_tune.h" ... 加入无线调参，使用串口PC10、PC11”
+- “增加电机归零指令“GET_0“电机归零到归零点”
+- VOFA log dump ending with: “这是电机到限幅了吗？”
+- VOFA log dump ending with: “现在限幅不是 ... 十度吗？怎么是再517？”
+- “现在我要调这个串级pid的参数，先调位置环，你把位置环的输出先给我加载到电机，我先单调位置环”
+- “现在我调好了位置环的P时0.68，D项和I项都没有，现在改回串级，我调速度环的pid”
+- “上升角度限幅加大两度”
+- “现在无线调参，电机归零写了吗？”
+- “误差范围在0.5左右，PID还会调节吗？”
+- “[Request interrupted by user] 误差在0.5cm时停止PID调节”
+- Very long VOFA dump ending with: “为啥在在误差范围内，PID还在调节？”
+- “那在误差范围内 所有的PID 都停止”
+- Very long VOFA dump ending with: “这里0到500的电机跳变值是怎么回事？”
+- “那应该怎么解决这个电机跳变问题？你分析一下，先别改代码”
+- “那你用这个吧 最稳的方案 不要‘所有 PID 全停’ 保持区里只停位置环，速度环继续做‘目标速度 = 0’的保持”
+- “现在要求小球能从0位置点，往5.6cm处移动，小球一旦到达5.6cm处小球立刻往-5.5位置处移动，然后稳定在-5.5cm处。但是这两段位置移动使用分段PID控制，从0cm处到5.6cm处，PID控制参数为 ... 你明白我意思吗？说一下你想怎么控制这一段”
+- “很好，那你现在开始写代码吧，要求逻辑严谨”
+- “那现在我还想调一下5到-5cm的PID，应该在那调节？”
+- Large VOFA dump ending with: “为啥会在目标附近来回摆？”
+- Large VOFA dump ending with: “还是回来回抖”
+- “甚至听错位置”
+- “我现在把速度环的I项清零了”
+- Very large VOFA dump labeled:
+  - “第一组”
+  - “第二组”
+- “我的意思是现在PID调节的很不稳定”
+- Selected `pid.h` lines containing the `STUCK_* / BREAKAWAY_*` block
+- “我觉得没必要写这些 ... 你把他们删了看一下·”
+- “那你在原文件清理吧”
+- “PID在哪里调？”
+- Data snippet ending with:
+  - “这个值不是在误差范围之内了吗？”
+  - “为啥还是会有输出”
+- “你重新读一下代码”
+- “然后分析一组数据”
+- Large VOFA dataset
+- “小球经常停在-4.7、-4.8的位置”
+
+Messages in this continuation after the earlier summary:
+- “?18,210,-501 ...” followed by a long VOFA dataset and:
+  - “你重新读一遍代码，然后分析数据，看看应该怎么调”
+- IDE selection of `pid.c` hold logic lines 818-860, then a long dataset:
+  - “第一组数据”
+  - “第二组数据，收敛的太慢了而且误差还有点大”
+- “在那个文件改？改什么？”
+- IDE selection showing:
+  - `pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);`
+  - followed by a long dataset and:
+  - “现在会在目标位置附近来回震荡，我觉得单独调节PID已经很难解决了吧？我们要不要单独依据
+    pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+    这个位置打一定逻辑补充补丁？
+    如果加的话加什么？分析一下，只针对这一个点，不要求改全局执行函数。你先仔细分析不要丢该代码”
+- “到了进端先清楚积分，然后末端再使用新的PID参数？”
+- repeated interruption/correction:
+  - “[Request interrupted by user] 到了近端先清除积分，然后末端再使用新的PID参数？”
+  - “到了近端先清除积分，然后末端再使用新的PID参数？”
+- “更软的PID能刹车吗？”
+- repeated interruption/correction:
+  - “[Request interrupted by user] 更软的PID能停住球吗吗？”
+- IDE selection showing `-6.0`
+  - “那你写一下，PID调节函数还是使用 pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f); 格式
+    然后只改在-6.0这个停止点的逻辑。在还有0.8cm到达目标位置时就切换新的PID参数”
+- Dataset after the first `-6.0` soft-PID patch and:
+  - “现在球去到+5.6有没有加这套补丁”
+- Large dataset after that and:
+  - “我现在觉得到-6这个点先不要再分段pid，另外做一个补丁，让球能稳定落在-6这个点，先分析一下”
+- “现在修改”
+- Large dataset after endpoint-patch rewrite and:
+  - “效果还不是不太理想，收敛得慢，还是有震荡”
+- Large dataset after that and:
+  - “根据这组数据，我觉得球刹车太早了，优化一下从+方向往-方向这段代码”
+- Large dataset after first return-path cruise-floor tweak and:
+  - “还是有刹太早的情况，你继续根据这组数据优化代码或者调一下pid什么的”
+- Large dataset after stronger cruise-floor tweak and:
+  - “现在刹车没之前那么早，但是还是有，而且现在在目标点的震荡很严重”
+
+7. Pending Tasks:
+
+- Continue tuning the `+5.6 -> -6.0` return-path logic in `Core/Src/pid.c` so braking does not start too early.
+- Continue tuning the `-6.0` endpoint patch so target-point oscillation is reduced.
+- Use the newest VOFA dataset to decide whether the next change should target:
+  - return-path cruise floors
+  - endpoint near-target speed clamp
+  - endpoint hold bias
+  - or some combination
+- Preserve the user’s current direction:
+  - do not solve `-6.0` by introducing another segmented PID stage
+  - keep the base second-stage `pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);`
+  - apply local logic only around the `-6.0` endpoint and the return path into it
+
+8. Current Work:
+
+Immediately before this summary request:
+
+- The current code in `Core/Src/pid.c` had already been changed from the earlier “soft landing by new PID segment” approach to a dedicated `-6.0` endpoint patch.
+- Then, after the user complained that braking from `+` toward `-6.0` was too early, the code was further adjusted to add and then strengthen a return-path cruise-floor patch:
+  - first version:
+    - `relative_y > 2.0f` -> minimum `pidY.out = -3.2f`
+    - `relative_y > 1.2f` -> minimum `pidY.out = -2.2f`
+  - latest version before summary:
+    - `relative_y > 2.6f` -> minimum `pidY.out = -4.2f`
+    - `relative_y > 1.2f` -> minimum `pidY.out = -3.0f`
+- This latest cruise-floor adjustment compiled successfully in `build/Debug`:
+  - `FLASH: 38128 B`
+  - `RAM: 3496 B`
+- After that change, the user provided another very large VOFA dataset and the latest explicit feedback:
+  - “现在刹车没之前那么早，但是还是有，而且现在在目标点的震荡很严重”
+- That means the immediate active work at the moment of this summary request was:
+  - interpreting the latest VOFA log under the newest `-4.2/-3.0` cruise-floor code
+  - determining how to reduce remaining early braking while also attacking the now-prominent target-point oscillation near `-6.0`
+- The most relevant current code section for continuation is:
+  ```c
+  bool target_is_neg6 = (target_y == -6.0f);
+  float target_hold_enter = target_is_neg6 ? 0.18f : TARGET_HOLD_POSITION_ENTER;
+  float target_hold_exit = target_is_neg6 ? 0.28f : TARGET_HOLD_POSITION_EXIT;
+
+  if(target_is_neg6) {
+      float relative_y_for_control = relative_y;
+      if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+          relative_y_for_control = relative_y_last;
+      }
+      neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+      relative_y = neg6_relative_y_filtered;
+      position_delta = relative_y - relative_y_last;
+      estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+      abs_relative_y = pid_absf(relative_y);
+      abs_estimated_velocity = pid_absf(estimated_velocity);
+  } else {
+      neg6_relative_y_filtered = relative_y;
+  }
+
+  pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+                  POS_LOOP_I_LIMIT);
+
+  if(target_is_neg6 && !target_hold_active) {
+      if(relative_y > 2.6f) {
+          if(pidY.out > -4.2f) pidY.out = -4.2f;
+      } else if(relative_y > 1.2f) {
+          if(pidY.out > -3.0f) pidY.out = -3.0f;
+      }
+  }
+
+  if(target_is_neg6) {
+      if(abs_relative_y <= 0.8f) {
+          float neg6_speed_limit = (abs_relative_y <= 0.35f) ? 0.70f : 1.80f;
+          if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+          else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+      }
+  }
+
+  if(target_hold_active) {
+      if(target_is_neg6) {
+          if(relative_y > 0.08f) pidY.out = -0.22f;
+          else if(relative_y < -0.08f) pidY.out = 0.22f;
+          else pidY.out = 0.0f;
+      } else {
+          pidY.out = 0.0f;
+      }
+  }
+  ```
+- Based on the newest dataset, the outstanding interpretation at the point work stopped was:
+  - braking from `+` toward `-6.0` is improved versus older versions, but still not ideal
+  - target-point oscillation is now the dominant complaint and likely requires further adjustment of the endpoint patch constants or logic
+
+9. Optional Next Step:
+
+Directly aligned next step:
+- Analyze the newest VOFA data against the current `pid.c` code and tune only the local `-6.0` logic, especially the interaction between:
+  - return-path cruise floors (`-4.2 / -3.0`)
+  - near-endpoint speed clamp (`1.80 / 0.70`)
+  - hold bias (`±0.22` with `0.08cm` deadband)
+- Because the user’s last explicit request was:
+  - “现在刹车没之前那么早，但是还是有，而且现在在目标点的震荡很严重”
+
+Most likely immediate next action:
+- reduce target-point oscillation by weakening or reshaping the `-6.0` endpoint hold/near-endpoint limits while preserving the now-stronger return-path cruise behavior, rather than reintroducing another segmented PID stage or global refactor.
+
+If you need specific details from before compaction (like exact code snippets, error messages, or content you generated), read the full transcript at: C:\Users\bai-kink\.claude\projects\d--File-2026diansaiH-Code-of-ZDT\069a0196-6fe2-4d6d-8ec2-b1d12f4294bb.jsonl
+Continue the conversation from where it left off without asking the user any further questions. Resume directly — do not acknowledge the summary, do not recap what was happening, do not preface with "I'll continue" or similar. Pick up the last task as if the break never happened.
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:34Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning pid.c update using apply_patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:35Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing speed loop braking adjustments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:35Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting speed loop negative limits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:37Z)**_
+
+我准备直接改 `pid.c` 这一段：中段巡航先基本保留，重点把 `-6.0` 最后一小段从“按位置一刀切限速”改成“按剩余距离 + 当前负速度收刹”，这样能减少冲点后的来回穿越。随后我会编译一遍，确保这次改动是干净的。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:41Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Creating concise TODO for patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:41Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [⚡] 🌡️ Tune -6.0 endpoint logic in pid.c to reduce target oscillation without reintroducing early braking
+- [ ] 🌡️ Build firmware in build/Debug to verify the change compiles
+- [ ] 🌡️ Summarize the behavioral change and remaining tuning direction
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:51Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing taper adjustment for cruise control**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Implementing dynamic negative speed cap**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:20:58Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Clarifying inner loop braking logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:01Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting endpoint speed clamping**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:05Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Proposing speed-aware hold adjustments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:12Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting cruise floor thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining cruise floor and endpoint cap balance**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Limiting PID output near -6 target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting PID output clamping for hold conditions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting and maintaining comments**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:48Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:52Z)**_
+
+我把终点逻辑从“固定近端限速 + 固定保持偏置”改成了两段更软的处理：靠近 `-6.0` 时按实际负速度提前消冲，进入保持后只给很小的比例型零速目标，目的就是压掉来回抽动。现在编译确认这版没有引入新问题。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:21:58Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware in Debug directory
+
+`cmake --build d:/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3496 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38384 B         1 MB      3.66%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:22:02Z)**_
+
+<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
+<summary>Tool use: **TodoWrite**</summary>
+**Agent task list:**
+- [X] 🌡️ Tune -6.0 endpoint logic in pid.c to reduce target oscillation without reintroducing early braking
+- [X] 🌡️ Build firmware in build/Debug to verify the change compiles
+- [⚡] 🌡️ Summarize the behavioral change and remaining tuning direction
+
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:22:14Z)**_
+
+我已经把 `-6.0` 终点这块改了，位置在 [Core/Src/pid.c](Core/Src/pid.c)。
+
+这次改动的重点不是再加一段新 PID，而是把最后这段局部逻辑重整了一下：
+
+1. 回程中段巡航托底还保留，但第二段托底稍微收短了。  
+   原来 `1.2cm` 内还在吃比较硬的 `-3.0` 托底，容易带着过大的负速度冲进终点；现在改成：
+   - `relative_y > 2.8` 维持 `-4.2`
+   - `0.9 < relative_y <= 2.8` 维持 `-2.8`
+
+2. `-6.0` 前最后 `0.9cm` 改成“按距离 + 当前负速度”收刹。  
+   核心思路是：如果球还在目标右侧，但 `estimated_velocity` 已经很负，就主动把外环目标速度压得更小，避免直接穿过 `-6.0` 后再反拉回来。
+   这段现在不是固定 `±1.8 / ±0.7` 了，而是：
+   - 一般近端限到 `1.20`
+   - 更近时限到 `0.55`
+   - 如果当前负速度过大，再进一步压到 `0.35` 或 `0.20`
+
+3. 保持区不再用固定 `±0.22` 的硬切换。  
+   那种写法很容易在目标点两侧来回翻。现在改成一个很小的比例型保持：
+   - `|relative_y| <= 0.05` 时直接 `0`
+   - 否则 `pidY.out = -1.6 * relative_y`
+   - 并限幅到 `±0.16`
+
+这版已经编过，`build/Debug` 通过：
+- `FLASH: 38384 B`
+- `RAM: 3496 B`
+
+你接下来重点看两件事就够了：
+
+- 回程到 `-6.0` 前 `1cm` 左右，`ch3` 是否还会长时间维持很大的负值
+- 到点后 `ch1` 是否还会明显穿过 `-6.0` 再反复来回摆
+
+如果还有问题，下一刀大概率就不是再动中段巡航，而是继续缩 `0.9cm` 内这套减冲窗口，尤其是 `estimated_velocity < -2.2f` 那个分支。
+
+---
+
+_**User (2026-08-03 05:24:37Z)**_
+
+280,-258,-274
+-258,-386,-500,-280,-258,-274
+-157,-403,-510,-280,-158,-328
+-157,-403,-510,-280,-158,-328
+-89,-412,-500,-280,-93,-361
+-89,-412,-500,-280,-93,-361
+-44,-420,-500,-280,-48,-381
+-44,-420,0,-280,-48,-381
+-101,-420,0,-280,-101,-346
+-101,-420,-541,-280,-101,-346
+-101,-428,-497,-280,-106,-340
+-101,-428,-497,-280,-106,-340
+0,-445,-509,-280,-1,-394
+0,-445,-509,-280,-1,-394
+56,-454,-500,-280,56,-419
+56,-454,-511,-280,56,-419
+78,-462,-511,-280,89,-429
+78,-462,-454,-280,89,-429
+101,-470,-454,-280,110,-433
+101,-470,0,-280,110,-433
+33,-470,-512,-280,38,-385
+33,-470,-512,-280,38,-385
+101,-487,-496,-280,107,-417
+101,-487,-496,-280,107,-417
+56,-487,0,-280,58,-383
+56,-487,-507,-280,58,-383
+44,-496,-507,-280,50,-373
+44,-496,-461,-280,50,-373
+56,-504,-461,-280,61,-374
+56,-504,0,-280,61,-374
+0,-504,-510,-280,-5,-332
+0,-504,-510,-280,-5,-332
+-11,-512,0,-280,-14,-325
+-11,-512,0,-280,-14,-325
+78,-529,-1005,-35,544,-380
+78,-529,0,-35,544,-380
+179,-529,0,-35,542,-360
+179,-529,0,-35,542,-360
+281,-529,0,-55,445,-311
+281,-529,-550,-55,445,-311
+382,-538,0,-35,495,-303
+382,-538,0,-35,495,-303
+483,-546,-499,-35,540,-313
+483,-546,-499,-35,540,-313
+483,-546,0,-43,494,-282
+483,-546,-480,-43,494,-282
+528,-554,-480,-35,539,-284
+528,-554,0,-35,539,-284
+528,-554,0,-20,534,-253
+528,-554,-525,-20,534,-253
+539,-563,0,-32,545,-259
+539,-563,0,-32,545,-259
+607,-571,-506,-27,615,-280
+607,-571,-506,-27,615,-280
+607,-571,0,-20,612,-257
+607,-571,0,-20,612,-257
+551,-571,0,-23,558,-218
+551,-571,0,-23,558,-218
+494,-571,0,-22,505,-178
+494,-571,0,-22,505,-178
+449,-571,0,-21,453,-141
+449,-571,0,-21,453,-141
+404,-571,-497,-21,405,-110
+404,-571,-497,-21,405,-110
+303,-580,0,-18,256,-22
+303,-580,0,-18,256,-22
+292,-580,0,-17,297,-43
+292,-580,0,-17,297,-43
+303,-580,0,-16,305,-47
+303,-580,0,-16,305,-47
+292,-580,0,-15,300,-44
+292,-580,0,-15,300,-44
+281,-580,503,-15,289,-37
+281,-580,503,-15,289,-37
+179,-571,0,-18,186,16
+179,-571,0,-18,186,16
+134,-571,0,-19,142,36
+134,-571,0,-19,142,36
+123,-571,0,-20,126,41
+123,-571,0,-20,126,41
+123,-571,0,-20,125,38
+123,-571,504,-20,125,38
+33,-563,0,-23,36,80
+33,-563,0,-23,36,80
+0,-563,455,-25,7,88
+0,-563,455,-25,7,88
+-78,-554,0,-29,-85,129
+-78,-554,0,-29,-85,129
+-101,-554,0,-31,-109,131
+-101,-554,506,-31,-109,131
+-191,-546,506,-35,-195,164
+-191,-546,0,-35,-195,164
+-202,-546,0,-37,-210,159
+-202,-546,0,-37,-210,159
+-191,-546,0,-38,-195,140
+-191,-546,0,-38,-195,140
+-292,-529,999,-45,-355,210
+-292,-529,0,-45,-355,210
+-393,-529,0,-48,-397,215
+-393,-529,504,-48,-397,215
+-472,-521,504,-53,-479,241
+-472,-521,0,-53,-479,241
+-472,-521,0,-55,-482,224
+-472,-521,502,-55,-482,224
+-539,-512,502,-60,-546,239
+-539,-512,502,-60,-546,239
+-539,-512,0,-62,-542,218
+-539,-512,0,-62,-542,218
+-596,-504,496,-66,-604,232
+-596,-504,0,-66,-604,232
+-697,-504,0,-280,-991,212
+-697,-504,0,-280,-991,212
+-798,-504,0,-280,-980,180
+-798,-504,500,-280,-980,180
+-899,-496,0,-280,-1000,193
+-899,-496,0,-280,-1000,193
+-989,-487,505,-280,-1000,224
+-989,-487,505,-280,-1000,224
+-989,-487,0,-280,-1000,212
+-989,-487,0,-280,-1000,212
+-989,-487,0,-280,-1000,183
+-989,-487,0,-280,-1000,183
+-989,-487,0,-280,-1000,150
+-989,-487,501,-280,-1000,150
+-989,-479,0,-280,-1000,167
+-989,-479,0,-280,-1000,167
+-989,-479,0,-280,-1000,155
+-989,-479,0,-280,-1000,155
+-967,-479,0,-280,-973,133
+-967,-479,0,-280,-973,133
+-922,-479,0,-280,-930,109
+-922,-479,0,-280,-930,109
+-888,-479,0,-280,-891,86
+-888,-479,0,-280,-891,86
+-854,-479,0,-280,-858,67
+-854,-479,0,-280,-858,67
+-821,-479,0,-280,-831,52
+-821,-479,0,-280,-831,52
+-809,-479,0,-280,-810,40
+-809,-479,0,-280,-810,40
+-787,-479,0,-280,-793,30
+-787,-479,-500,-280,-793,30
+-697,-487,-500,-280,-697,-24
+-697,-487,-506,-280,-697,-24
+-596,-496,0,-280,-580,-91
+-596,-496,0,-280,-580,-91
+-539,-496,0,-280,-549,-108
+-539,-496,0,-280,-549,-108
+-472,-504,-495,-280,-476,-150
+-472,-504,-495,-280,-476,-150
+-472,-504,-495,-280,-475,-151
+-472,-504,0,-280,-475,-151
+-494,-504,0,-280,-504,-134
+-494,-504,-502,-280,-504,-134
+-449,-512,-492,-280,-460,-159
+-449,-512,-492,-280,-460,-159
+-359,-529,-514,-35,141,-246
+-359,-529,-514,-35,141,-246
+-258,-538,-485,-35,264,-301
+-258,-538,-512,-35,264,-301
+-157,-546,-512,-35,358,-338
+-157,-546,-500,-35,358,-338
+-56,-554,-500,-35,433,-362
+-56,-554,-506,-35,433,-362
+33,-563,-500,-35,496,-378
+33,-563,-500,-35,496,-378
+134,-580,-502,-26,655,-437
+134,-580,-502,-26,655,-437
+236,-588,-497,-18,752,-459
+236,-588,0,-18,752,-459
+337,-588,0,-14,726,-417
+337,-588,-494,-14,726,-417
+438,-596,-494,-8,744,-399
+438,-596,-513,-8,744,-399
+528,-605,-502,-3,784,-395
+528,-605,-502,-3,784,-395
+629,-613,-998,2,836,-395
+629,-613,-998,2,836,-395
+731,-630,0,11,986,-446
+731,-630,-504,11,986,-446
+832,-638,-504,19,1000,-463
+832,-638,0,19,1000,-463
+933,-638,0,23,1000,-419
+933,-638,-490,23,1000,-419
+989,-647,-1540,29,1000,-400
+989,-647,-1540,29,1000,-400
+989,-672,0,40,1000,-489
+989,-672,0,40,1000,-489
+989,-680,-493,49,1000,-518
+989,-680,-493,49,1000,-518
+989,-680,0,54,1000,-472
+989,-680,0,54,1000,-472
+989,-680,0,57,1000,-399
+989,-680,-501,57,1000,-399
+989,-689,-501,61,1000,-372
+989,-689,0,61,1000,-372
+911,-689,0,63,920,-319
+911,-689,0,63,920,-319
+821,-689,0,65,821,-261
+821,-689,0,65,821,-261
+719,-689,0,66,729,-207
+719,-689,0,66,729,-207
+641,-689,0,66,650,-162
+641,-689,0,66,650,-162
+584,-689,0,66,586,-125
+584,-689,0,66,586,-125
+528,-689,0,66,535,-96
+528,-689,0,66,535,-96
+427,-680,492,63,407,-26
+427,-680,492,63,407,-26
+348,-680,0,62,349,5
+348,-680,0,62,349,5
+314,-680,0,61,325,18
+314,-680,0,61,325,18
+314,-680,0,61,319,21
+314,-680,500,61,319,21
+224,-672,503,58,232,67
+224,-672,503,58,232,67
+123,-655,514,50,21,173
+123,-655,514,50,21,173
+22,-655,0,46,-42,197
+22,-655,503,46,-42,197
+-67,-647,503,41,-131,232
+-67,-647,489,41,-131,232
+-157,-638,489,35,-226,268
+-157,-638,0,35,-226,268
+-224,-638,495,32,-227,252
+-224,-638,495,32,-227,252
+-326,-622,510,25,-373,312
+-326,-622,510,25,-373,312
+-382,-622,0,21,-389,301
+-382,-622,1497,21,-389,301
+-483,-596,1497,10,-629,405
+-483,-596,503,10,-629,405
+-584,-588,503,1,-766,449
+-584,-588,491,1,-766,449
+-686,-580,0,-5,-853,464
+-686,-580,0,-5,-853,464
+-787,-571,500,-12,-915,465
+-787,-571,500,-12,-915,465
+-866,-571,0,-16,-874,413
+-866,-571,501,-16,-874,413
+-877,-563,501,-21,-888,393
+-877,-563,504,-21,-888,393
+-922,-554,504,-27,-930,387
+-922,-554,502,-27,-930,387
+-978,-546,502,-32,-984,388
+-978,-546,500,-32,-984,388
+-989,-529,504,-41,-1000,440
+-989,-529,504,-41,-1000,440
+-989,-529,504,-46,-1000,411
+-989,-529,504,-46,-1000,411
+-989,-521,227,-52,-1000,401
+-989,-521,0,-52,-1000,401
+-956,-521,0,-55,-962,351
+-956,-521,416,-55,-962,351
+-944,-512,416,-59,-947,338
+-944,-512,0,-59,-947,338
+-866,-512,553,-62,-876,295
+-866,-512,553,-62,-876,295
+-866,-504,0,-66,-876,291
+-866,-504,0,-66,-876,291
+-967,-504,0,-280,-1000,257
+-967,-504,0,-280,-1000,257
+-989,-504,0,-280,-1000,214
+-989,-504,0,-280,-1000,214
+-989,-504,0,-280,-1000,172
+-989,-504,0,-280,-1000,172
+-967,-504,0,-280,-977,135
+-967,-504,0,-280,-977,135
+-922,-504,0,-280,-924,105
+-922,-504,0,-280,-924,105
+-877,-504,0,-280,-881,80
+-877,-504,0,-280,-881,80
+-843,-504,0,-280,-847,61
+-843,-504,0,-280,-847,61
+-821,-504,0,-280,-821,46
+-821,-504,0,-280,-821,46
+-956,-521,507,-52,-962,354
+-956,-521,0,-52,-962,354
+-899,-521,0,-55,-903,318
+-899,-521,0,-55,-903,318
+-809,-521,0,-56,-817,267
+-809,-521,0,-56,-817,267
+-719,-521,0,-57,-729,216
+-719,-521,0,-57,-729,216
+-641,-521,0,-58,-651,170
+-641,-521,0,-58,-651,170
+-584,-521,0,-58,-585,132
+-584,-521,0,-58,-585,132
+-528,-521,0,-58,-532,102
+-528,-521,0,-58,-532,102
+-483,-521,0,-58,-490,78
+-483,-521,0,-58,-490,78
+-449,-521,-509,-59,-457,59
+-449,-521,-509,-59,-457,59
+-348,-538,-491,-35,-223,-49
+-348,-538,-491,-35,-223,-49
+-247,-538,0,-50,-177,-88
+-247,-538,-577,-50,-177,-88
+-146,-546,-577,-35,-46,-142
+-146,-546,0,-35,-46,-142
+-56,-546,0,-43,-39,-148
+-56,-546,-500,-43,-39,-148
+33,-554,-503,-35,47,-181
+33,-554,-503,-35,47,-181
+134,-571,-503,-31,231,-269
+134,-571,-503,-31,231,-269
+236,-580,-503,-23,367,-322
+236,-580,0,-23,367,-322
+337,-580,0,-19,377,-307
+337,-580,-501,-19,377,-307
+427,-588,-501,-14,428,-314
+427,-588,-498,-14,428,-314
+494,-596,-1510,-9,495,-329
+494,-596,-1510,-9,495,-329
+584,-622,0,2,754,-440
+584,-622,0,2,754,-440
+686,-630,-500,11,895,-483
+686,-630,0,11,895,-483
+787,-630,0,16,887,-446
+787,-630,-506,16,887,-446
+888,-638,-506,22,910,-428
+888,-638,0,22,910,-428
+854,-638,-494,25,858,-373
+854,-638,-494,25,858,-373
+866,-647,0,29,873,-355
+866,-647,0,29,873,-355
+911,-655,-460,35,921,-355
+911,-655,-546,35,921,-355
+956,-664,-546,40,956,-362
+956,-664,0,40,956,-362
+888,-664,0,44,895,-324
+888,-664,-510,44,895,-324
+888,-672,0,48,895,-319
+888,-672,0,48,895,-319
+911,-680,-501,54,920,-329
+911,-680,-501,54,920,-329
+866,-680,0,57,867,-295
+866,-680,0,57,867,-295
+787,-680,0,58,788,-248
+787,-680,0,58,788,-248
+697,-680,0,59,706,-201
+697,-680,0,59,706,-201
+629,-680,0,60,633,-159
+629,-680,0,60,633,-159
+562,-680,0,60,572,-123
+562,-680,0,60,572,-123
+517,-680,0,60,522,-95
+517,-680,0,60,522,-95
+472,-680,0,60,483,-72
+472,-680,484,60,483,-72
+382,-672,484,57,365,-8
+382,-672,0,57,365,-8
+303,-672,496,56,314,19
+303,-672,496,56,314,19
+213,-664,0,52,206,75
+213,-664,0,52,206,75
+112,-655,493,47,80,137
+112,-655,0,47,80,137
+44,-655,0,44,48,147
+44,-655,505,44,48,147
+-33,-647,505,40,-34,182
+-33,-647,0,40,-34,182
+-33,-647,508,38,-41,176
+-33,-647,508,38,-41,176
+-101,-638,492,34,-108,201
+-101,-638,492,34,-108,201
+-191,-630,0,29,-199,236
+-191,-630,520,29,-199,236
+-292,-622,520,23,-295,271
+-292,-622,504,23,-295,271
+-382,-613,504,17,-389,302
+-382,-613,500,17,-389,302
+-472,-605,503,11,-477,328
+-472,-605,503,11,-477,328
+-551,-596,497,5,-559,349
+-551,-596,497,5,-559,349
+-652,-580,476,-3,-728,413
+-652,-580,476,-3,-728,413
+-731,-580,0,-8,-742,393
+-731,-580,500,-8,-742,393
+-776,-571,500,-14,-782,387
+-776,-571,0,-14,-782,387
+-742,-571,0,-17,-744,342
+-742,-571,496,-17,-744,342
+-764,-563,504,-22,-769,331
+-764,-563,504,-22,-769,331
+-866,-546,492,-30,-918,384
+-866,-546,492,-30,-918,384
+-967,-538,514,-37,-1000,410
+-967,-538,502,-37,-1000,410
+-989,-529,502,-44,-1000,422
+-989,-529,0,-44,-1000,422
+-989,-529,0,-48,-998,379
+-989,-529,494,-48,-998,379
+-978,-521,0,-53,-984,366
+-978,-521,0,-53,-984,366
+-899,-521,0,-55,-907,319
+-899,-521,0,-55,-907,319
+-899,-512,250,-60,-901,311
+-899,-512,0,-60,-901,311
+-832,-512,0,-62,-838,273
+-832,-512,0,-62,-838,273
+-753,-512,0,-63,-758,226
+-753,-512,0,-63,-758,226
+-674,-512,0,-64,-681,182
+-674,-512,0,-64,-681,182
+-607,-512,0,-64,-614,143
+-607,-512,0,-64,-614,143
+-551,-512,0,-65,-558,111
+-551,-512,0,-65,-558,111
+-506,-512,0,-65,-513,85
+-506,-512,0,-65,-513,85
+-472,-512,0,-65,-478,65
+-472,-512,0,-65,-478,65
+-449,-512,0,-65,-450,49
+-449,-512,0,-65,-450,49
+-427,-512,0,-65,-429,37
+-427,-512,0,-65,-429,37
+-404,-512,0,-65,-413,28
+-404,-512,0,-65,-413,28
+-393,-512,0,-65,-401,21
+-393,-512,-512,-65,-401,21
+-303,-521,-512,-62,-304,-31
+-303,-521,0,-62,-304,-31
+-269,-521,0,-61,-270,-49
+-269,-521,0,-61,-270,-49
+-258,-521,0,-60,-265,-51
+-258,-521,0,-60,-265,-51
+-157,-529,-654,-35,-141,-93
+-157,-529,-504,-35,-141,-93
+-56,-538,-504,-35,-35,-147
+-56,-538,-502,-35,-35,-147
+33,-546,-502,-35,73,-200
+33,-546,0,-35,73,-200
+67,-546,0,-43,72,-199
+67,-546,-505,-43,72,-199
+146,-554,-503,-35,149,-224
+146,-554,-503,-35,149,-224
+224,-563,0,-34,229,-256
+224,-563,0,-34,229,-256
+314,-571,-510,-28,321,-288
+314,-571,-510,-28,321,-288
+326,-571,0,-20,326,-268
+326,-571,-532,-20,326,-268
+359,-580,-532,-20,367,-277
+359,-580,0,-20,367,-277
+337,-580,-541,-18,346,-250
+337,-580,-541,-18,346,-250
+382,-588,-495,-13,391,-258
+382,-588,-495,-13,391,-258
+483,-605,-513,-5,558,-326
+483,-605,0,-5,558,-326
+573,-605,0,-1,582,-318
+573,-605,-501,-1,582,-318
+629,-613,-501,3,638,-326
+629,-613,0,3,638,-326
+607,-613,0,6,615,-292
+607,-613,0,6,615,-292
+551,-613,0,8,561,-246
+551,-613,0,8,561,-246
+584,-622,-506,11,594,-246
+584,-622,-506,11,594,-246
+562,-622,0,14,573,-218
+562,-622,0,14,573,-218
+528,-622,0,15,532,-182
+528,-622,0,15,532,-182
+483,-622,0,15,487,-147
+483,-622,0,15,487,-147
+438,-622,0,16,446,-116
+438,-622,0,16,446,-116
+404,-622,0,16,412,-90
+404,-622,0,16,412,-90
+303,-613,495,13,291,-22
+303,-613,0,13,291,-22
+224,-613,0,12,236,8
+224,-613,470,12,236,8
+134,-605,470,8,120,67
+134,-605,521,8,120,67
+33,-596,516,3,-12,131
+33,-596,516,3,-12,131
+-56,-588,0,-1,-144,190
+-56,-588,0,-1,-144,190
+-157,-580,498,-7,-267,240
+-157,-580,0,-7,-267,240
+-258,-580,0,-11,-286,233
+-258,-580,487,-11,-286,233
+-348,-571,487,-15,-353,252
+-348,-571,533,-15,-353,252
+-427,-563,0,-21,-438,278
+-427,-563,0,-21,-438,278
+-528,-554,510,-26,-528,305
+-528,-554,510,-26,-528,305
+-607,-546,497,-32,-617,329
+-607,-546,507,-32,-617,329
+-697,-538,507,-38,-702,349
+-697,-538,950,-38,-702,349
+-798,-521,950,-48,-875,412
+-798,-521,527,-48,-875,412
+-899,-512,527,-55,-985,439
+-899,-512,527,-55,-985,439
+-967,-512,0,-60,-972,401
+-967,-512,0,-60,-972,401
+-899,-512,0,-62,-909,340
+-899,-512,501,-62,-909,340
+-922,-504,501,-66,-927,324
+-922,-504,0,-66,-927,324
+-989,-504,0,-280,-1000,281
+-989,-504,536,-280,-1000,281
+-989,-496,0,-280,-1000,278
+-989,-496,0,-280,-1000,278
+-989,-487,511,-280,-1000,293
+-989,-487,511,-280,-1000,293
+-989,-479,489,-280,-1000,314
+-989,-479,0,-280,-1000,314
+-989,-479,0,-280,-1000,287
+-989,-479,0,-280,-1000,287
+-989,-479,0,-280,-1000,243
+-989,-479,0,-280,-1000,243
+-989,-479,0,-280,-1000,198
+-989,-479,0,-280,-1000,198
+-989,-479,0,-280,-1000,157
+-989,-479,0,-280,-1000,157
+-989,-470,493,-280,-1000,170
+-989,-470,0,-280,-1000,170
+-989,-470,0,-280,-1000,156
+-989,-470,0,-280,-1000,156
+-967,-470,0,-280,-972,132
+-967,-470,0,-280,-972,132
+-922,-470,0,-280,-929,108
+-922,-470,0,-280,-929,108
+-888,-470,0,-280,-890,85
+-888,-470,0,-280,-890,85
+-854,-470,0,-280,-857,67
+-854,-470,-510,-280,-857,67
+-753,-479,-510,-280,-747,4
+-753,-479,0,-280,-747,4
+-697,-479,0,-280,-701,-21
+-697,-479,-530,-280,-701,-21
+-596,-487,0,-280,-604,-77
+-596,-487,0,-280,-604,-77
+-573,-487,-501,-280,-579,-91
+-573,-487,-501,-280,-579,-91
+-494,-496,0,-280,-504,-134
+-494,-496,-503,-280,-504,-134
+-416,-504,-503,-280,-417,-184
+-416,-504,0,-280,-417,-184
+-416,-504,0,-280,-417,-184
+-416,-504,0,-280,-417,-184
+-449,-504,0,-280,-454,-163
+-449,-504,-501,-280,-454,-163
+-416,-512,0,-280,-418,-183
+-416,-512,0,-280,-418,-183
+-314,-521,-493,-35,89,-218
+-314,-521,-493,-35,89,-218
+-213,-546,-1513,-35,351,-350
+-213,-546,-508,-35,351,-350
+-112,-554,-508,-35,497,-412
+-112,-554,0,-35,497,-412
+-11,-554,0,-35,497,-391
+-11,-554,0,-35,497,-391
+78,-554,-490,-20,463,-338
+78,-554,-490,-20,463,-338
+179,-563,-413,-32,448,-326
+179,-563,-413,-32,448,-326
+281,-580,-526,-24,589,-378
+281,-580,-526,-24,589,-378
+371,-588,-507,-17,687,-405
+371,-588,-504,-17,687,-405
+472,-596,-504,-10,761,-417
+472,-596,-497,-10,761,-417
+573,-605,-497,-
+目标点震荡还是严重，提前刹车还是早了一点
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:48Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting pid.c data and logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing braking thresholds and oscillation causes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:52Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning localized endpoint damping patch**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:52Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning local angle limit to reduce reversal**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:56Z)**_
+
+这组新数据把问题暴露得更清楚了：不是单纯外环 `ch3` 的事，到了 `-6.0` 附近以后，内环 `ch4` 还会打到接近满角去反拉，所以球过点后被大力拽回，来回穿越就很重。我要把 `-6.0` 的终点补丁再收一层：一是把外环真正开始收刹的位置再往里推一点，二是在终点附近单独压住内环允许出的倾角，避免终点区“猛拉猛推”。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:57Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `pidY_velocity_damping|motor_set_angle|SPEED_LOOP_ANGLE_LIMIT|pidY_Speed.out|pidout_limit_Y`
+
+```text
+64:float pidY_velocity_damping;
+720:void pidout_limit_Y(pid_t *pid)
+730:void motor_set_angle(float target_deg)
+940:	pidY_velocity_damping = 0.0f;
+943:	pidY_Speed.out = 0.0f;
+953:		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+955:		pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+956:		float cmd_angle = pidY_velocity_damping;
+974:	motor_set_angle(cmd_angle);
+980:void pidout_limit_Y(pid_t *pid)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:24:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+915					pidY.out = -1.6f * relative_y;
+916					if(pidY.out > 0.16f) pidY.out = 0.16f;
+917					else if(pidY.out < -0.16f) pidY.out = -0.16f;
+918				}
+919			} else {
+920				pidY.out = 0.0f;
+921			}
+922		}
+923	
+924		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+925		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+926		 */
+927		float control_velocity = estimated_velocity;
+928		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+929			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+930		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+931			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+932		}
+933		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+934		                         (control_velocity - pidY_filtered_velocity);
+935	
+936	#if POSITION_LOOP_DIRECT_DRIVE
+937		/* 单环调试模式：位置环直接输出平台倾角。
+938		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+939		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+940		pidY_velocity_damping = 0.0f;
+941		pidY_Speed.target = 0.0f;
+942		pidY_Speed.now = pidY_filtered_velocity;
+943		pidY_Speed.out = 0.0f;
+944		pidY_Speed.pout = 0.0f;
+945		pidY_Speed.iout = 0.0f;
+946		pidY_Speed.dout = 0.0f;
+947	
+948		float cmd_angle = pidY.out;
+949		#else
+950			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+951			pidY_Speed.target = pidY.out;
+952			pidY_Speed.now = pidY_filtered_velocity;
+953			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+954			                SPEED_LOOP_I_LIMIT);
+955			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+956			float cmd_angle = pidY_velocity_damping;
+957		#endif
+958	
+959		// 负方向（下降）机构补偿 ×1.2。
+960		if(cmd_angle < 0.0f) {
+961			cmd_angle *= 1.0f;
+962		}
+963	
+964		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+965		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+966		static float cmd_angle_last = 0.0f;
+967		{
+968			float delta = cmd_angle - cmd_angle_last;
+969			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+970			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+971			cmd_angle = cmd_angle_last + delta;
+972			cmd_angle_last = cmd_angle;
+973		}
+974		motor_set_angle(cmd_angle);
+975	
+976		relative_y_last = relative_y;
+977		Y_last = Y;
+978	}
+979	
+980	void pidout_limit_Y(pid_t *pid)
+981	{
+982		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+983	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preparing to apply patch in pid.c**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:10Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing PID limits for early braking**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:12Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing angle clamp near target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:17Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing speed feedback impact on angle control**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:19Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning local angle cap and braking thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting braking floor threshold closer to target**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Adjusting braking thresholds**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Implementing angle clamping logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preparing bash patch application**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:25:31Z)**_
+
+我现在直接落两处本地补丁：`-6.0` 前的“外环收刹窗口”再往目标里侧挪一些，同时在同一区间对 `cmd_angle/ch4` 单独限一个更小的角度上限。这样改是冲着你这组数据里最明显的现象去的：`ch3` 已经不大，但 `ch4` 仍然在终点附近猛打。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:26:07Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Patch -6.0 endpoint braking and local angle cap in pid.c
 
 ```bash
 apply_patch <<'PATCH'
 *** Begin Patch
-*** Update File: Core/Src/main.c
+*** Update File: d:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c
 @@
- /* USER CODE BEGIN PV */
- 
- // 钢球位置误差/速度（由 USART2 中断从 MaixCAM 数据解析）
- volatile float ball_velocity = 0.0f;  // 钢球速度（cm/s），USART2 中断写、主循环读，必须 volatile
-+static bool ball_target_switched_to_negative = false;
+ 	if(target_is_neg6 && !target_hold_active) {
+-		/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+-		 * 但把第二段托底收短，给最后 1cm 的减冲窗口留出空间。 */
++		/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
++		 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+ 		if(relative_y > 2.8f) {
+ 			if(pidY.out > -4.2f) pidY.out = -4.2f;
+-		} else if(relative_y > 0.9f) {
+-			if(pidY.out > -2.8f) pidY.out = -2.8f;
++		} else if(relative_y > 0.65f) {
++			if(pidY.out > -2.6f) pidY.out = -2.6f;
+ 		}
+ 	}
+ 	if(target_is_neg6) {
+-		/* -6.0 前最后 0.9cm 改成按“剩余距离 + 当前来向速度”收刹：
++		/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+ 		 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+ 		 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+-		if(relative_y > 0.0f && relative_y <= 0.9f) {
+-			float neg6_speed_limit = 1.20f;
+-			if(relative_y <= 0.45f) neg6_speed_limit = 0.55f;
+-			if(estimated_velocity < -2.2f) {
+-				neg6_speed_limit = 0.35f;
+-			} else if(estimated_velocity < -1.4f && relative_y <= 0.55f) {
+-				neg6_speed_limit = 0.20f;
++		if(relative_y > 0.0f && relative_y <= 0.65f) {
++			float neg6_speed_limit = 0.95f;
++			if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
++			if(estimated_velocity < -2.0f) {
++				neg6_speed_limit = 0.12f;
++			} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
++				neg6_speed_limit = 0.18f;
+ 			}
+ 			if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+ 			else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+-		} else if(abs_relative_y <= 0.35f) {
+-			float neg6_speed_limit = 0.45f;
++		} else if(abs_relative_y <= 0.30f) {
++			float neg6_speed_limit = 0.30f;
+ 			if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+ 			else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+ 		}
+ 	}
+ 	if(target_hold_active) {
+ 		/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+ 		 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+ 		if(target_is_neg6) {
+-			if(pid_absf(relative_y) <= 0.05f) {
++			if(pid_absf(relative_y) <= 0.06f) {
+ 				pidY.out = 0.0f;
+ 			} else {
+-				pidY.out = -1.6f * relative_y;
+-				if(pidY.out > 0.16f) pidY.out = 0.16f;
+-				else if(pidY.out < -0.16f) pidY.out = -0.16f;
++				pidY.out = -1.1f * relative_y;
++				if(pidY.out > 0.10f) pidY.out = 0.10f;
++				else if(pidY.out < -0.10f) pidY.out = -0.10f;
+ 			}
+ 		} else {
+ 			pidY.out = 0.0f;
 @@
-   pid_init(&pidY, POSITION_PID, 1.20f, 0.0f, 0.00f, 0.0f);
-   pid_init(&pidY_Speed, POSITION_PID, 1.1f, 0.01f, 0.0f, 0.0f);//P=1.1 I=0.01/tick
-+  ball_target_switched_to_negative = false;
-   ball_target_set(5.0f);
-   BT_Tune_Init();
-   while (1)
-@@
-     /* USER CODE BEGIN 3 */
-     BT_Tune_Process();
+ 		pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+ 		                SPEED_LOOP_I_LIMIT);
+ 		pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+ 		float cmd_angle = pidY_velocity_damping;
+ 	#endif
 +
-+    if(!ball_target_switched_to_negative && Y >= 5.0f)
-+    {
-+      ball_target_switched_to_negative = true;
-+      ball_target_set(-5.0f);
-+    }
++	if(target_is_neg6) {
++		/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
++		 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
++		float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
++		if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
++		if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
++		if(target_hold_active) neg6_angle_limit = 2.0f;
++		if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
++		else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
++	}
  
-  if(g_flag_10ms)
-     {
+ 	// 负方向（下降）机构补偿 ×1.2。
+ 	if(cmd_angle < 0.0f) {
 *** End Patch
 PATCH
 ```
 
 ```text
 Exit code 127
-/usr/bin/bash: line 30: apply_patch: command not found
+/usr/bin/bash: line 86: apply_patch: command not found
 ```
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:40Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:26:12Z)**_
 
 <think><details><summary>Thought Process</summary>
-**Planning edit workflow adjustments**
+**Planning manual patch application with Edit**
 </details></think>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:41Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:26:17Z)**_
 
-补丁工具在这个环境里不可用，我改用精确编辑把状态机塞进 `main.c`，逻辑不变。
+`apply_patch` 在这个环境里还是不可用，我直接用精确文本替换把同样的改动落进 `pid.c`。逻辑不变，还是那两刀：把外环收刹窗口往里推，以及在 `-6.0` 终点附近单独限内环角度。
 
-_**Agent (claude-opus-4-8 2026-08-02 19:46:46Z)**_
-
-<tool-use data-tool-type="write" data-tool-name="Edit"><details>
-<summary>Tool use: **Edit**</summary>
-
-```text
-The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c has been updated successfully. (file state is current in your context — no need to Read it back)
-```
-</details></tool-use>
-
-_**Agent (claude-opus-4-8 2026-08-02 19:46:53Z)**_
-
-先加一个一次性切换标志，避免进到 `+5` 附近后反复改目标。
-
-_**Agent (claude-opus-4-8 2026-08-02 19:46:59Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:26:42Z)**_
 
 <tool-use data-tool-type="write" data-tool-name="Edit"><details>
 <summary>Tool use: **Edit**</summary>
 
 ```text
-The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c has been updated successfully. (file state is current in your context — no need to Read it back)
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
 ```
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:47:04Z)**_
-
-现在把“到 +5 立刻改成 -5”放进主循环，优先于控制调用。
-
-_**Agent (claude-opus-4-8 2026-08-02 19:47:08Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:26:56Z)**_
 
 <tool-use data-tool-type="write" data-tool-name="Edit"><details>
 <summary>Tool use: **Edit**</summary>
 
 ```text
-The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\main.c has been updated successfully. (file state is current in your context — no need to Read it back)
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
 ```
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:47:12Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:27:00Z)**_
 
-逻辑已接好，我跑一次构建确认没有引入编译问题。
+两处关键改动已经落下去了：`-6.0` 前的外环托底保持得更靠后，终点区的速度环输出角度也被单独压了帽。现在编译确认，然后你下一组 VOFA 里最该盯的是 `ch4` 能不能从之前那种终点附近大幅翻正翻负，收成更小更缓的摆动。
 
-_**Agent (claude-opus-4-8 2026-08-02 19:47:13Z)**_
-
-<tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
-<summary>Tool use: **TodoWrite**</summary>
-**Agent task list:**
-- [X] 🌡️ 查看当前目标与主循环结构
-- [X] 🌡️ 加入 +5 到 -5 的切换状态机
-- [⚡] 🌡️ 构建验证固件
-
-</details></tool-use>
-
-_**Agent (claude-opus-4-8 2026-08-02 19:47:24Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:27:06Z)**_
 
 <tool-use data-tool-type="shell" data-tool-name="Bash"><details>
 <summary>Tool use: **Bash**</summary>
-Build firmware after target switching change
+Build firmware after endpoint patch update
 
-`cmake --build build/Debug`
+`cmake --build d:/File/2026diansaiH/Code_of_ZDT/build/Debug`
 
 ```text
-[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/main.c.obj
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
 [2/2] Linking C executable Code_of_ZDT.elf
 Memory region         Used Size  Region Size  %age Used
-             RAM:        3512 B       128 KB      2.68%
+             RAM:        3496 B       128 KB      2.67%
           CCMRAM:           0 B        64 KB      0.00%
-           FLASH:       38032 B         1 MB      3.63%
+           FLASH:       38520 B         1 MB      3.67%
 ```
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:47:33Z)**_
-
-构建通过。我再抓下关键行号，方便你直接对照。
-
-_**Agent (claude-opus-4-8 2026-08-02 19:47:33Z)**_
-
-<tool-use data-tool-type="search" data-tool-name="Grep"><details>
-<summary>Tool use: **Grep**</summary>
- path `./\Core\Src\main.c` pattern `ball_target_switched_to_negative|ball_target_set\(5\.0f\)|ball_target_set\(-5\.0f\)|Y >= 5\.0f`
-</details></tool-use>
-
-_**Agent (claude-opus-4-8 2026-08-02 19:47:34Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:27:10Z)**_
 
 <tool-use data-tool-type="task" data-tool-name="TodoWrite"><details>
 <summary>Tool use: **TodoWrite**</summary>
 **Agent task list:**
-- [X] 🌡️ 查看当前目标与主循环结构
-- [X] 🌡️ 加入 +5 到 -5 的切换状态机
-- [X] 🌡️ 构建验证固件
+- [X] 🌡️ Tune -6.0 endpoint logic in pid.c to reduce target oscillation without reintroducing early braking
+- [X] 🌡️ Build firmware in build/Debug to verify the change compiles
+- [X] 🌡️ Summarize the behavioral change and remaining tuning direction
 
 </details></tool-use>
 
-_**Agent (claude-opus-4-8 2026-08-02 19:52:23Z)**_
+_**Agent (claude-opus-4-8 2026-08-03 05:27:23Z)**_
 
-已经改好。
+我已经继续收了一版，改动都在 [Core/Src/pid.c](Core/Src/pid.c)。
 
-现在流程是：
+这次是针对你这组数据里两个更具体的问题下手：
 
-1. 上电后目标先设为 `+5.0 cm`
-2. 主循环持续检测小球位置 `Y`
-3. 一旦检测到 `Y >= +5.0 cm`，立刻把目标切到 `-5.0 cm`
-4. 这个切换只发生一次，之后控制器就只会稳定在 `-5.0 cm`
+1. 提前刹车还是偏早  
+   我把 `-6.0` 回程第二段托底从原来的 `relative_y > 0.9` 改成了 `relative_y > 0.65`，也就是让中段的负向巡航保持得更靠近目标一点，避免还没进终点区就开始明显收油。
 
-关键位置在 [main.c:59](Core/Src/main.c#L59) 和 [main.c:161-164](Core/Src/main.c#L161-L164)。
+2. 目标点震荡重  
+   这组数据里最扎眼的是终点附近 `ch4` 仍然会打很大，不只是 `ch3` 的问题。所以我又加了一层只对 `-6.0` 生效的内环角度帽：
+   - `|relative_y| <= 0.75` 时，`cmd_angle` 限到 `5.5°`
+   - `|relative_y| <= 0.35` 时，再限到 `3.2°`
+   - 进入 hold 后，再收成 `2.0°`
 
-你现在的实现判断条件是“到达或超过 +5cm 就切换”：
-```c
-if(!ball_target_switched_to_negative && Y >= 5.0f)
-{
-  ball_target_switched_to_negative = true;
-  ball_target_set(-5.0f);
-}
+同时把终点前最后一小段的外环减冲窗口继续收紧了：
+- 现在只在最后 `0.65cm` 内做强收刹
+- 若此时 `estimated_velocity` 还在明显负向，就把 `pidY.out` 压到更小，避免穿点
+- hold 内的比例型保持也进一步减弱了，避免停住后自己左右抽
+
+编译已经过了，`build/Debug` 正常：
+- `FLASH: 38520 B`
+- `RAM: 3496 B`
+
+你下一组 VOFA 重点看这三件事：
+
+- `ch1` 到 `-6.0` 前 `0.6cm` 左右，是否还会很早开始变慢
+- `ch4` 在 `-6.0` 附近是否还会像之前那样大幅正负翻
+- 过点后第一下回拉的幅度有没有明显变小
+
+从这组现象判断，后面若还要继续收，优先继续动的是终点区 `ch4` 限角，不是再去加新 PID 段。
+
+---
+
+_**User (2026-08-03 05:28:07Z)**_
+
+-888,-504,0,-260,-892,107
+-888,-504,0,-260,-892,107
+-922,-496,499,-260,-933,130
+-922,-496,499,-260,-933,130
+-922,-496,0,-260,-924,125
+-922,-496,0,-260,-924,125
+-888,-496,0,-260,-896,109
+-888,-496,-512,-260,-896,109
+-787,-504,-512,-260,-780,43
+-787,-504,0,-260,-780,43
+-719,-504,0,-260,-724,10
+-719,-504,0,-260,-724,10
+-697,-504,0,-260,-698,-3
+-697,-504,0,-260,-698,-3
+-686,-504,0,-260,-689,-9
+-686,-504,0,-260,-689,-9
+-686,-504,0,-260,-686,-10
+-686,-504,-250,-260,-686,-10
+-596,-512,-250,-260,-605,-57
+-596,-512,0,-260,-605,-57
+-573,-512,-498,-260,-582,-69
+-573,-512,-498,-260,-582,-69
+-494,-521,-498,-260,-504,-114
+-494,-521,-498,-260,-504,-114
+-404,-529,-249,-260,-412,-167
+-404,-529,-516,-260,-412,-167
+-314,-538,-516,-260,-324,-217
+-314,-538,0,-260,-324,-217
+-326,-538,0,-260,-330,-213
+-326,-538,-452,-260,-330,-213
+-224,-546,-452,-12,163,-235
+-224,-546,-547,-12,163,-235
+-123,-554,-514,-12,240,-265
+-123,-554,-514,-12,240,-265
+-22,-571,-502,-12,408,-342
+-22,-571,-504,-12,408,-342
+67,-580,-504,-12,516,-382
+67,-580,-499,-12,516,-382
+168,-588,-499,-12,591,-403
+168,-588,-496,-12,591,-403
+258,-596,-496,-10,653,-413
+258,-596,-1025,-10,653,-413
+314,-613,-500,-1,807,-466
+314,-613,-500,-1,807,-466
+314,-630,-500,9,991,-529
+314,-630,-500,9,991,-529
+314,-638,-502,18,1000,-543
+314,-638,0,18,1000,-543
+314,-638,0,23,993,-488
+314,-638,-1475,23,993,-488
+416,-664,-1475,34,1000,-552
+416,-664,-508,34,1000,-552
+517,-672,-513,43,1000,-563
+517,-672,-513,43,1000,-563
+539,-680,0,51,1000,-552
+539,-680,0,51,1000,-552
+641,-689,-497,58,1000,-532
+641,-689,-503,58,1000,-532
+742,-697,-503,64,1000,-511
+742,-697,-504,64,1000,-511
+843,-706,-504,71,1000,-493
+843,-706,-514,71,1000,-493
+944,-714,0,77,1000,-477
+944,-714,0,77,1000,-477
+989,-722,-502,84,1000,-463
+989,-722,-502,84,1000,-463
+989,-731,-499,90,1000,-453
+989,-731,0,90,1000,-453
+989,-731,0,94,1000,-398
+989,-731,-492,94,1000,-398
+989,-739,-492,98,1000,-378
+989,-739,-502,98,1000,-378
+989,-748,0,104,1000,-374
+989,-748,0,104,1000,-374
+989,-748,0,107,1000,-330
+989,-748,0,107,1000,-330
+922,-748,0,108,922,-275
+922,-748,0,108,922,-275
+821,-748,0,109,830,-221
+821,-748,0,109,830,-221
+742,-748,0,110,748,-174
+742,-748,0,110,748,-174
+674,-748,0,110,680,-135
+674,-748,0,110,680,-135
+618,-748,0,110,626,-104
+618,-748,0,110,626,-104
+573,-748,0,110,583,-79
+573,-748,0,110,583,-79
+539,-748,0,110,549,-60
+539,-748,0,110,549,-60
+517,-748,0,110,524,-45
+517,-748,0,110,524,-45
+494,-748,494,110,504,-34
+494,-748,494,110,504,-34
+393,-739,0,108,402,21
+393,-739,0,108,402,21
+303,-731,505,103,275,89
+303,-731,507,103,275,89
+202,-722,507,98,146,154
+202,-722,502,98,146,154
+101,-714,502,92,25,211
+101,-714,1479,92,25,211
+0,-689,0,81,-269,352
+0,-689,0,81,-269,352
+-89,-689,500,74,-343,371
+-89,-689,500,74,-343,371
+-191,-680,0,68,-408,384
+-191,-680,509,68,-408,384
+-292,-672,509,62,-469,393
+-292,-672,502,62,-469,393
+-393,-664,502,55,-527,400
+-393,-664,503,55,-527,400
+-494,-655,503,49,-582,405
+-494,-655,489,49,-582,405
+-539,-647,513,43,-636,409
+-539,-647,513,43,-636,409
+-539,-638,0,36,-689,412
+-539,-638,500,36,-689,412
+-539,-630,500,30,-742,414
+-539,-630,2009,30,-742,414
+-449,-596,2009,15,-987,510
+-449,-596,499,15,-987,510
+-348,-588,499,4,-1000,565
+-348,-588,0,4,-1000,565
+-314,-588,502,-1,-1000,525
+-314,-588,502,-1,-1000,525
+-314,-571,495,-10,-1000,543
+-314,-571,495,-10,-1000,543
+-314,-563,500,-18,-1000,537
+-314,-563,0,-18,-1000,537
+-314,-563,0,-22,-1000,474
+-314,-563,509,-22,-1000,474
+-416,-554,509,-27,-1000,442
+-416,-554,0,-27,-1000,442
+-517,-554,511,-30,-966,379
+-517,-554,511,-30,-966,379
+-539,-546,1179,-34,-937,357
+-539,-546,1179,-34,-937,357
+-539,-521,0,-45,-1000,450
+-539,-521,0,-45,-1000,450
+-539,-521,0,-260,-1000,438
+-539,-521,0,-260,-1000,438
+-539,-521,0,-260,-1000,383
+-539,-521,0,-260,-1000,383
+-641,-521,0,-260,-1000,318
+-641,-521,416,-260,-1000,318
+-742,-512,0,-260,-1000,302
+-742,-512,0,-260,-1000,302
+-843,-512,0,-260,-1000,261
+-843,-512,0,-260,-1000,261
+-944,-512,0,-260,-1000,215
+-944,-512,0,-260,-1000,215
+-989,-512,0,-260,-1000,172
+-989,-512,0,-260,-1000,172
+-933,-512,0,-260,-941,135
+-933,-512,0,-260,-941,135
+-877,-512,479,-260,-888,104
+-877,-512,479,-260,-888,104
+-922,-504,0,-260,-928,127
+-922,-504,0,-260,-928,127
+-911,-504,0,-260,-919,122
+-911,-504,512,-260,-919,122
+-967,-496,512,-260,-974,154
+-967,-496,0,-260,-974,154
+-956,-496,0,-260,-966,149
+-956,-496,-511,-260,-966,149
+-866,-504,0,-260,-851,83
+-866,-504,0,-260,-851,83
+-787,-504,0,-260,-787,47
+-787,-504,0,-260,-787,47
+-742,-504,0,-260,-751,26
+-742,-504,0,-260,-751,26
+-731,-504,0,-260,-731,15
+-731,-504,0,-260,-731,15
+-719,-504,0,-260,-720,8
+-719,-504,-502,-260,-720,8
+-629,-512,-502,-260,-631,-42
+-629,-512,0,-260,-631,-42
+-596,-512,0,-260,-603,-58
+-596,-512,0,-260,-603,-58
+-517,-521,-499,-260,-520,-105
+-517,-521,0,-260,-520,-105
+-506,-521,0,-260,-506,-113
+-506,-521,-505,-260,-506,-113
+-438,-529,-505,-260,-440,-151
+-438,-529,-502,-260,-440,-151
+-359,-538,-502,-260,-360,-196
+-359,-538,0,-260,-360,-196
+-359,-538,-549,-260,-366,-193
+-359,-538,-549,-260,-366,-193
+-258,-546,0,-12,130,-217
+-258,-546,-515,-12,130,-217
+-157,-554,-515,-12,211,-250
+-157,-554,-506,-12,211,-250
+-56,-563,-506,-12,295,-282
+-56,-563,-508,-12,295,-282
+22,-571,-508,-12,376,-311
+22,-571,-941,-12,376,-311
+123,-588,-533,-12,538,-383
+123,-588,-533,-12,538,-383
+224,-605,-504,-9,730,-463
+224,-605,-500,-9,730,-463
+314,-613,-500,0,844,-492
+314,-613,-1485,0,844,-492
+314,-638,-1485,12,1000,-569
+314,-638,0,12,1000,-569
+314,-638,0,20,1000,-548
+314,-638,0,20,1000,-548
+314,-638,0,24,969,-478
+314,-638,0,24,969,-478
+416,-647,-502,29,963,-442
+416,-647,-502,29,963,-442
+517,-672,-1477,40,1000,-520
+517,-672,0,40,1000,-520
+539,-672,0,46,1000,-493
+539,-672,0,46,1000,-493
+539,-672,0,50,1000,-426
+539,-672,-473,50,1000,-426
+539,-680,0,54,1000,-398
+539,-680,0,54,1000,-398
+641,-680,0,57,949,-342
+641,-680,0,57,949,-342
+742,-689,-499,61,931,-327
+742,-689,-503,61,931,-327
+843,-697,-503,66,948,-332
+843,-697,0,66,948,-332
+888,-697,0,69,890,-296
+888,-697,0,69,890,-296
+798,-697,-554,71,809,-248
+798,-697,-554,71,809,-248
+809,-706,0,74,815,-247
+809,-706,0,74,815,-247
+764,-706,0,77,769,-219
+764,-706,0,77,769,-219
+697,-706,0,78,707,-183
+697,-706,-492,78,707,-183
+731,-714,-492,81,734,-195
+731,-714,0,81,734,-195
+697,-714,0,83,707,-177
+697,-714,0,83,707,-177
+652,-714,0,84,661,-150
+652,-714,0,84,661,-150
+607,-714,0,85,613,-122
+607,-714,0,85,613,-122
+562,-714,0,85,569,-97
+562,-714,0,85,569,-97
+528,-714,0,85,532,-75
+528,-714,430,85,532,-75
+427,-706,0,82,414,-11
+427,-706,0,82,414,-11
+359,-706,0,81,363,16
+效果还是不好
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:12Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Preparing commentary and reading code blocks**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:16Z)**_
+
+这组比上一组更明确：`-6.0` 附近现在不是单纯“刹早”，而是终点区整段都还在持续给比较大的负倾角，导致球刚回一点又被继续往负方向推，随后再大幅反拉，形成整段往返。我要把 `-6.0` 补丁从“终点附近限幅”再往前推成一个明确的近端状态：进到近端后直接清速度环积分，并把终点区的内环角度上限压得更低。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:16Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+780			}
+781		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+782			if(pid_absf(Y + 6.0f) <= TARGET_HOLD_POSITION_ENTER) {
+783				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+784				control_initialized = false;
+785				target_hold_active = false;
+786				target_hold_settle_ticks = 0u;
+787			}
+788		}
+789	
+790		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+791		float target_y = ball_target_get();
+792		float relative_y = Y - target_y;
+793		bool target_changed = !control_initialized || target_y != target_y_last;
+794	
+795		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+796		if(target_changed) {
+797			target_hold_active = false;
+798			target_hold_settle_ticks = 0u;
+799			relative_y_last = relative_y;
+800			target_y_last = target_y;
+801			control_initialized = true;
+802		}
+803	
+804		float position_delta = relative_y - relative_y_last;
+805		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+806	
+807		/* 内环速度反馈改为本地位置差分速度。
+808		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+809		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+810		 */
+811		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+812		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+813		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+814		bool target_is_neg6 = (target_y == -6.0f);
+815		float target_hold_enter = target_is_neg6 ? 0.18f : TARGET_HOLD_POSITION_ENTER;
+816		float target_hold_exit = target_is_neg6 ? 0.28f : TARGET_HOLD_POSITION_EXIT;
+817	
+818		/* -6.0cm 终点补丁：不再切新的分段 PID，而是在近端直接保护观测与压小目标速度。
+819		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+820		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+821		if(target_is_neg6) {
+822			float relative_y_for_control = relative_y;
+823			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+824				relative_y_for_control = relative_y_last;
+825			}
+826			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+827			relative_y = neg6_relative_y_filtered;
+828			position_delta = relative_y - relative_y_last;
+829			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+830			abs_relative_y = pid_absf(relative_y);
+831			abs_estimated_velocity = pid_absf(estimated_velocity);
+832		} else {
+833			neg6_relative_y_filtered = relative_y;
+834		}
+835	
+836		/* 最终保持只在第二段完成后生效。
+837		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+838		 *
+839		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+840		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+841		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+842			if(target_hold_active) {
+843				if(abs_relative_y >= target_hold_exit) {
+844					target_hold_active = false;
+845					target_hold_settle_ticks = 0u;
+846				}
+847			} else if(abs_relative_y <= target_hold_enter &&
+848			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+849				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+850					target_hold_settle_ticks++;
+851				}
+852				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+853					target_hold_active = true;
+854				}
+855			} else {
+856				target_hold_settle_ticks = 0u;
+857			}
+858		} else {
+859			target_hold_active = false;
+860			target_hold_settle_ticks = 0u;
+861		}
+862	
+863		if(target_hold_active) {
+864			/* 进入误差保持区后，只停止位置环继续推球：
+865			 *   1) 外环目标速度稍后压到 0；
+866			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+867		}
+868	
+869		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+870		pidY.target = 0.0f;
+871		pidY.now = relative_y;
+872		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+873		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+874		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+875		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+876		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+877		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+878		                POS_LOOP_I_LIMIT);
+879		if(target_is_neg6 && !target_hold_active) {
+880			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+881			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+882			if(relative_y > 2.8f) {
+883				if(pidY.out > -4.2f) pidY.out = -4.2f;
+884			} else if(relative_y > 0.65f) {
+885				if(pidY.out > -2.6f) pidY.out = -2.6f;
+886			}
+887		}
+888		if(target_is_neg6) {
+889			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+890			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+891			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+892			if(relative_y > 0.0f && relative_y <= 0.65f) {
+893				float neg6_speed_limit = 0.95f;
+894				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+895				if(estimated_velocity < -2.0f) {
+896					neg6_speed_limit = 0.12f;
+897				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+898					neg6_speed_limit = 0.18f;
+899				}
+900				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+901				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+902			} else if(abs_relative_y <= 0.30f) {
+903				float neg6_speed_limit = 0.30f;
+904				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+905				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+906			}
+907		}
+908		if(target_hold_active) {
+909			/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+910			 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+911			if(target_is_neg6) {
+912				if(pid_absf(relative_y) <= 0.06f) {
+913					pidY.out = 0.0f;
+914				} else {
+915					pidY.out = -1.1f * relative_y;
+916					if(pidY.out > 0.10f) pidY.out = 0.10f;
+917					else if(pidY.out < -0.10f) pidY.out = -0.10f;
+918				}
+919			} else {
+920				pidY.out = 0.0f;
+921			}
+922		}
+923	
+924		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+925		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+926		 */
+927		float control_velocity = estimated_velocity;
+928		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+929			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+930		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+931			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+932		}
+933		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+934		                         (control_velocity - pidY_filtered_velocity);
+935	
+936	#if POSITION_LOOP_DIRECT_DRIVE
+937		/* 单环调试模式：位置环直接输出平台倾角。
+938		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+939		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+940		pidY_velocity_damping = 0.0f;
+941		pidY_Speed.target = 0.0f;
+942		pidY_Speed.now = pidY_filtered_velocity;
+943		pidY_Speed.out = 0.0f;
+944		pidY_Speed.pout = 0.0f;
+945		pidY_Speed.iout = 0.0f;
+946		pidY_Speed.dout = 0.0f;
+947	
+948		float cmd_angle = pidY.out;
+949		#else
+950			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+951			pidY_Speed.target = pidY.out;
+952			pidY_Speed.now = pidY_filtered_velocity;
+953			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+954			                SPEED_LOOP_I_LIMIT);
+955			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+956			float cmd_angle = pidY_velocity_damping;
+957		#endif
+958	
+959		if(target_is_neg6) {
+960			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+961			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+962			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+963			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+964			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+965			if(target_hold_active) neg6_angle_limit = 2.0f;
+966			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+967			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+968		}
+969	
+970		// 负方向（下降）机构补偿 ×1.2。
+971		if(cmd_angle < 0.0f) {
+972			cmd_angle *= 1.0f;
+973		}
+974	
+975		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+976		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+977		static float cmd_angle_last = 0.0f;
+978		{
+979			float delta = cmd_angle - cmd_angle_last;
+980			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+981			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+982			cmd_angle = cmd_angle_last + delta;
+983			cmd_angle_last = cmd_angle;
+984		}
+985		motor_set_angle(cmd_angle);
+986	
+987		relative_y_last = relative_y;
+988		Y_last = Y;
+989	}
+990	
+991	void pidout_limit_Y(pid_t *pid)
+992	{
+993		PIDOUT_CLAMP(pid, -50.0f, 50.0f);
+994	}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:16Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `target_is_neg6|target_hold_active|pidY_Speed.iout|cmd_angle_last|control_initialized`
+
+```text
+755:	static bool control_initialized = false;
+756:	static bool target_hold_active = false;
+776:			control_initialized = false;
+777:			target_hold_active = false;
+784:			control_initialized = false;
+785:			target_hold_active = false;
+793:	bool target_changed = !control_initialized || target_y != target_y_last;
+797:		target_hold_active = false;
+801:		control_initialized = true;
+814:	bool target_is_neg6 = (target_y == -6.0f);
+815:	float target_hold_enter = target_is_neg6 ? 0.18f : TARGET_HOLD_POSITION_ENTER;
+816:	float target_hold_exit = target_is_neg6 ? 0.28f : TARGET_HOLD_POSITION_EXIT;
+821:	if(target_is_neg6) {
+842:		if(target_hold_active) {
+844:				target_hold_active = false;
+853:				target_hold_active = true;
+859:		target_hold_active = false;
+863:	if(target_hold_active) {
+879:	if(target_is_neg6 && !target_hold_active) {
+888:	if(target_is_neg6) {
+908:	if(target_hold_active) {
+911:		if(target_is_neg6) {
+945:	pidY_Speed.iout = 0.0f;
+959:	if(target_is_neg6) {
+965:		if(target_hold_active) neg6_angle_limit = 2.0f;
+977:	static float cmd_angle_last = 0.0f;
+979:		float delta = cmd_angle - cmd_angle_last;
+982:		cmd_angle = cmd_angle_last + delta;
+983:		cmd_angle_last = cmd_angle;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning PID logic improvements**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Requesting static variable definitions**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:25Z)**_
+
+我这次不再只拧常数了，直接给 `-6.0` 近端加一个明确状态：一旦进入近端，就把速度环旧积分清掉，避免它带着前一段累出来的“负向执念”继续猛推终点区；同时把近端角度帽再压低。这样改会更硬一点，但目标就是先把这段来回抽动砍掉。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:25Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+748		motor_command_pulses = target_pulses;
+749	}
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758		static float neg6_relative_y_filtered = 0.0f;
+759	
+760		if(!g_pid_segment_initialized) {
+761			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+762			g_pid_segment = PID_SEGMENT_TO_POS_56;
+763			g_pid_segment_initialized = true;
+764		}
+765	
+766		Y = ball_error;  // 视觉小球绝对位置
+767	
+768		/* 分段状态机：
+769		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+770		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+771		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:26Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+740		}
+741	
+742		if(target_pulses >= 0) {
+743			Emm_V5_Pos_Control(MOTOR_ADDR, 0, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)target_pulses, 1, 0);
+744		} else {
+745			Emm_V5_Pos_Control(MOTOR_ADDR, 1, MOTOR_POSITION_SPEED_RPM, 0, (uint32_t)(-target_pulses), 1, 0);
+746		}
+747	
+748		motor_command_pulses = target_pulses;
+749	}
+750	
+751	void pid_control__26Y(void)
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758		static float neg6_relative_y_filtered = 0.0f;
+759
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:37Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:50Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 		if(target_is_neg6) {
+			float relative_y_for_control = relative_y;
+			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+				relative_y_for_control = relative_y_last;
+			}
+			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+			relative_y = neg6_relative_y_filtered;
+			position_delta = relative_y - relative_y_last;
+			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+			abs_relative_y = pid_absf(relative_y);
+			abs_estimated_velocity = pid_absf(estimated_velocity);
+		} else {
+			neg6_relative_y_filtered = relative_y;
+		}
+</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:53Z)**_
+
+替换没对上，我先把那一小段精确读出来再改，避免误伤别的逻辑。改动目标不变：给 `-6.0` 加近端状态，并在入近端时清速度环积分。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:28:54Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+818	
+819		/* -6.0cm 终点补丁：不再切新的分段 PID，而是在近端直接保护观测与压小目标速度。
+820		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+821		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+822		if(target_is_neg6) {
+823			float relative_y_for_control = relative_y;
+824			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+825				relative_y_for_control = relative_y_last;
+826			}
+827			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+828			relative_y = neg6_relative_y_filtered;
+829			position_delta = relative_y - relative_y_last;
+830			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831			abs_relative_y = pid_absf(relative_y);
+832			abs_estimated_velocity = pid_absf(estimated_velocity);
+833		} else {
+834			neg6_relative_y_filtered = relative_y;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+838		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+839		 *
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:07Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 		if(target_is_neg6) {
+			float relative_y_for_control = relative_y;
+			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+				relative_y_for_control = relative_y_last;
+			}
+			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+			relative_y = neg6_relative_y_filtered;
+			position_delta = relative_y - relative_y_last;
+			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+			abs_relative_y = pid_absf(relative_y);
+			abs_estimated_velocity = pid_absf(estimated_velocity);
+		} else {
+			neg6_relative_y_filtered = relative_y;
+		}
+</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Verifying whitespace and line endings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning Perl one-liner patching script**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:21Z)**_
+
+`Edit` 这段连续两次没命中，应该是文件里这一块的缩进或换行和我手里的片段有细微差异。我先把当前实际块再精确读一遍，然后直接替换成整块文本，避免继续猜。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:22Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+820		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+821		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+822		if(target_is_neg6) {
+823			float relative_y_for_control = relative_y;
+824			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+825				relative_y_for_control = relative_y_last;
+826			}
+827			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+828			relative_y = neg6_relative_y_filtered;
+829			position_delta = relative_y - relative_y_last;
+830			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831			abs_relative_y = pid_absf(relative_y);
+832			abs_estimated_velocity = pid_absf(estimated_velocity);
+833		} else {
+834			neg6_relative_y_filtered = relative_y;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:22Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+878		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+879		                POS_LOOP_I_LIMIT);
+880		if(target_is_neg6 && !target_hold_active) {
+881			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+882			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+883			if(relative_y > 2.8f) {
+884				if(pidY.out > -4.2f) pidY.out = -4.2f;
+885			} else if(relative_y > 0.65f) {
+886				if(pidY.out > -2.6f) pidY.out = -2.6f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+891			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+892			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+893			if(relative_y > 0.0f && relative_y <= 0.65f) {
+894				float neg6_speed_limit = 0.95f;
+895				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+896				if(estimated_velocity < -2.0f) {
+897					neg6_speed_limit = 0.12f;
+898				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+899					neg6_speed_limit = 0.18f;
+900				}
+901				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+902				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+903			} else if(abs_relative_y <= 0.30f) {
+904				float neg6_speed_limit = 0.30f;
+905				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+906				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+907			}
+908		}
+909		if(target_hold_active) {
+910			/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+911			 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+912			if(target_is_neg6) {
+913				if(pid_absf(relative_y) <= 0.06f) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:22Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+950		#else
+951			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+952			pidY_Speed.target = pidY.out;
+953			pidY_Speed.now = pidY_filtered_velocity;
+954			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+955			                SPEED_LOOP_I_LIMIT);
+956			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+957			float cmd_angle = pidY_velocity_damping;
+958		#endif
+959	
+960		if(target_is_neg6) {
+961			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+962			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+963			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+964			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+965			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+966			if(target_hold_active) neg6_angle_limit = 2.0f;
+967			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+968			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+969		}
+970	
+971		// 负方向（下降）机构补偿 ×1.2。
+972		if(cmd_angle < 0.0f) {
+973			cmd_angle *= 1.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:26Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Refining edit blocks and resetting flags**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:27Z)**_
+
+我已经把要动的三块都定位出来了，接下来直接做精确替换：`-6.0` 近端进场状态、近端外环更强收口、近端内环更低限角。这样这一轮能把“旧积分 + 大角度”这两个主要源头一起压掉。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:37Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 		if(target_is_neg6) {
+			float relative_y_for_control = relative_y;
+			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+				relative_y_for_control = relative_y_last;
+			}
+			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+			relative_y = neg6_relative_y_filtered;
+			position_delta = relative_y - relative_y_last;
+			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+			abs_relative_y = pid_absf(relative_y);
+			abs_estimated_velocity = pid_absf(estimated_velocity);
+		} else {
+			neg6_relative_y_filtered = relative_y;
+		}
+</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:48Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Evaluating patch alternatives for manual edits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning Bash-perl patching for file edits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:50Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing precise Perl regex patches for blocks**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:29:51Z)**_
+
+`Edit` 还是因为文本细节没命中。我改用一次性的脚本替换这三块局部逻辑，范围只锁在 `pid.c` 里已经定位好的独特片段，不会动到别处。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:30:46Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Tighten -6.0 near-zone braking and angle cap in pid.c
+
+`perl -0pi -e 's@\Q\t\tif(target_is_neg6) {\n\t\t\tfloat relative_y_for_control = relative_y;\n\t\t\tif(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {\n\t\t\t\trelative_y_for_control = relative_y_last;\n\t\t\t}\n\t\t\tneg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);\n\t\t\trelative_y = neg6_relative_y_filtered;\n\t\t\tposition_delta = relative_y - relative_y_last;\n\t\t\testimated_velocity = position_delta \/ PID_CONTROL_PERIOD_S;\n\t\t\tabs_relative_y = pid_absf(relative_y);\n\t\t\tabs_estimated_velocity = pid_absf(estimated_velocity);\n\t\t} else {\n\t\t\tneg6_relative_y_filtered = relative_y;\n\t\t}\E@\t\tif(target_is_neg6) {\n\t\t\tfloat relative_y_for_control = relative_y;\n\t\t\tif(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {\n\t\t\t\trelative_y_for_control = relative_y_last;\n\t\t\t}\n\t\t\tneg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);\n\t\t\trelative_y = neg6_relative_y_filtered;\n\t\t\tposition_delta = relative_y - relative_y_last;\n\t\t\testimated_velocity = position_delta / PID_CONTROL_PERIOD_S;\n\t\t\tabs_relative_y = pid_absf(relative_y);\n\t\t\tabs_estimated_velocity = pid_absf(estimated_velocity);\n\t\t\tif(neg6_near_zone_active) {\n\t\t\t\tif(relative_y > 0.85f || relative_y < -0.35f) {\n\t\t\t\t\tneg6_near_zone_active = false;\n\t\t\t\t}\n\t\t\t} else if(relative_y <= 0.55f && relative_y >= -0.10f) {\n\t\t\t\tneg6_near_zone_active = true;\n\t\t\t\tpidY_Speed.iout = 0.0f;\n\t\t\t}\n\t\t} else {\n\t\t\tneg6_relative_y_filtered = relative_y;\n\t\t\tneg6_near_zone_active = false;\n\t\t}\n@s; s@\Q\t\tif(target_is_neg6 && !target_hold_active) {\n\t\t\t/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；\n\t\t\t * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */\n\t\t\tif(relative_y > 2.8f) {\n\t\t\t\tif(pidY.out > -4.2f) pidY.out = -4.2f;\n\t\t\t} else if(relative_y > 0.65f) {\n\t\t\t\tif(pidY.out > -2.6f) pidY.out = -2.6f;\n\t\t\t}\n\t\t}\n\t\tif(target_is_neg6) {\n\t\t\t/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：\n\t\t\t *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；\n\t\t\t *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */\n\t\t\tif(relative_y > 0.0f && relative_y <= 0.65f) {\n\t\t\t\tfloat neg6_speed_limit = 0.95f;\n\t\t\t\tif(relative_y <= 0.30f) neg6_speed_limit = 0.40f;\n\t\t\t\tif(estimated_velocity < -2.0f) {\n\t\t\t\t\tneg6_speed_limit = 0.12f;\n\t\t\t\t} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {\n\t\t\t\t\tneg6_speed_limit = 0.18f;\n\t\t\t\t}\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t} else if(abs_relative_y <= 0.30f) {\n\t\t\t\tfloat neg6_speed_limit = 0.30f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t}\n\t\t}\E@\t\tif(target_is_neg6 && !target_hold_active) {\n\t\t\t/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；\n\t\t\t * 近端托底只保留到 0.45cm，之后明确进入终点收口区。 */\n\t\t\tif(relative_y > 2.8f) {\n\t\t\t\tif(pidY.out > -4.2f) pidY.out = -4.2f;\n\t\t\t} else if(relative_y > 0.45f) {\n\t\t\t\tif(pidY.out > -2.4f) pidY.out = -2.4f;\n\t\t\t}\n\t\t}\n\t\tif(target_is_neg6) {\n\t\t\t/* 进入 -6.0 近端区后，外环目标速度收得更狠，避免继续带着明显负速度穿点。 */\n\t\t\tif(neg6_near_zone_active) {\n\t\t\t\tfloat neg6_speed_limit = 0.22f;\n\t\t\t\tif(relative_y > 0.22f) neg6_speed_limit = 0.45f;\n\t\t\t\tif(estimated_velocity < -1.6f) neg6_speed_limit = 0.08f;\n\t\t\t\telse if(estimated_velocity < -0.9f) neg6_speed_limit = 0.14f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t} else if(abs_relative_y <= 0.22f) {\n\t\t\t\tfloat neg6_speed_limit = 0.18f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t}\n\t\t}\n@s; s@\Q\t\tif(target_is_neg6) {\n\t\t\t/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。\n\t\t\t * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */\n\t\t\tfloat neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;\n\t\t\tif(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;\n\t\t\tif(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;\n\t\t\tif(target_hold_active) neg6_angle_limit = 2.0f;\n\t\t\tif(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;\n\t\t\telse if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;\n\t\t}\E@\t\tif(target_is_neg6) {\n\t\t\t/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。\n\t\t\t * 近端区单独清积分并大幅收紧角度帽，先把终点往返抽动压住。 */\n\t\t\tfloat neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;\n\t\t\tif(abs_relative_y <= 0.75f) neg6_angle_limit = 4.5f;\n\t\t\tif(neg6_near_zone_active) neg6_angle_limit = 1.8f;\n\t\t\tif(target_hold_active) neg6_angle_limit = 1.2f;\n\t\t\tif(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;\n\t\t\telse if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;\n\t\t}\n@s' d:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c`
+
+```text
+(Bash completed with no output)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:30:57Z)**_
+
+改动已经写进去了。我现在先读关键片段确认替换结果，再编译；这一步主要防止脚本替换因为空格或转义把代码打歪。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:30:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+818	
+819		/* -6.0cm 终点补丁：不再切新的分段 PID，而是在近端直接保护观测与压小目标速度。
+820		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+821		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+822		if(target_is_neg6) {
+823			float relative_y_for_control = relative_y;
+824			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+825				relative_y_for_control = relative_y_last;
+826			}
+827			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+828			relative_y = neg6_relative_y_filtered;
+829			position_delta = relative_y - relative_y_last;
+830			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831			abs_relative_y = pid_absf(relative_y);
+832			abs_estimated_velocity = pid_absf(estimated_velocity);
+833		} else {
+834			neg6_relative_y_filtered = relative_y;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+838		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+839		 *
+840		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+841		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+842		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+843			if(target_hold_active) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:30:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+878		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+879		                POS_LOOP_I_LIMIT);
+880		if(target_is_neg6 && !target_hold_active) {
+881			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+882			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+883			if(relative_y > 2.8f) {
+884				if(pidY.out > -4.2f) pidY.out = -4.2f;
+885			} else if(relative_y > 0.65f) {
+886				if(pidY.out > -2.6f) pidY.out = -2.6f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+891			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+892			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+893			if(relative_y > 0.0f && relative_y <= 0.65f) {
+894				float neg6_speed_limit = 0.95f;
+895				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+896				if(estimated_velocity < -2.0f) {
+897					neg6_speed_limit = 0.12f;
+898				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+899					neg6_speed_limit = 0.18f;
+900				}
+901				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+902				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+903			} else if(abs_relative_y <= 0.30f) {
+904				float neg6_speed_limit = 0.30f;
+905				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+906				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+907			}
+908		}
+909		if(target_hold_active) {
+910			/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+911			 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:30:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+956			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+957			float cmd_angle = pidY_velocity_damping;
+958		#endif
+959	
+960		if(target_is_neg6) {
+961			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+962			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+963			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+964			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+965			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+966			if(target_hold_active) neg6_angle_limit = 2.0f;
+967			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+968			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+969		}
+970	
+971		// 负方向（下降）机构补偿 ×1.2。
+972		if(cmd_angle < 0.0f) {
+973			cmd_angle *= 1.0f;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning line-based file editing with Perl**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:08Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning precise multiline edits preserving indentation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:08Z)**_
+
+刚才那次脚本替换没有命中到关键块，文件里还是旧逻辑。我不继续靠模糊替换了，直接按刚读出来的实际片段逐块精确改掉，再编译。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:19Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+<tool_use_error>String to replace not found in file.
+String: 		if(target_is_neg6) {
+			float relative_y_for_control = relative_y;
+			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+				relative_y_for_control = relative_y_last;
+			}
+			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+			relative_y = neg6_relative_y_filtered;
+			position_delta = relative_y - relative_y_last;
+			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+			abs_relative_y = pid_absf(relative_y);
+			abs_estimated_velocity = pid_absf(estimated_velocity);
+		} else {
+			neg6_relative_y_filtered = relative_y;
+		}
+</tool_use_error>
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning precise file edits using Perl and Bash**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:29Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Designing robust Perl regex for patching blocks**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:31:29Z)**_
+
+我换成正则定点替换这三块代码，不再靠逐字匹配。这样能避开缩进和换行差异，直接命中注释锚点对应的逻辑块。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:20Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Apply regex replacements for -6.0 near-zone logic
+
+`perl -0pi -e 's@if\(target_is_neg6\) \{\n\t\t\tfloat relative_y_for_control = relative_y;\n\t\t\tif\(abs_relative_y <= 1\.2f && pid_absf\(position_delta\) > 1\.0f\) \{\n\t\t\t\trelative_y_for_control = relative_y_last;\n\t\t\t\}\n\t\t\tneg6_relative_y_filtered \+= 0\.45f \* \(relative_y_for_control - neg6_relative_y_filtered\);\n\t\t\trelative_y = neg6_relative_y_filtered;\n\t\t\tposition_delta = relative_y - relative_y_last;\n\t\t\testimated_velocity = position_delta / PID_CONTROL_PERIOD_S;\n\t\t\tabs_relative_y = pid_absf\(relative_y\);\n\t\t\tabs_estimated_velocity = pid_absf\(estimated_velocity\);\n\t\t\} else \{\n\t\t\tneg6_relative_y_filtered = relative_y;\n\t\t\}@if(target_is_neg6) {\n\t\t\tfloat relative_y_for_control = relative_y;\n\t\t\tif(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {\n\t\t\t\trelative_y_for_control = relative_y_last;\n\t\t\t}\n\t\t\tneg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);\n\t\t\trelative_y = neg6_relative_y_filtered;\n\t\t\tposition_delta = relative_y - relative_y_last;\n\t\t\testimated_velocity = position_delta / PID_CONTROL_PERIOD_S;\n\t\t\tabs_relative_y = pid_absf(relative_y);\n\t\t\tabs_estimated_velocity = pid_absf(estimated_velocity);\n\t\t\tif(neg6_near_zone_active) {\n\t\t\t\tif(relative_y > 0.85f || relative_y < -0.35f) {\n\t\t\t\t\tneg6_near_zone_active = false;\n\t\t\t\t}\n\t\t\t} else if(relative_y <= 0.55f && relative_y >= -0.10f) {\n\t\t\t\tneg6_near_zone_active = true;\n\t\t\t\tpidY_Speed.iout = 0.0f;\n\t\t\t}\n\t\t} else {\n\t\t\tneg6_relative_y_filtered = relative_y;\n\t\t\tneg6_near_zone_active = false;\n\t\t}@s; s@if\(target_is_neg6 && !target_hold_active\) \{\n\t\t\t/\* 从 \+5\.6 回到 -6\.0 的中段仍保留巡航托底，避免太早掉速；\n\t\t\t \* 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 \*/\n\t\t\tif\(relative_y > 2\.8f\) \{\n\t\t\t\tif\(pidY\.out > -4\.2f\) pidY\.out = -4\.2f;\n\t\t\t\} else if\(relative_y > 0\.65f\) \{\n\t\t\t\tif\(pidY\.out > -2\.6f\) pidY\.out = -2\.6f;\n\t\t\t\}\n\t\t\}\n\t\tif\(target_is_neg6\) \{\n\t\t\t/\* -6\.0 前最后 0\.65cm 改成按“剩余距离 \+ 当前来向速度”收刹：\n\t\t\t \*   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；\n\t\t\t \*   - 真正贴近目标后再收得更软，减少穿点后的往返。 \*/\n\t\t\tif\(relative_y > 0\.0f && relative_y <= 0\.65f\) \{\n\t\t\t\tfloat neg6_speed_limit = 0\.95f;\n\t\t\t\tif\(relative_y <= 0\.30f\) neg6_speed_limit = 0\.40f;\n\t\t\t\tif\(estimated_velocity < -2\.0f\) \{\n\t\t\t\t\tneg6_speed_limit = 0\.12f;\n\t\t\t\t\} else if\(estimated_velocity < -1\.2f && relative_y <= 0\.40f\) \{\n\t\t\t\t\tneg6_speed_limit = 0\.18f;\n\t\t\t\t\}\n\t\t\t\tif\(pidY\.out > neg6_speed_limit\) pidY\.out = neg6_speed_limit;\n\t\t\t\telse if\(pidY\.out < -neg6_speed_limit\) pidY\.out = -neg6_speed_limit;\n\t\t\t\} else if\(abs_relative_y <= 0\.30f\) \{\n\t\t\t\tfloat neg6_speed_limit = 0\.30f;\n\t\t\t\tif\(pidY\.out > neg6_speed_limit\) pidY\.out = neg6_speed_limit;\n\t\t\t\telse if\(pidY\.out < -neg6_speed_limit\) pidY\.out = -neg6_speed_limit;\n\t\t\t\}\n\t\t\}@if(target_is_neg6 && !target_hold_active) {\n\t\t\t/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；\n\t\t\t * 近端托底只保留到 0.45cm，之后明确进入终点收口区。 */\n\t\t\tif(relative_y > 2.8f) {\n\t\t\t\tif(pidY.out > -4.2f) pidY.out = -4.2f;\n\t\t\t} else if(relative_y > 0.45f) {\n\t\t\t\tif(pidY.out > -2.4f) pidY.out = -2.4f;\n\t\t\t}\n\t\t}\n\t\tif(target_is_neg6) {\n\t\t\t/* 进入 -6.0 近端区后，外环目标速度收得更狠，避免继续带着明显负速度穿点。 */\n\t\t\tif(neg6_near_zone_active) {\n\t\t\t\tfloat neg6_speed_limit = 0.22f;\n\t\t\t\tif(relative_y > 0.22f) neg6_speed_limit = 0.45f;\n\t\t\t\tif(estimated_velocity < -1.6f) neg6_speed_limit = 0.08f;\n\t\t\t\telse if(estimated_velocity < -0.9f) neg6_speed_limit = 0.14f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t} else if(abs_relative_y <= 0.22f) {\n\t\t\t\tfloat neg6_speed_limit = 0.18f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t}\n\t\t}@s; s@if\(target_is_neg6\) \{\n\t\t\t/\* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。\n\t\t\t \* 单独给 -6\.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 \*/\n\t\t\tfloat neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;\n\t\t\tif\(abs_relative_y <= 0\.75f\) neg6_angle_limit = 5\.5f;\n\t\t\tif\(abs_relative_y <= 0\.35f\) neg6_angle_limit = 3\.2f;\n\t\t\tif\(target_hold_active\) neg6_angle_limit = 2\.0f;\n\t\t\tif\(cmd_angle > neg6_angle_limit\) cmd_angle = neg6_angle_limit;\n\t\t\telse if\(cmd_angle < -neg6_angle_limit\) cmd_angle = -neg6_angle_limit;\n\t\t\}@if(target_is_neg6) {\n\t\t\t/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。\n\t\t\t * 近端区单独清积分并大幅收紧角度帽，先把终点往返抽动压住。 */\n\t\t\tfloat neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;\n\t\t\tif(abs_relative_y <= 0.75f) neg6_angle_limit = 4.5f;\n\t\t\tif(neg6_near_zone_active) neg6_angle_limit = 1.8f;\n\t\t\tif(target_hold_active) neg6_angle_limit = 1.2f;\n\t\t\tif(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;\n\t\t\telse if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;\n\t\t}@s' d:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c`
+
+```text
+(Bash completed with no output)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:26Z)**_
+
+这次替换命中的概率高很多。我先复读关键块确认已经变成新逻辑，再跑构建。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:26Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+820		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+821		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+822		if(target_is_neg6) {
+823			float relative_y_for_control = relative_y;
+824			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+825				relative_y_for_control = relative_y_last;
+826			}
+827			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+828			relative_y = neg6_relative_y_filtered;
+829			position_delta = relative_y - relative_y_last;
+830			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831			abs_relative_y = pid_absf(relative_y);
+832			abs_estimated_velocity = pid_absf(estimated_velocity);
+833		} else {
+834			neg6_relative_y_filtered = relative_y;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+838		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+839		 *
+840		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+841		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:26Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+880		if(target_is_neg6 && !target_hold_active) {
+881			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+882			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+883			if(relative_y > 2.8f) {
+884				if(pidY.out > -4.2f) pidY.out = -4.2f;
+885			} else if(relative_y > 0.65f) {
+886				if(pidY.out > -2.6f) pidY.out = -2.6f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+891			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+892			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+893			if(relative_y > 0.0f && relative_y <= 0.65f) {
+894				float neg6_speed_limit = 0.95f;
+895				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+896				if(estimated_velocity < -2.0f) {
+897					neg6_speed_limit = 0.12f;
+898				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+899					neg6_speed_limit = 0.18f;
+900				}
+901				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+902				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+903			} else if(abs_relative_y <= 0.30f) {
+904				float neg6_speed_limit = 0.30f;
+905				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+906				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+907			}
+908		}
+909		if(target_hold_active) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:26Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+960		if(target_is_neg6) {
+961			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+962			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+963			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+964			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+965			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+966			if(target_hold_active) neg6_angle_limit = 2.0f;
+967			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+968			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+969		}
+970	
+971		// 负方向（下降）机构补偿 ×1.2。
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:36Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning full file rewrite with modifications**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:39Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Developing Python script for precise file edits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:39Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning targeted code block replacements**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:32:40Z)**_
+
+我换成脚本按锚点改，之前那几次替换都被这个文件的实际换行格式卡住了。现在直接按注释块和变量声明去改，不再依赖逐字匹配。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:40Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Use a Python script to update anchored -6.0 near-zone logic in pid.c
+
+```bash
+python - <<'PY'
+from pathlib import Path
+import re
+path = Path(r'd:/File/2026diansaiH/Code_of_ZDT/Core/Src/pid.c')
+text = path.read_text(encoding='utf-8')
+orig = text
+
+text = text.replace(
+    'static float neg6_relative_y_filtered = 0.0f;\n',
+    'static float neg6_relative_y_filtered = 0.0f;\n\tstatic bool neg6_near_zone_active = false;\n',
+    1,
+)
+
+text = text.replace(
+    '\t\ttarget_hold_active = false;\n\t\ttarget_hold_settle_ticks = 0u;\n\t\trelative_y_last = relative_y;\n',
+    '\t\ttarget_hold_active = false;\n\t\ttarget_hold_settle_ticks = 0u;\n\t\tneg6_near_zone_active = false;\n\t\trelative_y_last = relative_y;\n',
+    1,
+)
+
+pattern1 = re.compile(r'''\t\tif\(target_is_neg6\) \{\n\t\t\tfloat relative_y_for_control = relative_y;\n\t\t\tif\(abs_relative_y <= 1\.2f && pid_absf\(position_delta\) > 1\.0f\) \{\n\t\t\t\trelative_y_for_control = relative_y_last;\n\t\t\t\}\n\t\t\tneg6_relative_y_filtered \+= 0\.45f \* \(relative_y_for_control - neg6_relative_y_filtered\);\n\t\t\trelative_y = neg6_relative_y_filtered;\n\t\t\tposition_delta = relative_y - relative_y_last;\n\t\t\testimated_velocity = position_delta / PID_CONTROL_PERIOD_S;\n\t\t\tabs_relative_y = pid_absf\(relative_y\);\n\t\t\tabs_estimated_velocity = pid_absf\(estimated_velocity\);\n\t\t\} else \{\n\t\t\tneg6_relative_y_filtered = relative_y;\n\t\t\}''')
+repl1 = '''\t\tif(target_is_neg6) {\n\t\t\tfloat relative_y_for_control = relative_y;\n\t\t\tif(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {\n\t\t\t\trelative_y_for_control = relative_y_last;\n\t\t\t}\n\t\t\tneg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);\n\t\t\trelative_y = neg6_relative_y_filtered;\n\t\t\tposition_delta = relative_y - relative_y_last;\n\t\t\testimated_velocity = position_delta / PID_CONTROL_PERIOD_S;\n\t\t\tabs_relative_y = pid_absf(relative_y);\n\t\t\tabs_estimated_velocity = pid_absf(estimated_velocity);\n\t\t\tif(neg6_near_zone_active) {\n\t\t\t\tif(relative_y > 0.85f || relative_y < -0.35f) {\n\t\t\t\t\tneg6_near_zone_active = false;\n\t\t\t\t}\n\t\t\t} else if(relative_y <= 0.55f && relative_y >= -0.10f) {\n\t\t\t\tneg6_near_zone_active = true;\n\t\t\t\tpidY_Speed.iout = 0.0f;\n\t\t\t}\n\t\t} else {\n\t\t\tneg6_relative_y_filtered = relative_y;\n\t\t\tneg6_near_zone_active = false;\n\t\t}'''
+text, n1 = pattern1.subn(repl1, text, count=1)
+
+pattern2 = re.compile(r'''\t\tif\(target_is_neg6 && !target_hold_active\) \{\n\t\t\t/\* 从 \+5\.6 回到 -6\.0 的中段仍保留巡航托底，避免太早掉速；\n\t\t\t \* 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 \*/\n\t\t\tif\(relative_y > 2\.8f\) \{\n\t\t\t\tif\(pidY\.out > -4\.2f\) pidY\.out = -4\.2f;\n\t\t\t\} else if\(relative_y > 0\.65f\) \{\n\t\t\t\tif\(pidY\.out > -2\.6f\) pidY\.out = -2\.6f;\n\t\t\t\}\n\t\t\}\n\t\tif\(target_is_neg6\) \{\n\t\t\t/\* -6\.0 前最后 0\.65cm 改成按“剩余距离 \+ 当前来向速度”收刹：\n\t\t\t \*   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；\n\t\t\t \*   - 真正贴近目标后再收得更软，减少穿点后的往返。 \*/\n\t\t\tif\(relative_y > 0\.0f && relative_y <= 0\.65f\) \{\n\t\t\t\tfloat neg6_speed_limit = 0\.95f;\n\t\t\t\tif\(relative_y <= 0\.30f\) neg6_speed_limit = 0\.40f;\n\t\t\t\tif\(estimated_velocity < -2\.0f\) \{\n\t\t\t\t\tneg6_speed_limit = 0\.12f;\n\t\t\t\t\} else if\(estimated_velocity < -1\.2f && relative_y <= 0\.40f\) \{\n\t\t\t\t\tneg6_speed_limit = 0\.18f;\n\t\t\t\t\}\n\t\t\t\tif\(pidY\.out > neg6_speed_limit\) pidY\.out = neg6_speed_limit;\n\t\t\t\telse if\(pidY\.out < -neg6_speed_limit\) pidY\.out = -neg6_speed_limit;\n\t\t\t\} else if\(abs_relative_y <= 0\.30f\) \{\n\t\t\t\tfloat neg6_speed_limit = 0\.30f;\n\t\t\t\tif\(pidY\.out > neg6_speed_limit\) pidY\.out = neg6_speed_limit;\n\t\t\t\telse if\(pidY\.out < -neg6_speed_limit\) pidY\.out = -neg6_speed_limit;\n\t\t\t\}\n\t\t\}''')
+repl2 = '''\t\tif(target_is_neg6 && !target_hold_active) {\n\t\t\t/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；\n\t\t\t * 近端托底只保留到 0.45cm，之后明确进入终点收口区。 */\n\t\t\tif(relative_y > 2.8f) {\n\t\t\t\tif(pidY.out > -4.2f) pidY.out = -4.2f;\n\t\t\t} else if(relative_y > 0.45f) {\n\t\t\t\tif(pidY.out > -2.4f) pidY.out = -2.4f;\n\t\t\t}\n\t\t}\n\t\tif(target_is_neg6) {\n\t\t\t/* 进入 -6.0 近端区后，外环目标速度收得更狠，避免继续带着明显负速度穿点。 */\n\t\t\tif(neg6_near_zone_active) {\n\t\t\t\tfloat neg6_speed_limit = 0.22f;\n\t\t\t\tif(relative_y > 0.22f) neg6_speed_limit = 0.45f;\n\t\t\t\tif(estimated_velocity < -1.6f) neg6_speed_limit = 0.08f;\n\t\t\t\telse if(estimated_velocity < -0.9f) neg6_speed_limit = 0.14f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t} else if(abs_relative_y <= 0.22f) {\n\t\t\t\tfloat neg6_speed_limit = 0.18f;\n\t\t\t\tif(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;\n\t\t\t\telse if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;\n\t\t\t}\n\t\t}'''
+text, n2 = pattern2.subn(repl2, text, count=1)
+
+pattern3 = re.compile(r'''\t\tif\(target_is_neg6\) \{\n\t\t\t/\* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。\n\t\t\t \* 单独给 -6\.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 \*/\n\t\t\tfloat neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;\n\t\t\tif\(abs_relative_y <= 0\.75f\) neg6_angle_limit = 5\.5f;\n\t\t\tif\(abs_relative_y <= 0\.35f\) neg6_angle_limit = 3\.2f;\n\t\t\tif\(target_hold_active\) neg6_angle_limit = 2\.0f;\n\t\t\tif\(cmd_angle > neg6_angle_limit\) cmd_angle = neg6_angle_limit;\n\t\t\telse if\(cmd_angle < -neg6_angle_limit\) cmd_angle = -neg6_angle_limit;\n\t\t\}''')
+repl3 = '''\t\tif(target_is_neg6) {\n\t\t\t/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。\n\t\t\t * 近端区单独清积分并大幅收紧角度帽，先把终点往返抽动压住。 */\n\t\t\tfloat neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;\n\t\t\tif(abs_relative_y <= 0.75f) neg6_angle_limit = 4.5f;\n\t\t\tif(neg6_near_zone_active) neg6_angle_limit = 1.8f;\n\t\t\tif(target_hold_active) neg6_angle_limit = 1.2f;\n\t\t\tif(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;\n\t\t\telse if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;\n\t\t}'''
+text, n3 = pattern3.subn(repl3, text, count=1)
+
+if text == orig or not all([n1, n2, n3]):
+    raise SystemExit(f'replacements failed: n1={n1}, n2={n2}, n3={n3}, changed={text != orig}')
+path.write_text(text, encoding='utf-8', newline='')
+print(f'ok n1={n1} n2={n2} n3={n3}')
+PY
 ```
 
-构建我已经跑过，`cmake --build build/Debug` 通过。  
-如果你想让切换更稳一点，我下一步会把 `Y >= 5.0f` 改成“进入 +5cm 附近窗口且速度足够小再切换”，这样不会因为高速冲过 `+5` 时过早翻目标。
+```text
+Exit code 1
+replacements failed: n1=0, n2=0, n3=0, changed=True
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:49Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting file changes and line endings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:52Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning full file overwrite with simpler edits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:52Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Deciding on Python script with anchor-based replacements**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:57Z)**_
+
+前面几次精确替换都被这个文件的换行格式绊住了，浪费了时间。我先把当前文件状态再核一遍，然后用锚点脚本直接改指定区块，不再靠整段字符串硬匹配。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+752	{
+753		static float relative_y_last = 0.0f;
+754		static float target_y_last = 0.0f;
+755		static bool control_initialized = false;
+756		static bool target_hold_active = false;
+757		static uint8_t target_hold_settle_ticks = 0u;
+758		static float neg6_relative_y_filtered = 0.0f;
+759		static bool neg6_near_zone_active = false;
+760	
+761		if(!g_pid_segment_initialized) {
+762			pid_apply_segment_profile(5.6f, 1.735f, 0.0f, 0.0f, 0.99f, 0.01f, 0.0f);
+763			g_pid_segment = PID_SEGMENT_TO_POS_56;
+764			g_pid_segment_initialized = true;
+765		}
+766	
+767		Y = ball_error;  // 视觉小球绝对位置
+768	
+769		/* 分段状态机：
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+794		bool target_changed = !control_initialized || target_y != target_y_last;
+795	
+796		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+797		if(target_changed) {
+798			target_hold_active = false;
+799			target_hold_settle_ticks = 0u;
+800			relative_y_last = relative_y;
+801			target_y_last = target_y;
+802			control_initialized = true;
+803		}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+818	
+819		/* -6.0cm 终点补丁：不再切新的分段 PID，而是在近端直接保护观测与压小目标速度。
+820		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+821		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+822		if(target_is_neg6) {
+823			float relative_y_for_control = relative_y;
+824			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+825				relative_y_for_control = relative_y_last;
+826			}
+827			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+828			relative_y = neg6_relative_y_filtered;
+829			position_delta = relative_y - relative_y_last;
+830			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+831			abs_relative_y = pid_absf(relative_y);
+832			abs_estimated_velocity = pid_absf(estimated_velocity);
+833		} else {
+834			neg6_relative_y_filtered = relative_y;
+835		}
+836	
+837		/* 最终保持只在第二段完成后生效。
+838		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+839		 *
+840		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+841		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+842		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+843			if(target_hold_active) {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+878		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+879		                POS_LOOP_I_LIMIT);
+880		if(target_is_neg6 && !target_hold_active) {
+881			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+882			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+883			if(relative_y > 2.8f) {
+884				if(pidY.out > -4.2f) pidY.out = -4.2f;
+885			} else if(relative_y > 0.65f) {
+886				if(pidY.out > -2.6f) pidY.out = -2.6f;
+887			}
+888		}
+889		if(target_is_neg6) {
+890			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+891			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+892			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+893			if(relative_y > 0.0f && relative_y <= 0.65f) {
+894				float neg6_speed_limit = 0.95f;
+895				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+896				if(estimated_velocity < -2.0f) {
+897					neg6_speed_limit = 0.12f;
+898				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+899					neg6_speed_limit = 0.18f;
+900				}
+901				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+902				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+903			} else if(abs_relative_y <= 0.30f) {
+904				float neg6_speed_limit = 0.30f;
+905				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+906				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+907			}
+908		}
+909		if(target_hold_active) {
+910			/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+911			 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:33:57Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+958		#endif
+959	
+960		if(target_is_neg6) {
+961			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+962			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+963			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+964			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+965			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+966			if(target_hold_active) neg6_angle_limit = 2.0f;
+967			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+968			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+969		}
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:34:02Z)**_
+
+现在文件状态清楚了：`neg6_near_zone_active` 已经加上了，但逻辑还没真正接进去。我直接用一个短脚本按行级锚点替换这 4 个位置，改完马上构建。
+
+---
+
+_**User (2026-08-03 05:34:14Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-03 05:35:46Z)**_
+
+<ide_opened_file>The user opened the file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c in the IDE. This may or may not be related to the current task.</ide_opened_file>
+
+重新阅读一下代码，然后分析179,-571,0,-18,186,16
+179,-571,0,-18,186,16
+134,-571,0,-19,142,36
+134,-571,0,-19,142,36
+123,-571,0,-20,126,41
+123,-571,0,-20,126,41
+123,-571,0,-20,125,38
+123,-571,504,-20,125,38
+33,-563,0,-23,36,80
+33,-563,0,-23,36,80
+0,-563,455,-25,7,88
+0,-563,455,-25,7,88
+-78,-554,0,-29,-85,129
+-78,-554,0,-29,-85,129
+-101,-554,0,-31,-109,131
+-101,-554,506,-31,-109,131
+-191,-546,506,-35,-195,164
+-191,-546,0,-35,-195,164
+-202,-546,0,-37,-210,159
+-202,-546,0,-37,-210,159
+-191,-546,0,-38,-195,140
+-191,-546,0,-38,-195,140
+-292,-529,999,-45,-355,210
+-292,-529,0,-45,-355,210
+-393,-529,0,-48,-397,215
+-393,-529,504,-48,-397,215
+-472,-521,504,-53,-479,241
+-472,-521,0,-53,-479,241
+-472,-521,0,-55,-482,224
+-472,-521,502,-55,-482,224
+-539,-512,502,-60,-546,239
+-539,-512,502,-60,-546,239
+-539,-512,0,-62,-542,218
+-539,-512,0,-62,-542,218
+-596,-504,496,-66,-604,232
+-596,-504,0,-66,-604,232
+-697,-504,0,-280,-991,212
+-697,-504,0,-280,-991,212
+-798,-504,0,-280,-980,180
+-798,-504,500,-280,-980,180
+-899,-496,0,-280,-1000,193
+-899,-496,0,-280,-1000,193
+-989,-487,505,-280,-1000,224
+-989,-487,505,-280,-1000,224
+-989,-487,0,-280,-1000,212
+-989,-487,0,-280,-1000,212
+-989,-487,0,-280,-1000,183
+-989,-487,0,-280,-1000,183
+-989,-487,0,-280,-1000,150
+-989,-487,501,-280,-1000,150
+-989,-479,0,-280,-1000,167
+-989,-479,0,-280,-1000,167
+-989,-479,0,-280,-1000,155
+-989,-479,0,-280,-1000,155
+-967,-479,0,-280,-973,133
+-967,-479,0,-280,-973,133
+-922,-479,0,-280,-930,109
+-922,-479,0,-280,-930,109
+-888,-479,0,-280,-891,86
+-888,-479,0,-280,-891,86
+-854,-479,0,-280,-858,67
+-854,-479,0,-280,-858,67
+-821,-479,0,-280,-831,52
+-821,-479,0,-280,-831,52
+-809,-479,0,-280,-810,40
+-809,-479,0,-280,-810,40
+-787,-479,0,-280,-793,30
+-787,-479,-500,-280,-793,30
+-697,-487,-500,-280,-697,-24
+-697,-487,-506,-280,-697,-24
+-596,-496,0,-280,-580,-91
+-596,-496,0,-280,-580,-91
+-539,-496,0,-280,-549,-108
+-539,-496,0,-280,-549,-108
+-472,-504,-495,-280,-476,-150
+-472,-504,-495,-280,-476,-150
+-472,-504,-495,-280,-475,-151
+-472,-504,0,-280,-475,-151
+-494,-504,0,-280,-504,-134
+-494,-504,-502,-280,-504,-134
+-449,-512,-492,-280,-460,-159
+-449,-512,-492,-280,-460,-159
+-359,-529,-514,-35,141,-246
+-359,-529,-514,-35,141,-246
+-258,-538,-485,-35,264,-301
+-258,-538,-512,-35,264,-301
+-157,-546,-512,-35,358,-338
+-157,-546,-500,-35,358,-338
+-56,-554,-500,-35,433,-362
+-56,-554,-506,-35,433,-362
+33,-563,-500,-35,496,-378
+33,-563,-500,-35,496,-378
+134,-580,-502,-26,655,-437
+134,-580,-502,-26,655,-437
+236,-588,-497,-18,752,-459
+236,-588,0,-18,752,-459
+337,-588,0,-14,726,-417
+337,-588,-494,-14,726,-417
+438,-596,-494,-8,744,-399
+438,-596,-513,-8,744,-399
+528,-605,-502,-3,784,-395
+528,-605,-502,-3,784,-395
+629,-613,-998,2,836,-395
+629,-613,-998,2,836,-395
+731,-630,0,11,986,-446
+731,-630,-504,11,986,-446
+832,-638,-504,19,1000,-463
+832,-638,0,19,1000,-463
+933,-638,0,23,1000,-419
+933,-638,-490,23,1000,-419
+989,-647,-1540,29,1000,-400
+989,-647,-1540,29,1000,-400
+989,-672,0,40,1000,-489
+989,-672,0,40,1000,-489
+989,-680,-493,49,1000,-518
+989,-680,-493,49,1000,-518
+989,-680,0,54,1000,-472
+989,-680,0,54,1000,-472
+989,-680,0,57,1000,-399
+989,-680,-501,57,1000,-399
+989,-689,-501,61,1000,-372
+989,-689,0,61,1000,-372
+911,-689,0,63,920,-319
+911,-689,0,63,920,-319
+821,-689,0,65,821,-261
+821,-689,0,65,821,-261
+719,-689,0,66,729,-207
+719,-689,0,66,729,-207
+641,-689,0,66,650,-162
+641,-689,0,66,650,-162
+584,-689,0,66,586,-125
+584,-689,0,66,586,-125
+528,-689,0,66,535,-96
+528,-689,0,66,535,-96
+427,-680,492,63,407,-26
+427,-680,492,63,407,-26
+348,-680,0,62,349,5
+348,-680,0,62,349,5
+314,-680,0,61,325,18
+314,-680,0,61,325,18
+314,-680,0,61,319,21
+314,-680,500,61,319,21
+224,-672,503,58,232,67
+224,-672,503,58,232,67
+123,-655,514,50,21,173
+123,-655,514,50,21,173
+22,-655,0,46,-42,197
+22,-655,503,46,-42,197
+-67,-647,503,41,-131,232
+-67,-647,489,41,-131,232
+-157,-638,489,35,-226,268
+-157,-638,0,35,-226,268
+-224,-638,495,32,-227,252
+-224,-638,495,32,-227,252
+-326,-622,510,25,-373,312
+-326,-622,510,25,-373,312
+-382,-622,0,21,-389,301
+-382,-622,1497,21,-389,301
+-483,-596,1497,10,-629,405
+-483,-596,503,10,-629,405
+-584,-588,503,1,-766,449
+-584,-588,491,1,-766,449
+-686,-580,0,-5,-853,464
+-686,-580,0,-5,-853,464
+-787,-571,500,-12,-915,465
+-787,-571,500,-12,-915,465
+-866,-571,0,-16,-874,413
+-866,-571,501,-16,-874,413
+-877,-563,501,-21,-888,393
+-877,-563,504,-21,-888,393
+-922,-554,504,-27,-930,387
+-922,-554,502,-27,-930,387
+-978,-546,502,-32,-984,388
+-978,-546,500,-32,-984,388
+-989,-529,504,-41,-1000,440
+-989,-529,504,-41,-1000,440
+-989,-529,504,-46,-1000,411
+-989,-529,504,-46,-1000,411
+-989,-521,227,-52,-1000,401
+-989,-521,0,-52,-1000,401
+-956,-521,0,-55,-962,351
+-956,-521,416,-55,-962,351
+-944,-512,416,-59,-947,338
+-944,-512,0,-59,-947,338
+-866,-512,553,-62,-876,295
+-866,-512,553,-62,-876,295
+-866,-504,0,-66,-876,291
+-866,-504,0,-66,-876,291
+-967,-504,0,-280,-1000,257
+-967,-504,0,-280,-1000,257
+-989,-504,0,-280,-1000,214
+-989,-504,0,-280,-1000,214
+-989,-504,0,-280,-1000,172
+-989,-504,0,-280,-1000,172
+-967,-504,0,-280,-977,135
+-967,-504,0,-280,-977,135
+-922,-504,0,-280,-924,105
+-922,-504,0,-280,-924,105
+-877,-504,0,-280,-881,80
+-877,-504,0,-280,-881,80
+-843,-504,0,-280,-847,61
+-843,-504,0,-280,-847,61
+-821,-504,0,-280,-821,46
+-821,-504,0,-280,-821,46
+-956,-521,507,-52,-962,354
+-956,-521,0,-52,-962,354
+-899,-521,0,-55,-903,318
+-899,-521,0,-55,-903,318
+-809,-521,0,-56,-817,267
+-809,-521,0,-56,-817,267
+-719,-521,0,-57,-729,216
+-719,-521,0,-57,-729,216
+-641,-521,0,-58,-651,170
+-641,-521,0,-58,-651,170
+-584,-521,0,-58,-585,132
+-584,-521,0,-58,-585,132
+-528,-521,0,-58,-532,102
+-528,-521,0,-58,-532,102
+-483,-521,0,-58,-490,78
+-483,-521,0,-58,-490,78
+-449,-521,-509,-59,-457,59
+-449,-521,-509,-59,-457,59
+-348,-538,-491,-35,-223,-49
+-348,-538,-491,-35,-223,-49
+-247,-538,0,-50,-177,-88
+-247,-538,-577,-50,-177,-88
+-146,-546,-577,-35,-46,-142
+-146,-546,0,-35,-46,-142
+-56,-546,0,-43,-39,-148
+-56,-546,-500,-43,-39,-148
+33,-554,-503,-35,47,-181
+33,-554,-503,-35,47,-181
+134,-571,-503,-31,231,-269
+134,-571,-503,-31,231,-269
+236,-580,-503,-23,367,-322
+236,-580,0,-23,367,-322
+337,-580,0,-19,377,-307
+337,-580,-501,-19,377,-307
+427,-588,-501,-14,428,-314
+427,-588,-498,-14,428,-314
+494,-596,-1510,-9,495,-329
+494,-596,-1510,-9,495,-329
+584,-622,0,2,754,-440
+584,-622,0,2,754,-440
+686,-630,-500,11,895,-483
+686,-630,0,11,895,-483
+787,-630,0,16,887,-446
+787,-630,-506,16,887,-446
+888,-638,-506,22,910,-428
+888,-638,0,22,910,-428
+854,-638,-494,25,858,-373
+854,-638,-494,25,858,-373
+866,-647,0,29,873,-355
+866,-647,0,29,873,-355
+911,-655,-460,35,921,-355
+911,-655,-546,35,921,-355
+956,-664,-546,40,956,-362
+956,-664,0,40,956,-362
+888,-664,0,44,895,-324
+888,-664,-510,44,895,-324
+888,-672,0,48,895,-319
+888,-672,0,48,895,-319
+911,-680,-501,54,920,-329
+911,-680,-501,54,920,-329
+866,-680,0,57,867,-295
+866,-680,0,57,867,-295
+787,-680,0,58,788,-248
+787,-680,0,58,788,-248
+697,-680,0,59,706,-201
+697,-680,0,59,706,-201
+629,-680,0,60,633,-159
+629,-680,0,60,633,-159
+562,-680,0,60,572,-123
+562,-680,0,60,572,-123
+517,-680,0,60,522,-95
+517,-680,0,60,522,-95
+472,-680,0,60,483,-72
+472,-680,484,60,483,-72
+382,-672,484,57,365,-8
+382,-672,0,57,365,-8
+303,-672,496,56,314,19
+303,-672,496,56,314,19
+213,-664,0,52,206,75
+213,-664,0,52,206,75
+112,-655,493,47,80,137
+112,-655,0,47,80,137
+44,-655,0,44,48,147
+44,-655,505,44,48,147
+-33,-647,505,40,-34,182
+-33,-647,0,40,-34,182
+-33,-647,508,38,-41,176
+-33,-647,508,38,-41,176
+-101,-638,492,34,-108,201
+-101,-638,492,34,-108,201
+-191,-630,0,29,-199,236
+-191,-630,520,29,-199,236
+-292,-622,520,23,-295,271
+-292,-622,504,23,-295,271
+-382,-613,504,17,-389,302
+-382,-613,500,17,-389,302
+-472,-605,503,11,-477,328
+-472,-605,503,11,-477,328
+-551,-596,497,5,-559,349
+-551,-596,497,5,-559,349
+-652,-580,476,-3,-728,413
+-652,-580,476,-3,-728,413
+-731,-580,0,-8,-742,393
+-731,-580,500,-8,-742,393
+-776,-571,500,-14,-782,387
+-776,-571,0,-14,-782,387
+-742,-571,0,-17,-744,342
+-742,-571,496,-17,-744,342
+-764,-563,504,-22,-769,331
+-764,-563,504,-22,-769,331
+-866,-546,492,-30,-918,384
+-866,-546,492,-30,-918,384
+-967,-538,514,-37,-1000,410
+-967,-538,502,-37,-1000,410
+-989,-529,502,-44,-1000,422
+-989,-529,0,-44,-1000,422
+-989,-529,0,-48,-998,379
+-989,-529,494,-48,-998,379
+-978,-521,0,-53,-984,366
+-978,-521,0,-53,-984,366
+-899,-521,0,-55,-907,319
+-899,-521,0,-55,-907,319
+-899,-512,250,-60,-901,311
+-899,-512,0,-60,-901,311
+-832,-512,0,-62,-838,273
+-832,-512,0,-62,-838,273
+-753,-512,0,-63,-758,226
+-753,-512,0,-63,-758,226
+-674,-512,0,-64,-681,182
+-674,-512,0,-64,-681,182
+-607,-512,0,-64,-614,143
+-607,-512,0,-64,-614,143
+-551,-512,0,-65,-558,111
+-551,-512,0,-65,-558,111
+-506,-512,0,-65,-513,85
+-506,-512,0,-65,-513,85
+-472,-512,0,-65,-478,65
+-472,-512,0,-65,-478,65
+-449,-512,0,-65,-450,49
+-449,-512,0,-65,-450,49
+-427,-512,0,-65,-429,37
+-427,-512,0,-65,-429,37
+-404,-512,0,-65,-413,28
+-404,-512,0,-65,-413,28
+-393,-512,0,-65,-401,21
+-393,-512,-512,-65,-401,21
+-303,-521,-512,-62,-304,-31
+-303,-521,0,-62,-304,-31
+-269,-521,0,-61,-270,-49
+-269,-521,0,-61,-270,-49
+-258,-521,0,-60,-265,-51
+-258,-521,0,-60,-265,-51
+-157,-529,-654,-35,-141,-93
+-157,-529,-504,-35,-141,-93
+-56,-538,-504,-35,-35,-147
+-56,-538,-502,-35,-35,-147
+33,-546,-502,-35,73,-200
+33,-546,0,-35,73,-200
+67,-546,0,-43,72,-199
+67,-546,-505,-43,72,-199
+146,-554,-503,-35,149,-224
+146,-554,-503,-35,149,-224
+224,-563,0,-34,229,-256
+224,-563,0,-34,229,-256
+314,-571,-510,-28,321,-288
+314,-571,-510,-28,321,-288
+326,-571,0,-20,326,-268
+326,-571,-532,-20,326,-268
+359,-580,-532,-20,367,-277
+359,-580,0,-20,367,-277
+337,-580,-541,-18,346,-250
+337,-580,-541,-18,346,-250
+382,-588,-495,-13,391,-258
+382,-588,-495,-13,391,-258
+483,-605,-513,-5,558,-326
+483,-605,0,-5,558,-326
+573,-605,0,-1,582,-318
+573,-605,-501,-1,582,-318
+629,-613,-501,3,638,-326
+629,-613,0,3,638,-326
+607,-613,0,6,615,-292
+607,-613,0,6,615,-292
+551,-613,0,8,561,-246
+551,-613,0,8,561,-246
+584,-622,-506,11,594,-246
+584,-622,-506,11,594,-246
+562,-622,0,14,573,-218
+562,-622,0,14,573,-218
+528,-622,0,15,532,-182
+528,-622,0,15,532,-182
+483,-622,0,15,487,-147
+483,-622,0,15,487,-147
+438,-622,0,16,446,-116
+438,-622,0,16,446,-116
+404,-622,0,16,412,-90
+404,-622,0,16,412,-90
+303,-613,495,13,291,-22
+303,-613,0,13,291,-22
+224,-613,0,12,236,8
+224,-613,470,12,236,8
+134,-605,470,8,120,67
+134,-605,521,8,120,67
+33,-596,516,3,-12,131
+33,-596,516,3,-12,131
+-56,-588,0,-1,-144,190
+-56,-588,0,-1,-144,190
+-157,-580,498,-7,-267,240
+-157,-580,0,-7,-267,240
+-258,-580,0,-11,-286,233
+-258,-580,487,-11,-286,233
+-348,-571,487,-15,-353,252
+-348,-571,533,-15,-353,252
+-427,-563,0,-21,-438,278
+-427,-563,0,-21,-438,278
+-528,-554,510,-26,-528,305
+-528,-554,510,-26,-528,305
+-607,-546,497,-32,-617,329
+-607,-546,507,-32,-617,329
+-697,-538,507,-38,-702,349
+-697,-538,950,-38,-702,349
+-798,-521,950,-48,-875,412
+-798,-521,527,-48,-875,412
+-899,-512,527,-55,-985,439
+-899,-512,527,-55,-985,439
+-967,-512,0,-60,-972,401
+-967,-512,0,-60,-972,401
+-899,-512,0,-62,-909,340
+-899,-512,501,-62,-909,340
+-922,-504,501,-66,-927,324
+-922,-504,0,-66,-927,324
+-989,-504,0,-280,-1000,281
+-989,-504,536,-280,-1000,281
+-989,-496,0,-280,-1000,278
+-989,-496,0,-280,-1000,278
+-989,-487,511,-280,-1000,293
+-989,-487,511,-280,-1000,293
+-989,-479,489,-280,-1000,314
+-989,-479,0,-280,-1000,314
+-989,-479,0,-280,-1000,287
+-989,-479,0,-280,-1000,287
+-989,-479,0,-280,-1000,243
+-989,-479,0,-280,-1000,243
+-989,-479,0,-280,-1000,198
+-989,-479,0,-280,-1000,198
+-989,-479,0,-280,-1000,157
+-989,-479,0,-280,-1000,157
+-989,-470,493,-280,-1000,170
+-989,-470,0,-280,-1000,170
+-989,-470,0,-280,-1000,156
+-989,-470,0,-280,-1000,156
+-967,-470,0,-280,-972,132
+-967,-470,0,-280,-972,132
+-922,-470,0,-280,-929,108
+-922,-470,0,-280,-929,108
+-888,-470,0,-280,-890,85
+-888,-470,0,-280,-890,85
+-854,-470,0,-280,-857,67
+-854,-470,-510,-280,-857,67
+-753,-479,-510,-280,-747,4
+-753,-479,0,-280,-747,4
+-697,-479,0,-280,-701,-21
+-697,-479,-530,-280,-701,-21
+-596,-487,0,-280,-604,-77
+-596,-487,0,-280,-604,-77
+-573,-487,-501,-280,-579,-91
+-573,-487,-501,-280,-579,-91
+-494,-496,0,-280,-504,-134
+-494,-496,-503,-280,-504,-134
+-416,-504,-503,-280,-417,-184
+-416,-504,0,-280,-417,-184
+-416,-504,0,-280,-417,-184
+-416,-504,0,-280,-417,-184
+-449,-504,0,-280,-454,-163
+-449,-504,-501,-280,-454,-163
+-416,-512,0,-280,-418,-183
+-416,-512,0,-280,-418,-183
+-314,-521,-493,-35,89,-218
+-314,-521,-493,-35,89,-218
+-213,-546,-1513,-35,351,-350
+-213,-546,-508,-35,351,-350
+-112,-554,-508,-35,497,-412
+-112,-554,0,-35,497,-412
+-11,-554,0,-35,497,-391
+-11,-554,0,-35,497,-391
+78,-554,-490,-20,463,-338
+78,-554,-490,-20,463,-338
+179,-563,-413,-32,448,-326
+179,-563,-413,-32,448,-326
+281,-580,-526,-24,589,-378
+281,-580,-526,-24,589,-378
+371,-588,-507,-17,687,-405
+371,-588,-504,-17,687,-405
+472,-596,-504,-10,761,-417
+472,-596,-497,-10,761,-417
+573,-605,-497,-
+目标点震荡还是严重，提前刹车还是早了一点
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:35:53Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Reviewing pid.c and main.c logic**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:35:56Z)**_
+
+我先把现在 `pid.c` 里终点相关逻辑再对一遍，然后直接按这组 VOFA 数据逐段拆。重点会看两件事：`ch3` 是不是还在过早收目标速度，`ch4` 是不是在终点区持续给大倾角。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:35:56Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:35:56Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\main.c`
+
+```text
+170	    // ========== 每10ms：发送 VOFA+ 数据（100Hz） ==========
+171	    if(HAL_GetTick() - last_vofa_time >= 10)
+172	    {
+173	      last_vofa_time = HAL_GetTick();
+174	
+175	      // ===== VOFA+ 发送：6通道 =====
+176	      // 所有通道均 ×100 发送，VOFA+ 中 ÷100 后为真实值。
+177	      int32_t vofa_data[6];
+178	      vofa_data[0] = (int32_t)(motor_get_command_angle() * 100.0f);  // ch0: 开环目标角度(°)
+179	      vofa_data[1] = (int32_t)(Y * 100.0f);                          // ch1: 小球位置(cm)
+180	      vofa_data[2] = (int32_t)(ball_velocity * 100.0f);              // ch2: MaixCAM 原始速度(cm/s)，仅诊断
+181	      vofa_data[3] = (int32_t)(pidY.out * 100.0f);                   // ch3: 位置环目标速度(cm/s)
+182	      vofa_data[4] = (int32_t)(pidY_velocity_damping * 100.0f);     // ch4: 速度环输出倾角(°)
+183	      vofa_data[5] = (int32_t)(pidY_filtered_velocity * 100.0f);    // ch5: 本地差分+低通后的控制速度(cm/s)
+184	      Vofa_usage_SendString(vofa_data, 6);
+185	    }
+186	
+187	    // ========== 处理 MaixCAM 视觉数据 ==========
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:03Z)**_
+
+`pid.c` 行号已经和前面不一样了，说明文件被你这边打开/调整过之后长度变了。我先重新定位 `-6.0` 相关代码块，再按当前文件实际内容分析这组数据。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:03Z)**_
+
+<tool-use data-tool-type="search" data-tool-name="Grep"><details>
+<summary>Tool use: **Grep**</summary>
+ path `./\Core\Src\pid.c` pattern `target_is_neg6|pidY.out|pidY_velocity_damping|target_hold_active|relative_y > 2\.8f|0\.65f|neg6`
+
+```text
+43:float pidY_velocity_damping;
+211:	static bool target_hold_active = false;
+213:	static float neg6_relative_y_filtered = 0.0f;
+214:	static bool neg6_near_zone_active = false;
+233:			target_hold_active = false;
+235:			neg6_relative_y_filtered = 0.0f;
+241:			target_hold_active = false;
+253:		target_hold_active = false;
+270:	bool target_is_neg6 = (target_y == -6.0f);
+271:	float target_hold_enter = target_is_neg6 ? 0.18f : TARGET_HOLD_POSITION_ENTER;
+272:	float target_hold_exit = target_is_neg6 ? 0.28f : TARGET_HOLD_POSITION_EXIT;
+277:	if(target_is_neg6) {
+282:		neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+283:		relative_y = neg6_relative_y_filtered;
+289:		neg6_relative_y_filtered = relative_y;
+298:		if(target_hold_active) {
+300:				target_hold_active = false;
+309:				target_hold_active = true;
+315:		target_hold_active = false;
+319:	if(target_hold_active) {
+335:	if(target_is_neg6 && !target_hold_active) {
+338:		if(relative_y > 2.8f) {
+339:			if(pidY.out > -4.2f) pidY.out = -4.2f;
+340:		} else if(relative_y > 0.65f) {
+341:			if(pidY.out > -2.6f) pidY.out = -2.6f;
+344:	if(target_is_neg6) {
+348:		if(relative_y > 0.0f && relative_y <= 0.65f) {
+349:			float neg6_speed_limit = 0.95f;
+350:			if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+352:				neg6_speed_limit = 0.12f;
+354:				neg6_speed_limit = 0.18f;
+356:			if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+357:			else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+359:			float neg6_speed_limit = 0.30f;
+360:			if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+361:			else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+364:	if(target_hold_active) {
+367:		if(target_is_neg6) {
+369:				pidY.out = 0.0f;
+371:				pidY.out = -1.1f * relative_y;
+372:				if(pidY.out > 0.10f) pidY.out = 0.10f;
+373:				else if(pidY.out < -0.10f) pidY.out = -0.10f;
+376:			pidY.out = 0.0f;
+396:	pidY_velocity_damping = 0.0f;
+404:	float cmd_angle = pidY.out;
+407:		pidY_Speed.target = pidY.out;
+411:		pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+412:		float cmd_angle = pidY_velocity_damping;
+415:	if(target_is_neg6) {
+418:		float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+419:		if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+420:		if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+421:		if(target_hold_active) neg6_angle_limit = 2.0f;
+422:		if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+423:		else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:03Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+220		}
+221	
+222		Y = ball_error;  // 视觉小球绝对位置
+223	
+224		/* 分段状态机：
+225		 *   1) 先用第一组参数把球从 0cm 推到 +5.6cm；
+226		 *   2) 一旦进入 +5.6cm ±0.5cm，立刻切第二组参数并改目标到 -5.5cm；
+227		 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
+228		if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
+229			if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
+230				pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+231				g_pid_segment = PID_SEGMENT_TO_NEG_55;
+232				control_initialized = false;
+233				target_hold_active = false;
+234				target_hold_settle_ticks = 0u;
+235				neg6_relative_y_filtered = 0.0f;
+236			}
+237		} else if(g_pid_segment == PID_SEGMENT_TO_NEG_55) {
+238			if(pid_absf(Y + 6.0f) <= TARGET_HOLD_POSITION_ENTER) {
+239				g_pid_segment = PID_SEGMENT_HOLD_NEG_55;
+240				control_initialized = false;
+241				target_hold_active = false;
+242				target_hold_settle_ticks = 0u;
+243			}
+244		}
+245	
+246		/* 在目标坐标系中控制：负值表示球在目标负侧，正值表示球在目标正侧。 */
+247		float target_y = ball_target_get();
+248		float relative_y = Y - target_y;
+249		bool target_changed = !control_initialized || target_y != target_y_last;
+250	
+251		/* 切换目标时丢弃旧状态，避免把上一个目标的补偿带到新目标。 */
+252		if(target_changed) {
+253			target_hold_active = false;
+254			target_hold_settle_ticks = 0u;
+255			relative_y_last = relative_y;
+256			target_y_last = target_y;
+257			control_initialized = true;
+258		}
+259	
+260		float position_delta = relative_y - relative_y_last;
+261		redYSpeed = position_delta;  // 保留旧诊断变量，单位为每控制周期 cm
+262	
+263		/* 内环速度反馈改为本地位置差分速度。
+264		 * MaixCAM 直接给出的速度存在大量 0/尖峰交替，容易让内环误判“已经超速”，
+265		 * 提前给出负倾角。位置量测本身连续得多，因此用 relative_y 差分更稳。
+266		 */
+267		float estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+268		float abs_relative_y = (relative_y >= 0.0f) ? relative_y : -relative_y;
+269		float abs_estimated_velocity = (estimated_velocity >= 0.0f) ? estimated_velocity : -estimated_velocity;
+270		bool target_is_neg6 = (target_y == -6.0f);
+271		float target_hold_enter = target_is_neg6 ? 0.18f : TARGET_HOLD_POSITION_ENTER;
+272		float target_hold_exit = target_is_neg6 ? 0.28f : TARGET_HOLD_POSITION_EXIT;
+273	
+274		/* -6.0cm 终点补丁：不再切新的分段 PID，而是在近端直接保护观测与压小目标速度。
+275		 * 1) |error|<=1.2cm 时，若单帧位置跳变超过 1.0cm，则判为视觉毛刺，本周期沿用上一帧 relative_y；
+276		 * 2) 对近端 relative_y 再做一阶低通，但滤波更快一些，减少末端相位滞后。 */
+277		if(target_is_neg6) {
+278			float relative_y_for_control = relative_y;
+279			if(abs_relative_y <= 1.2f && pid_absf(position_delta) > 1.0f) {
+280				relative_y_for_control = relative_y_last;
+281			}
+282			neg6_relative_y_filtered += 0.45f * (relative_y_for_control - neg6_relative_y_filtered);
+283			relative_y = neg6_relative_y_filtered;
+284			position_delta = relative_y - relative_y_last;
+285			estimated_velocity = position_delta / PID_CONTROL_PERIOD_S;
+286			abs_relative_y = pid_absf(relative_y);
+287			abs_estimated_velocity = pid_absf(estimated_velocity);
+288		} else {
+289			neg6_relative_y_filtered = relative_y;
+290		}
+291	
+292		/* 最终保持只在第二段完成后生效。
+293		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+294		 *
+295		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+296		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+297		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+298			if(target_hold_active) {
+299				if(abs_relative_y >= target_hold_exit) {
+300					target_hold_active = false;
+301					target_hold_settle_ticks = 0u;
+302				}
+303			} else if(abs_relative_y <= target_hold_enter &&
+304			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+305				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+306					target_hold_settle_ticks++;
+307				}
+308				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+309					target_hold_active = true;
+310				}
+311			} else {
+312				target_hold_settle_ticks = 0u;
+313			}
+314		} else {
+315			target_hold_active = false;
+316			target_hold_settle_ticks = 0u;
+317		}
+318	
+319		if(target_hold_active) {
+320			/* 进入误差保持区后，只停止位置环继续推球：
+321			 *   1) 外环目标速度稍后压到 0；
+322			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+323		}
+324	
+325		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+326		pidY.target = 0.0f;
+327		pidY.now = relative_y;
+328		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+329		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+330		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+331		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+332		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+333		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+334		                POS_LOOP_I_LIMIT);
+335		if(target_is_neg6 && !target_hold_active) {
+336			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+337			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+338			if(relative_y > 2.8f) {
+339				if(pidY.out > -4.2f) pidY.out = -4.2f;
+340			} else if(relative_y > 0.65f) {
+341				if(pidY.out > -2.6f) pidY.out = -2.6f;
+342			}
+343		}
+344		if(target_is_neg6) {
+345			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+346			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+347			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+348			if(relative_y > 0.0f && relative_y <= 0.65f) {
+349				float neg6_speed_limit = 0.95f;
+350				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+351				if(estimated_velocity < -2.0f) {
+352					neg6_speed_limit = 0.12f;
+353				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+354					neg6_speed_limit = 0.18f;
+355				}
+356				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+357				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+358			} else if(abs_relative_y <= 0.30f) {
+359				float neg6_speed_limit = 0.30f;
+360				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+361				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+362			}
+363		}
+364		if(target_hold_active) {
+365			/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+366			 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+367			if(target_is_neg6) {
+368				if(pid_absf(relative_y) <= 0.06f) {
+369					pidY.out = 0.0f;
+370				} else {
+371					pidY.out = -1.1f * relative_y;
+372					if(pidY.out > 0.10f) pidY.out = 0.10f;
+373					else if(pidY.out < -0.10f) pidY.out = -0.10f;
+374				}
+375			} else {
+376				pidY.out = 0.0f;
+377			}
+378		}
+379	
+380		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+381		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+382		 */
+383		float control_velocity = estimated_velocity;
+384		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+385			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+386		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+387			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+388		}
+389		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+390		                         (control_velocity - pidY_filtered_velocity);
+391	
+392	#if POSITION_LOOP_DIRECT_DRIVE
+393		/* 单环调试模式：位置环直接输出平台倾角。
+394		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+395		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+396		pidY_velocity_damping = 0.0f;
+397		pidY_Speed.target = 0.0f;
+398		pidY_Speed.now = pidY_filtered_velocity;
+399		pidY_Speed.out = 0.0f;
+400		pidY_Speed.pout = 0.0f;
+401		pidY_Speed.iout = 0.0f;
+402		pidY_Speed.dout = 0.0f;
+403	
+404		float cmd_angle = pidY.out;
+405		#else
+406			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+407			pidY_Speed.target = pidY.out;
+408			pidY_Speed.now = pidY_filtered_velocity;
+409			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+410			                SPEED_LOOP_I_LIMIT);
+411			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+412			float cmd_angle = pidY_velocity_damping;
+413		#endif
+414	
+415		if(target_is_neg6) {
+416			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+417			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+418			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+419			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+420			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+421			if(target_hold_active) neg6_angle_limit = 2.0f;
+422			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+423			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+424		}
+425	
+426		// 负方向（下降）机构补偿 ×1.2。
+427		if(cmd_angle < 0.0f) {
+428			cmd_angle *= 1.0f;
+429		}
+430	
+431		/* 倾角变化率限制：每 20ms tick 最大变化 ANGLE_SLEW_PER_TICK，
+432		 * 避免 PID 在相邻周期间从 +限幅 直接跳到 -限幅 造成机械冲击振荡。 */
+433		static float cmd_angle_last = 0.0f;
+434		{
+435			float delta = cmd_angle - cmd_angle_last;
+436			if(delta >  ANGLE_SLEW_PER_TICK) delta =  ANGLE_SLEW_PER_TICK;
+437			else if(delta < -ANGLE_SLEW_PER_TICK) delta = -ANGLE_SLEW_PER_TICK;
+438			cmd_angle = cmd_angle_last + delta;
+439			cmd_angle_last = cmd_angle;
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:21Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing dataset against code behavior**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:22Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying signal phase transitions and overshoot**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:23Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Verifying output scaling consistency**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:28Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing floor value discrepancies**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:30Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Tracing oscillation caused by loop delays**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:33Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Confirming late braking logic in code**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:39Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying dead zone before speed clamp activation**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:43Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing early braking from velocity clamp discontinuity**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:48Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing ball trajectory dynamics during overshoot**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:51Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Diagnosing overshoot causes and hold logic limits**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:36:57Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Identifying late angle capping issue**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:02Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Discovering unused near-zone flag in code**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:09Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Analyzing ball braking patterns**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:13Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Quantifying limit cycle amplitude and clarifying velocity spikes**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:16Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Planning concise code references with links**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Summarizing VOFA behavior and dead code findings**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:18Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Selecting key output columns**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:37:45Z)**_
+
+我重新对了当前代码，结合 [Core/Src/main.c:178-183](Core/Src/main.c#L178-L183) 的 VOFA 定义，这组数据里真正该盯的是：
+
+- `ch1`：小球位置
+- `ch3`：位置环输出的目标速度
+- `ch4`：速度环输出的倾角
+- `ch5`：本地差分+低通后的控制速度
+
+看完现在的 [Core/Src/pid.c:270-423](Core/Src/pid.c#L270-L423)，结论比较明确：  
+这不是单一的 “PID 参数没调好”，而是 `-6.0` 终点补丁本身还有两个结构性问题，所以才会同时出现“提前刹一点”和“目标点大震荡”。
+
+**1. 提前刹车还是早，根子在 [Core/Src/pid.c:335-362](Core/Src/pid.c#L335-L362)**
+
+你这组数据开头这一段很典型：
+
+- `ch1 = -5.71 -> -5.54 -> -5.29 -> -5.04`
+- 同时 `ch5 = 0.16 -> 1.31 -> 2.10 -> 2.32`
+
+这说明球在 `-6.0` 右侧时，其实还在继续往右跑，也就是离目标越来越远。  
+但这时 `ch3` 只有 `-0.18 -> -0.31 -> -0.45 -> -0.66`，拉回力度很小。
+
+这正对应当前代码里的近端限速：
+
+- `0 < relative_y <= 0.65` 时，`pidY.out` 会被压得很软
+- 一旦 `relative_y > 0.65`，又立刻切回巡航托底 `-2.6`
+
+所以它现在不是“平滑减速”，而是：
+
+- 先在 `0.65cm` 这附近过早收软
+- 球继续跑开
+- 超过阈值后又突然被 `-2.6` 硬拉回来
+
+这就是你体感里的“还是提前刹了一点”。  
+不是纯粹中段巡航不够，而是 **终点前 `0.65cm` 这一刀切得太早，而且切得太狠**。
+
+**2. 目标点震荡严重，根子在 [Core/Src/pid.c:415-423](Core/Src/pid.c#L415-L423) 的限角开始得太晚**
+
+后面这段更明显：
+
+- 当 `ch1 ≈ -5.04 ~ -4.79` 时，`ch3` 已经被打到 `-2.80`
+- 同时 `ch4` 直接到 `-9.91° / -10.00°`
+- `ch5` 先还是正的，随后才翻成负
+
+这说明外环刚一重新接管，内环就已经给了接近满角的大动作。  
+而当前代码里 `-6.0` 的角度帽是：
+
+- `|relative_y| <= 0.75` 才限到 `5.5°`
+- `|relative_y| <= 0.35` 才限到 `3.2°`
+
+问题是你这组数据里**最猛的那一下**，发生在 `relative_y` 还大约 `0.9~1.0cm` 的时候。  
+也就是说，**最大的踢角发生在限角窗口之外**。等进入 `0.75cm` 以内时，速度已经被打出来了，后面只能靠反向再猛拉一次，于是形成来回穿越。
+
+这就是为什么你看到后面又会走成镜像：
+
+- 一路冲到 `ch1 ≈ -7.48`
+- 同时 `ch3 ≈ +1.04`
+- `ch4` 又打到 `+10°`
+- `ch5 ≈ -3.30`
+
+也就是围着 `-6.0` 做一个接近 bang-bang 的大往返，不是细收敛。
+
+**3. hold 逻辑这组数据里基本没真正接管**
+
+看 [Core/Src/pid.c:297-317](Core/Src/pid.c#L297-L317)，进入最终保持要同时满足：
+
+- 位置进窗
+- 速度也足够小
+- 连续稳定若干 tick
+
+但你这组数据里，过点时 `ch5` 一直在 `±1~5 cm/s` 这个量级来回。  
+所以 `target_hold_active` 大部分时间根本进不去。也就是说：
+
+- 你现在看到的严重震荡
+- 不是 hold 逻辑把球抖起来
+- 而是 **hold 之前的大幅往返就已经形成了**
+
+**4. 代码里还有一个很关键的事实：`neg6_near_zone_active` 现在是死变量**
+
+在 [Core/Src/pid.c:214](Core/Src/pid.c#L214) 里它已经声明了：
+
+- `static bool neg6_near_zone_active = false;`
+
+但当前文件里没有真正把它接到终点流程里。  
+也就是说，前面想做的“近端状态”实际上还没落到控制链上。现在真正跑的，还是：
+
+- `0.65cm` 的外环限速分段
+- `0.75/0.35cm` 的内环限角分段
+
+所以从这组数据看，系统行为完全符合当前代码，没有出现“看不懂的异常”。
+
+**结论**
+
+这组数据说明现在最主要的问题不是全局 PID，而是 `-6.0` 终点补丁的窗口位置和窗口衔接：
+
+1. 外环在 `0.65cm` 就开始收得太软，刹车点偏早。  
+2. 内环限角从 `0.75cm` 才开始，开始得太晚，第一脚大踢角没被拦住。  
+3. 这两个窗口之间存在明显的非连续切换，所以表现成“先软放、再猛拉、再过点、再猛拉回来”。  
+4. `neg6_near_zone_active` 还没接入，所以现在并没有真正的“近端状态机”。
+
+下一步该动的地方也很明确，不该再泛泛调 PID，而该直接改这三处局部逻辑：
+
+- 把外环“近端收软”的起点从 `0.65cm` 往里收
+- 把内环限角的起点从 `0.75cm` 往外提
+- 把 `neg6_near_zone_active` 真正接进 `-6.0` 近端流程，进近端时清速度环积分，出近端再释放
+
+这样改才是在对这组数据下药，而不是继续盲调。
+
+---
+
+_**User (2026-08-03 05:38:01Z)**_
+
+继续修改
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:40:38Z)**_
+
+<think><details><summary>Thought Process</summary>
+I need to adjust the softening parameters for the outer loop by moving its start point inward, then shift the inner loop's angle limit outward to a larger threshold. I also need to properly integrate the near-zone activation flag so it clears the speed loop integral when entering and releases it on exit. I need to reconsider the coordinate system—when the ball is at Y = -5.71, relative_y is +0.29, meaning it's on the positive side of the -6.0 target and moving away. The oscillation happens as it approaches and overshoots. Rather than continue tweaking constants, I should implement a proper near-zone state machine: define entry at abs_relative_y <= 1.2, clear the speed loop integrator on first entry, and restructure the outer loop logic around this boundary.
+
+Now I'm planning three specific edits to the code. First, I'll wire up the near-zone flag that's currently declared but unused by adding logic after the abs_relative_y calculation. Second, I'll adjust the outer loop softening to start later and remain continuous. Third, I'll expand the inner angle cap window to start earlier. I need to be careful with the file's tab indentation when making these changes. Adjusting the angle limiting logic... I'm seeing a discontinuity problem at the 0.65 threshold — below it the floor keeps output at -2.6 minimum, but above it a soft cap of ±0.95 kicks in, creating a sudden jump in commanded speed that feels jerky rather than smooth.
+
+To fix this, I should replace both the cruise floor and near-end cap with a single distance-scheduled approach speed that ramps continuously across the whole return path, eliminating the cliff at 0.65. I'm designing a function where the allowed approach magnitude varies smoothly with relative_y — staying aggressive when far away, then gradually easing as the ball approaches.
+
+Writing control logic... Writing speed control logic... Adjusting the cap calculation to use absolute value of relative_y so overshooting significantly in the negative direction allows stronger recovery—for example, relative_y of -0.5 would permit ±0.57 correction instead of just ±0.10. But I'm realizing this approach keeps spiraling into more tweaks, so maybe I should reconsider the overall strategy here.
+
+The real issues are the discontinuity at 0.65 and the angle cap kicking in too late. The main levers are widening the angle cap to reduce oscillation in the inner loop, smoothing the outer transition zone, and making sure the near-zone integral clears properly. I'll keep the changes focused and moderate rather than over-engineering, using the existing pid_absf function for consistency, then apply targeted edits to the file.
+
+Now I'm wiring the near-zone management to clear the speed integral when first entering the near zone (within 1.0cm of target), which prevents accumulated negative integral from the return phase from causing overshoot at the endpoint. Continuing with the edits... Writing braking logic... Refining the approach speed curve for the return motion, removing the abrupt speed step that was causing the ball to escape and get pulled back, and instead implementing a smooth deceleration based on remaining distance with a minimum cruise speed that varies from about 1.2cm/s near the target to 4.2cm/s when further away. Adding angle limit logic... Adjusting angle limits based on the relative Y position to progressively constrain the command angle as the target gets closer, with additional tightening when the target hold is active.
+</details></think>
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+---
+
+_**User (2026-08-03 05:40:43Z)**_
+
+[Request interrupted by user]
+
+_**User (2026-08-03 05:41:08Z)**_
+
+<command-name>/model</command-name>
+            <command-message>model</command-message>
+            <command-args>claude-opus-4-8</command-args>
+
+_**User (2026-08-03 05:41:21Z)**_
+
+<local-command-caveat>Caveat: The messages below were generated by the user while running local commands. DO NOT respond to these messages or otherwise consider them in your response unless the user explicitly asks you to.</local-command-caveat>
+
+_**User (2026-08-03 05:41:32Z)**_
+
+现在继续任务
+
+---
+
+_**Agent (claude-opus-4-8 2026-08-03 05:41:42Z)**_
+
+<think><details><summary>Thought Process</summary>
+**Inspecting relevant code around edit**
+</details></think>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:41:42Z)**_
+
+我把近端状态先接进去了：现在进入 `-6.0` 的 `1cm` 区域会先清一次速度环积分。接下来继续把另外两刀落下去：把外环“过早收软”的窗口往里收，同时把内环限角提早到更外侧生效。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:41:43Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+330			target_hold_settle_ticks = 0u;
+331		}
+332	
+333		if(target_hold_active) {
+334			/* 进入误差保持区后，只停止位置环继续推球：
+335			 *   1) 外环目标速度稍后压到 0；
+336			 *   2) 速度环继续按“目标速度 = 0”闭环抑制残余滚动。 */
+337		}
+338	
+339		/* PID 固定跟踪相对坐标系的零点，ball_target_y 可随时更改。 */
+340		pidY.target = 0.0f;
+341		pidY.now = relative_y;
+342		/* 外环用条件积分限幅。POS_LOOP_I_LIMIT=0 表示外环不积分（稳态误差交给内环积分消除），
+343		 * 且每周期强制 iout=0，即使曾被历史代码写坏也会立刻清掉。
+344		 * 绝不能再用 PIDOUT_CLAMP：外环 pout 在 |relative_y|>12.5cm 时超过 5.0 限幅，
+345		 * 反算抗饱和会把溢出量永久写进 iout，Ki=0 时再也退不回来，
+346		 * 表现为 ch3 恒定偏低一个常数（实测 −2.245 cm/s），球停在错误位置。 */
+347		pid_cal_clamped(&pidY, -BALL_TARGET_SPEED_LIMIT, BALL_TARGET_SPEED_LIMIT,
+348		                POS_LOOP_I_LIMIT);
+349		if(target_is_neg6 && !target_hold_active) {
+350			/* 从 +5.6 回到 -6.0 的中段仍保留巡航托底，避免太早掉速；
+351			 * 托底一直保留到更靠近目标的位置，减少“还没进终点区就先收刹”的感觉。 */
+352			if(relative_y > 2.8f) {
+353				if(pidY.out > -4.2f) pidY.out = -4.2f;
+354			} else if(relative_y > 0.65f) {
+355				if(pidY.out > -2.6f) pidY.out = -2.6f;
+356			}
+357		}
+358		if(target_is_neg6) {
+359			/* -6.0 前最后 0.65cm 改成按“剩余距离 + 当前来向速度”收刹：
+360			 *   - 还在目标右侧且负速度过大时，提前把外环目标速度压小；
+361			 *   - 真正贴近目标后再收得更软，减少穿点后的往返。 */
+362			if(relative_y > 0.0f && relative_y <= 0.65f) {
+363				float neg6_speed_limit = 0.95f;
+364				if(relative_y <= 0.30f) neg6_speed_limit = 0.40f;
+365				if(estimated_velocity < -2.0f) {
+366					neg6_speed_limit = 0.12f;
+367				} else if(estimated_velocity < -1.2f && relative_y <= 0.40f) {
+368					neg6_speed_limit = 0.18f;
+369				}
+370				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+371				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+372			} else if(abs_relative_y <= 0.30f) {
+373				float neg6_speed_limit = 0.30f;
+374				if(pidY.out > neg6_speed_limit) pidY.out = neg6_speed_limit;
+375				else if(pidY.out < -neg6_speed_limit) pidY.out = -neg6_speed_limit;
+376			}
+377		}
+378		if(target_hold_active) {
+379			/* 进入保持后，对 -6.0 不再用固定 ±0.22 的硬切换，
+380			 * 改成一个很小的比例型目标速度，让内环持续压残余滚动但少一点反复抽动。 */
+381			if(target_is_neg6) {
+382				if(pid_absf(relative_y) <= 0.06f) {
+383					pidY.out = 0.0f;
+384				} else {
+385					pidY.out = -1.1f * relative_y;
+386					if(pidY.out > 0.10f) pidY.out = 0.10f;
+387					else if(pidY.out < -0.10f) pidY.out = -0.10f;
+388				}
+389			} else {
+390				pidY.out = 0.0f;
+391			}
+392		}
+393	
+394		/* 先限制本地估计速度，再低通滤波，VOFA ch5 继续保留这个诊断量。
+395		 * 单调位置环时它不参与控制，只作为观察球在平台上实际运动情况的参考。
+396		 */
+397		float control_velocity = estimated_velocity;
+398		if(control_velocity > BALL_VELOCITY_CONTROL_LIMIT) {
+399			control_velocity = BALL_VELOCITY_CONTROL_LIMIT;
+400		} else if(control_velocity < -BALL_VELOCITY_CONTROL_LIMIT) {
+401			control_velocity = -BALL_VELOCITY_CONTROL_LIMIT;
+402		}
+403		pidY_filtered_velocity += BALL_VELOCITY_FILTER_ALPHA *
+404		                         (control_velocity - pidY_filtered_velocity);
+405	
+406	#if POSITION_LOOP_DIRECT_DRIVE
+407		/* 单环调试模式：位置环直接输出平台倾角。
+408		 * 位置环此时直接调“位置 -> 角度”，便于先把 P/I/D 基本手感调顺。
+409		 * 仍复用电机最终角度限幅与角度斜坡限制，避免机械冲击。 */
+410		pidY_velocity_damping = 0.0f;
+411		pidY_Speed.target = 0.0f;
+412		pidY_Speed.now = pidY_filtered_velocity;
+413		pidY_Speed.out = 0.0f;
+414		pidY_Speed.pout = 0.0f;
+415		pidY_Speed.iout = 0.0f;
+416		pidY_Speed.dout = 0.0f;
+417	
+418		float cmd_angle = pidY.out;
+419		#else
+420			/* 外环给出小球目标速度，内环以本地估计速度为反馈输出平台倾角。 */
+421			pidY_Speed.target = pidY.out;
+422			pidY_Speed.now = pidY_filtered_velocity;
+423			pid_cal_clamped(&pidY_Speed, -SPEED_LOOP_ANGLE_LIMIT, SPEED_LOOP_ANGLE_LIMIT,
+424			                SPEED_LOOP_I_LIMIT);
+425			pidY_velocity_damping = pidY_Speed.out;  /* 保留旧变量名，供 VOFA 观察限幅后的速度环输出 */
+426			float cmd_angle = pidY_velocity_damping;
+427		#endif
+428	
+429		if(target_is_neg6) {
+430			/* 终点附近最明显的问题已经不是外环 target speed，而是速度环会把倾角打得过猛。
+431			 * 单独给 -6.0 一段更紧的内环角度帽，减少过点后的大幅反拉。 */
+432			float neg6_angle_limit = SPEED_LOOP_ANGLE_LIMIT;
+433			if(abs_relative_y <= 0.75f) neg6_angle_limit = 5.5f;
+434			if(abs_relative_y <= 0.35f) neg6_angle_limit = 3.2f;
+435			if(target_hold_active) neg6_angle_limit = 2.0f;
+436			if(cmd_angle > neg6_angle_limit) cmd_angle = neg6_angle_limit;
+437			else if(cmd_angle < -neg6_angle_limit) cmd_angle = -neg6_angle_limit;
+438		}
+439
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:41:43Z)**_
+
+<tool-use data-tool-type="read" data-tool-name="Read"><details>
+<summary>Tool use: **Read**</summary>
+ `./\Core\Src\pid.c`
+
+```text
+286			abs_relative_y = pid_absf(relative_y);
+287			abs_estimated_velocity = pid_absf(estimated_velocity);
+288		} else {
+289			neg6_relative_y_filtered = relative_y;
+290		}
+291	
+292		/* -6.0 近端状态机：首次进入 |error|<=1.0cm 时清一次速度环积分，
+293		 * 避免把回程累积的负向积分带进终点区，导致过点后仍持续猛推；
+294		 * 直到明显退出到 1.4cm 以外才复位，留出回差防止边界抖动。 */
+295		if(target_is_neg6) {
+296			if(!neg6_near_zone_active && abs_relative_y <= 1.0f) {
+297				neg6_near_zone_active = true;
+298				pidY_Speed.iout = 0.0f;
+299			} else if(neg6_near_zone_active && abs_relative_y > 1.4f) {
+300				neg6_near_zone_active = false;
+301			}
+302		} else {
+303			neg6_near_zone_active = false;
+304		}
+305	
+306		/* 最终保持只在第二段完成后生效。
+307		 * 第一段到 +5.6cm 时不做停留，而是立刻切第二组参数继续向 -5.5cm 运动。
+308		 *
+309		 * 进入最终保持不能只看位置，还必须确认球已经基本停住；否则会在“带着余速穿过
+310		 * 目标窗”的瞬间提前锁定，随后又滑出保持区，形成反复进出与停错位置。 */
+311		if(g_pid_segment == PID_SEGMENT_HOLD_NEG_55) {
+312			if(target_hold_active) {
+313				if(abs_relative_y >= target_hold_exit) {
+314					target_hold_active = false;
+315					target_hold_settle_ticks = 0u;
+316				}
+317			} else if(abs_relative_y <= target_hold_enter &&
+318			          abs_estimated_velocity <= TARGET_HOLD_SPEED_LIMIT) {
+319				if(target_hold_settle_ticks < TARGET_HOLD_SETTLE_TICKS) {
+320					target_hold_settle_ticks++;
+321				}
+322				if(target_hold_settle_ticks >= TARGET_HOLD_SETTLE_TICKS) {
+323					target_hold_active = true;
+324				}
+325			} else {
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:42:08Z)**_
+
+代码状态现在对上了。我要把两处局部补丁一起收紧：`ch3` 的近端减速区从 `0.65` 再往里压，`ch4` 的限角从 `0.75` 提前到 `1.2`，并且近端状态激活时直接用更小的角度帽。这样这次就是针对你这组里“先软、再猛拉”的节奏下刀。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:42:09Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:42:25Z)**_
+
+<tool-use data-tool-type="write" data-tool-name="Edit"><details>
+<summary>Tool use: **Edit**</summary>
+
+```text
+The file d:\File\2026diansaiH\Code_of_ZDT\Core\Src\pid.c has been updated successfully. (file state is current in your context — no need to Read it back)
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:42:35Z)**_
+
+两处关键逻辑已经改完了：`ch3` 在近端不会再那么早软掉，`ch4` 的限角也提前到了 `1.2cm` 外侧，并且进入近端状态后直接压到更小。现在编译确认这版是干净的。
+
+_**Agent (claude-opus-4-8 2026-08-03 05:42:42Z)**_
+
+<tool-use data-tool-type="shell" data-tool-name="Bash"><details>
+<summary>Tool use: **Bash**</summary>
+Build firmware after tightening -6.0 near-zone logic
+
+`cmake --build d:/File/2026diansaiH/Code_of_ZDT/build/Debug`
+
+```text
+[1/2] Building C object CMakeFiles/Code_of_ZDT.dir/Core/Src/pid.c.obj
+[2/2] Linking C executable Code_of_ZDT.elf
+Memory region         Used Size  Region Size  %age Used
+             RAM:        3504 B       128 KB      2.67%
+          CCMRAM:           0 B        64 KB      0.00%
+           FLASH:       38616 B         1 MB      3.68%
+```
+</details></tool-use>
+
+_**Agent (claude-opus-4-8 2026-08-03 05:42:55Z)**_
+
+我已经继续改了，还是只动 [Core/Src/pid.c](Core/Src/pid.c)。
+
+这次不是再泛调 PID，而是把你这组数据里最明显的两处失配直接改掉：
+
+1. `-6.0` 近端状态真正接管  
+   在 `|error| <= 1.0cm` 时会进入 `neg6_near_zone_active`，并清一次速度环积分，避免前面回程积出来的负向积分继续把终点区往负方向猛推。
+
+2. 外环 `ch3` 不再在 `0.65cm` 就过早软掉  
+   现在中段托底改成：
+   - `relative_y > 2.8` 保底 `-4.2`
+   - `relative_y > 0.45` 保底 `-2.4`
+
+   也就是把“硬托底”保持得更靠近目标，但一旦进了近端状态，就反过来把外环目标速度收得更狠，避免直接打穿终点。
+
+3. 内环 `ch4` 的限角提前生效  
+   现在不是等到 `0.75cm` 才开始收角了，而是：
+   - `|error| <= 1.2cm` 限到 `4.5°`
+   - `|error| <= 0.75cm` 限到 `3.2°`
+   - 进入近端状态后直接压到 `1.8°`
+   - hold 内再压到 `1.2°`
+
+这版编译已经过了：
+- `FLASH: 38616 B`
+- `RAM: 3504 B`
+
+你下一组 VOFA 重点看三件事：
+
+- `ch3` 在 `-5.3 ~ -5.7` 这段，是否还会像之前那样先明显收软
+- `ch4` 在 `-6.0` 附近第一次大反拉时，是否还会一下冲到很大的正负角
+- `ch1` 是否还会从 `-6` 一路冲到 `-7.x` 再大幅回摆
+
+按这版逻辑，最应该先看到的变化是：第一下过点幅度明显变小，终点区来回穿越次数减少。
