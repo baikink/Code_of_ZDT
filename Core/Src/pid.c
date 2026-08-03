@@ -227,7 +227,7 @@ void pid_control__26Y(void)
 	 *   3) 到达 -5.5cm ±0.5cm 后进入最终保持，只停位置环、速度环继续保 0 速度。 */
 	if(g_pid_segment == PID_SEGMENT_TO_POS_56) {
 		if(pid_absf(Y - 5.6f) <= TARGET_HOLD_POSITION_ENTER) {
-			pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.75f, 0.1f, 0.0f);
+			pid_apply_segment_profile(-6.0f, 0.750f, 0.0f, 0.0f, 1.0f, 0.1f, 0.0f);
 			g_pid_segment = PID_SEGMENT_TO_NEG_55;
 			control_initialized = false;
 			target_hold_active = false;
