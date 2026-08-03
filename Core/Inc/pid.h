@@ -143,9 +143,9 @@ void pidout_Servo_limit(pid_t *pid);
  * 为避免视觉噪声和轻微回弹导致反复进出保持区，退出门限留 0.1cm 回差，
  * 即误差重新增大到 0.6cm 以上才恢复闭环。
  */
-#define TARGET_HOLD_POSITION_ENTER  0.50f
+#define TARGET_HOLD_POSITION_ENTER  0.250f
 #define TARGET_HOLD_POSITION_EXIT   0.60f
-#define TARGET_HOLD_SPEED_LIMIT     0.25f
+#define TARGET_HOLD_SPEED_LIMIT     0.5f
 #define TARGET_HOLD_SETTLE_TICKS    6u    /* 进入最终保持前，位置与速度需连续稳定 6 × 20ms = 120ms */
 
 extern float Y;

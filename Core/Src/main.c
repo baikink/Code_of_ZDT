@@ -40,8 +40,8 @@
 
 // ========== 步进电机通信参数 ==========
 #define MOTOR_ADDR  1      // 电机地址
-#define MOTOR_SPEED 1500   // RPM
-#define MOTOR_ACC   100    // 加速度档位
+#define MOTOR_SPEED 1200   // RPM
+#define MOTOR_ACC   300    // 加速度档位
 
 /* USER CODE END PD */
 
